@@ -62,10 +62,10 @@ export PEER=/ip4/10.52.2.249/tcp/31340/p2p/QmefxzDL1DaJ7TcrZjLuz7Xs9sUVKpufyg7f5
 
 ```
 ```
-# Machine 1  (server 1)
+# Machine 1  (server 1) hold 16 blocks(16 tranformer layers)
 python -m petals.cli.run_server huggyllama/llama-7b --initial_peers $PEER --num_blocks 16  --identity_path bootstrap_1.id
 
-# Machine 2  (server 2)
+# Machine 2  (server 2) hold another 16 blocks(16 tranformer layers)
 python -m petals.cli.run_server huggyllama/llama-7b --initial_peers $PEER --num_blocks 16  --identity_path bootstrap_1.id
 ```
 
