@@ -43,7 +43,7 @@ pip install -r requirements/requirements-dev.txt
 cd BloomBee 
 pip install .
 ```
-#### Run a Task   
+#### Run a Task   (<a href="https://colab.research.google.com/drive/1pENMOEoEV01DqBImZzuX_4jTV3fNwNga#scrollTo=oyCFDemCZsRs">Try now in Colab</a>)
 #### 1. Set up backbone peers 
 The bootstrap peers can be used as --initial_peers, to connect new GPU servers to the existing ones. They can also serve as libp2p relays for GPU servers that lack open ports (e.g., because they are behind NAT and/or firewalls).
 
