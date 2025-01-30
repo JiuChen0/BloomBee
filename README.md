@@ -5,7 +5,11 @@
 
 
 
-We depend on global GPU sharing. If your GPU can only handle a small part of the Llama3.1 (405B) model, you can join a network of servers to load different model parts.
+We depend on global GPU sharing. If your GPU can only handle a small part of the Llama3.1 (405B) model, you can join a network of servers to load different model parts.  
+
+<p align="center">
+    🚀 &nbsp;<b><a href="https://colab.research.google.com/drive/1BZn0KrEGaNA2dlzmCTtTIjJKx3bNzOMs#scrollTo=1Qhi4I2PSGgg">Try now in Colab</a></b>
+</p>
 
 ## Installation
 
@@ -28,7 +32,7 @@ To install hivemind from source, simply run the following:
 #### Clone the repository:  
 
 ```bash  
-git clone https://github.com/HaibaraAiChan/flexgen_model_in_petals.git  
+git clone https://github.com/yottalabsai/BloomBee.git  
 ```
 #### Install the dependencies:  
 ```
