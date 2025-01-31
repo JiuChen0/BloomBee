@@ -3,9 +3,9 @@
     Run large language models in a heterogeneous decentralized environment with offloading.<br>  
 </p>  
 
+The rapid rise of generative AI has boosted demand for large language model (LLM) inference and fine-tuining services. While proprietary models are still favored, advancements in open-source LLMs have made them competitive. However, high costs and limited GPU resources hinder deployment. This work introduces BloomBee, a decentralized offline serving system that leverages idle GPU resources to provide cost-effective access to LLMs.
 
-
-We depend on global GPU sharing. If your GPU can only handle a small part of the Llama3.1 (405B) model, you can join a network of servers to load different model parts.  
+We rely on global GPU sharing, which includes more consumer-grade GPUs. If your GPU can only manage a small portion of a large language model, like the Llama3.1 (405B) model, you can connect to a network of servers that load different parts of the model. In this network, you can request inference or fine-tuning services.
 
 <p align="center">
     🚀 &nbsp;<b><a href="https://colab.research.google.com/drive/1BZn0KrEGaNA2dlzmCTtTIjJKx3bNzOMs#scrollTo=1Qhi4I2PSGgg">Try now in Colab</a></b>
@@ -18,23 +18,23 @@ natively or with [Anaconda](https://www.anaconda.com/products/individual).
 
 You can get [the latest release](https://pypi.org/project/xxxxx) with pip or build BloomBee from source.
 
-### With pip
+#### With pip
 
 If your versions of Python and PyTorch match the requirements, you can install hivemind from pip:
 
 ```
 pip install bloombee
 ```
-### From source
+#### From source
 
 To install hivemind from source, simply run the following:
 
-#### Clone the repository:  
+##### Clone the repository:  
 
 ```bash  
 git clone https://github.com/yottalabsai/BloomBee.git  
 ```
-#### Install the dependencies:  
+##### Install the dependencies:  
 ```
 cd BloomBee  
 pip install -r requirements/requirements-dev.txt
@@ -43,7 +43,7 @@ pip install -r requirements/requirements-dev.txt
 cd BloomBee 
 pip install .
 ```
-#### Run a Task   (<a href="https://colab.research.google.com/drive/1pENMOEoEV01DqBImZzuX_4jTV3fNwNga#scrollTo=oyCFDemCZsRs">Try now in Colab</a>)
+## Run a Task    (<a href="https://colab.research.google.com/drive/1pENMOEoEV01DqBImZzuX_4jTV3fNwNga#scrollTo=oyCFDemCZsRs">Try now in Colab</a>)
 #### 1. Set up backbone peers 
 The bootstrap peers can be used as --initial_peers, to connect new GPU servers to the existing ones. They can also serve as libp2p relays for GPU servers that lack open ports (e.g., because they are behind NAT and/or firewalls).
 
