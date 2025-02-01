@@ -88,3 +88,19 @@ cd Bloombee/
 python benchmarks/benchmark_training.py --model huggyllama/llama-7b  --initial_peers $PEER --torch_dtype float32  --n_steps 20 --batch_size 32 --seq_len 128
 ```
 More advanced guides ([here](https://github.com/bigscience-workshop/petals/wiki/Launch-your-own-swarm)).
+
+## Acknowledgements  
+
+- **Contributors**:   
+  - [Jian Li](https://github.com/xxnwj)  
+  - [Shuangyan Yang](https://github.com/HaibaraAiChan) 
+  - [Jie Ren](https://github.com/jren73) 
+  - [xxx](https://github.com/Arnab9Codes) 
+
+- **Libraries and Tools**:  
+  - [Hivemind](https://reactjs.org/) - A JavaScript library for building user interfaces.  
+  - [Flexgen](https://tailwindcss.com/) - A utility-first CSS framework.  
+  - [Petals](https://tailwindcss.com/) - A utility-first CSS framework.
+
+- **Support**:  
+  - Special thanks to [Jialin Liu](), [Daniel](), [Dong Li](https://faculty.ucmerced.edu/dong-li/) for their guidance.  
