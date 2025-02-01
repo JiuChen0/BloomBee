@@ -98,9 +98,9 @@ More advanced guides ([here](https://github.com/bigscience-workshop/petals/wiki/
   - [xxx](https://github.com/Arnab9Codes) 
 
 - **Libraries and Tools**:  
-  - [Hivemind](https://reactjs.org/) - A JavaScript library for building user interfaces.  
-  - [Flexgen](https://tailwindcss.com/) - A utility-first CSS framework.  
-  - [Petals](https://tailwindcss.com/) - A utility-first CSS framework.
+  - [Hivemind](https://github.com/learning-at-home/hivemind) - A PyTorch library for decentralized deep learning across the Internet.  
+  - [Flexgen](https://tailwindcss.com/) - An offloading-based system running on weak GPUs.  
+  - [Petals](https://github.com/bigscience-workshop/petals) - A library for decentralized LLMs fine-tuning and inference without offloading.
 
 - **Support**:  
   - Special thanks to [Jialin Liu](), [Daniel](), [Dong Li](https://faculty.ucmerced.edu/dong-li/) for their guidance.  
