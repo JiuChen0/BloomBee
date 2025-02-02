@@ -95,7 +95,7 @@ More advanced guides ([here](https://github.com/bigscience-workshop/petals/wiki/
   - [Jian Li](https://github.com/xxnwj)  
   - [Shuangyan Yang](https://github.com/HaibaraAiChan) 
   - [Jie Ren](https://github.com/jren73) 
-  - [xxx](https://github.com/Arnab9Codes) 
+  - [Arnab Tarafder](https://github.com/Arnab9Codes) 
 
 - **Libraries and Tools**:  
   - [Hivemind](https://github.com/learning-at-home/hivemind) - A PyTorch library for decentralized deep learning across the Internet.  
