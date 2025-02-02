@@ -1,6 +1,6 @@
 FROM nvcr.io/nvidia/cuda:11.0.3-cudnn8-devel-ubuntu20.04
-LABEL maintainer="bigscience-workshop"
-LABEL repository="petals"
+LABEL maintainer="Yotta Labs"
+LABEL repository="bloombee"
 
 WORKDIR /home
 # Set en_US.UTF-8 locale by default
@@ -22,10 +22,10 @@ RUN conda install python~=3.10.12 pip && \
     conda clean --all && rm -rf ~/.cache/pip
 
 VOLUME /cache
-ENV PETALS_CACHE=/cache
+ENV BLOOMBEE_CACHE=/cache
 
-COPY . petals/
-RUN pip install --no-cache-dir -e petals
+COPY . bloombee/
+RUN pip install --no-cache-dir -e bloombee
 
-WORKDIR /home/petals/
+WORKDIR /home/bloombee/
 CMD bash
