@@ -50,8 +50,8 @@ This project was made possible thanks to a collaboration with
   - [Scaling to Distributed GPUs](#scaling-to-distributed-gpus)
   - [API Example](#api-example)
   - [Frequently Asked Questions](#frequently-asked-questions)
-- [Performance Results](#performance-results)
-- [How It Works](#how-it-works)
+<!-- - [Performance Results](#performance-results) -->
+<!-- - [How It Works](#how-it-works) -->
 <!-- - [Roadmap](#roadmap) -->
 
 ## Installation
