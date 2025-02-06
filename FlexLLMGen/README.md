@@ -22,13 +22,13 @@ The goal of FlexLLMGen is to create a high-throughput system to enable new and e
 foundation models to throughput-oriented tasks on low-cost hardware, such as a single commodity GPU
 instead of expensive systems.
 
-Check out the [examples](#examples) of what you can run on a single commodity GPU with FlexLLMGen, including benchmarking and data wrangling.
+<!-- Check out the [examples](#examples) of what you can run on a single commodity GPU with FlexLLMGen, including benchmarking and data wrangling. -->
 
 ❌ **Limitation**. As an offloading-based system running on weak GPUs, FlexLLMGen also has its limitations.
 FlexLLMGen can be significantly slower than the case when you have enough powerful GPUs to hold the whole model, especially for small-batch cases.
 FlexLLMGen is mostly optimized for throughput-oriented batch processing settings (e.g., classifying or extracting information from many documents in batches), on single GPUs.
 
-----------
+<!-- ----------
 
 This project was made possible thanks to a collaboration with
 
@@ -37,7 +37,7 @@ This project was made possible thanks to a collaboration with
 <a href="https://www.andrew.cmu.edu/user/beidic/"><img src="https://upload.wikimedia.org/wikipedia/commons/9/9b/Carnegie_Mellon_wordmark.svg" height="20"></a> &nbsp;&nbsp;&nbsp;
 <a href="https://www.together.xyz/"><img src="https://images.squarespace-cdn.com/content/v1/6358bea282189a0adf57fe16/eef09191-631f-40d9-9bfd-f875b25bcf0b/together-logo-black-transparent2.png" height="20"></a> &nbsp;&nbsp;&nbsp;
 <a href="https://research.yandex.com/"><img src="https://storage.yandexcloud.net/yandex-research/assets/yandex_research.png" height="20"></a> &nbsp;&nbsp;&nbsp;
-<a href="https://ds3lab.inf.ethz.ch/"><img src="https://user-images.githubusercontent.com/1608867/220273382-c09669b3-42fd-47c2-b88c-7ed55cb43820.png" height="20"></a>
+<a href="https://ds3lab.inf.ethz.ch/"><img src="https://user-images.githubusercontent.com/1608867/220273382-c09669b3-42fd-47c2-b88c-7ed55cb43820.png" height="20"></a> -->
 
 ----------
 
@@ -168,7 +168,7 @@ They save more memory but run slower.
 - Enable weight compression by adding `--compress-weight`. This can reduce the weight memory usage by around 70%.
 - Offload all weights to disk by using `--percent 0 0 100 0 100 0`. This requires very little CPU and GPU memory.
 
-## Performance Results
+<!-- ## Performance Results
 ### Generation Throughput (token/s)
 The corresponding effective batch sizes and lowest offloading devices are in parentheses. Please see [here](benchmark/batch_size_table.md) for more details.
 | System | OPT-6.7B | OPT-30B | OPT-175B |
@@ -202,7 +202,7 @@ FlexLLMGen utilizes a block schedule to reuse weight and overlap I/O with comput
 
 <img src="https://github.com/FMInference/FlexLLMGen/raw/main/docs/block_schedule.jpg" alt="image" width="500"></img>
 
-More technical details see the [paper](https://arxiv.org/abs/2303.06865).
+More technical details see the [paper](https://arxiv.org/abs/2303.06865). -->
 
 <!-- ## Roadmap
 We plan to work on the following features.
