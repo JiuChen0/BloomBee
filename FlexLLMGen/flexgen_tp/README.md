@@ -3,7 +3,7 @@ To utilize all GPUs on a single compute node for inference with tensor paralleli
 perform ```pip install e .``` from BloomBee/FlexLLMGen/  directory and run using the following from the same directory:
 
 ```
-python3 flexgen_tp.flex_opt.py --model facebook/opt-1.3b --gen-len 32
+ python3 -m flexgen_tp.flex_opt --model facebook/opt-1.3b --gen-len 32
 ```
 the installation should install flexgen_tp package along with flexllmgen. Delete the downloaded dataset first, if you have run flexllmgen.flex_opt.py
 
