@@ -1,5 +1,5 @@
 <p align="center">  
-    <img src="figures/bloombee_logo.png" alt="Bloombee Logo" /><br>  
+    <img src="figures/bloombee.jpg" alt="Bloombee Logo" /><br>  
     Run large language models in a heterogeneous decentralized environment with offloading.<br>  
 </p>  
 
