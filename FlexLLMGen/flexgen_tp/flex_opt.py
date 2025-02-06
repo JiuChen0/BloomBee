@@ -115,7 +115,7 @@ def init_weight_list(weight_specs, policy, env):
     dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent]
     dev_choices = [env.disk, env.cpu, env.gpu]
     ########### EDITED
-    print(f'dev_percents: {dev_percents}')
+    #print(f'dev_percents: {dev_percents}')
     #dist.barrier()
     ########
 
@@ -968,11 +968,12 @@ class OptLM:
         
         # Ensure all processes reach this point before proceeding
 
-        dist.barrier() 
+        #dist.barrier()
 
+        device_id=torch.cuda.current_device()
+        dist.barrier(device_ids=[device_id])
         # Proceed with other operations
         
-        #print("Downloading done, all ranks are here.")
         self.layers[j].init_weight(self.weight_home[j], expanded_path)
 
     def load_weight(self, i, j, k, overlap=True):

@@ -394,7 +394,10 @@ def slice_tensors(file_list, json_data, output_base_path, world_size, attn=False
                 
                 # remove file_name from file_list
                 file_list.remove(file_name)
-    
+
+                ###### later added for deletion procedure
+                os.remove(file_name)
+
     print(f'inside function file list: {len(file_list)}')
 
     return file_list
@@ -439,16 +442,26 @@ def download_opt_weights(model_name, path, world_size, rank_path):
 
     ########## Edited
     file_list = list_files_in_folder(path)
-    print(f'len:{len(file_list)}')
+    print(f'len:{len(file_list)}, reched here')
     #print(f'{file_list}\n\n')
-
-    with open('./mlp_parallel.json', 'r') as file:
-        mlp_json = file.read()
-        mlp_json_data = json.loads(mlp_json)
-        
+    cur_dir = os.getcwd()
+    file = 'flexgen_tp/mlp_parallel.json'
+    mlp_json_path = os.path.join(cur_dir, file)
+    print(mlp_json_path)
+    
+    if os.path.exists(mlp_json_path):
+        with open(mlp_json_path, 'r') as file:
+            #print('\n\ READING THE FILE \n')
+            mlp_json = file.read()
+            mlp_json_data = json.loads(mlp_json)
+    else:
+        print(f"File not found: {mlp_json_path}")
     ######### modification for flexgen original
     #world_size=2
     output_base_path = rank_path# "/home/aktarafder/ranks"
+    
+
+    #print(f'E reacher here mlp_json:{mlp_json_data}')
 
     if not os.path.exists(output_base_path):
         os.makedirs(output_base_path)
@@ -459,7 +472,10 @@ def download_opt_weights(model_name, path, world_size, rank_path):
     # slice tensors for attention json
     print(f'\n\nfile_list2 len:{len(file_list2)}\n\n')
 
-    with open('./mha_parallel.json', 'r') as file:
+    file = 'flexgen_tp/mha_parallel.json'
+    mha_json_path = os.path.join(cur_dir, file)
+
+    with open(mha_json_path, 'r') as file:
         mha_json = file.read()
         mha_json_data = json.loads(mha_json)
     
@@ -481,6 +497,9 @@ def download_opt_weights(model_name, path, world_size, rank_path):
             save_tensor_slice(tensor, slice_folder, os.path.basename(file_name))
         
         file_list3.remove(file_name)
+
+        ######### deletion,update it later need this to check if we want to download aagain
+        #os.remove(file_name)
 
     assert len(file_list3) == 0, "all files have not been placed to rank folders! some error"
     
