@@ -52,7 +52,7 @@ This project was made possible thanks to a collaboration with
   - [Frequently Asked Questions](#frequently-asked-questions)
 - [Performance Results](#performance-results)
 - [How It Works](#how-it-works)
-- [Roadmap](#roadmap)
+<!-- - [Roadmap](#roadmap) -->
 
 ## Installation
 Requirements:  
@@ -202,13 +202,13 @@ FlexLLMGen utilizes a block schedule to reuse weight and overlap I/O with comput
 
 <img src="https://github.com/FMInference/FlexLLMGen/raw/main/docs/block_schedule.jpg" alt="image" width="500"></img>
 
-More technical details see our [paper](https://arxiv.org/abs/2303.06865).
+More technical details see the [paper](https://arxiv.org/abs/2303.06865).
 
-## Roadmap
+<!-- ## Roadmap
 We plan to work on the following features.
 
 - [ ] Optimize the performance for multiple GPUs on the same machine
 - [ ] Support more models (BLOOM, CodeGen, GLM)
 - [X] Release the cost model and policy optimizer
 - [ ] Macbook Support (M1 and M2)
-- [ ] AMD Support
+- [ ] AMD Support -->
