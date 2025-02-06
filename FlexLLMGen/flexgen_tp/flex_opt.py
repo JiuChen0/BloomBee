@@ -20,19 +20,19 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import torch.multiprocessing as mp
 
-from flexgen.compression import CompressionConfig
-from flexgen.opt_config import OptConfig, get_opt_config, download_opt_weights
+from flexgen_tp.compression import CompressionConfig
+from flexgen_tp.opt_config import OptConfig, get_opt_config, download_opt_weights
 
 ################ Edited
-from flexgen.opt_config import OptConfig, get_opt_config, download_opt_weights
+from flexgen_tp.opt_config import OptConfig, get_opt_config, download_opt_weights
 
-from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
+from flexgen_tp.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
     TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
 ################ Edited
-from flexgen.pytorch_backend import TorchTensor
+from flexgen_tp.pytorch_backend import TorchTensor
 
-from flexgen.timer import timers
-from flexgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
+from flexgen_tp.timer import timers
+from flexgen_tp.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
     torch_mem_stats, torch_dtype_to_np_dtype, write_benchmark_log,
     read_benchmark_log)

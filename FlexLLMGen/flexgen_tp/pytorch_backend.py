@@ -19,7 +19,7 @@ import pdb
 ############# Edited
 
 
-from flexgen.utils import (GB, T, cpu_mem_stats, vector_gather,
+from flexgen_tp.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
     torch_dtype_to_num_bytes)
 
@@ -35,7 +35,7 @@ global_disk_device = None
 
 def fix_recursive_import():
     global general_copy_compressed, TorchCompressedDevice, global_cpu_device
-    from flexgen import compression
+    from flexgen_tp import compression
     general_copy_compressed = compression.general_copy_compressed
     TorchCompressedDevice = compression.TorchCompressedDevice
 
