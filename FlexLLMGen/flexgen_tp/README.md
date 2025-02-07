@@ -7,4 +7,4 @@ perform ```pip install e .``` from BloomBee/FlexLLMGen/  directory and run using
 ```
 the installation should install flexgen_tp package along with flexllmgen. Delete the downloaded dataset first, if you have run flexllmgen.flex_opt.py
 
-Use the same directory for running flexllmgen alsoo.
+Use the same directory for running flexllmgen also.
