@@ -20,7 +20,7 @@ You can get [the latest release](https://pypi.org/project/xxxxx) with pip or bui
 
 #### With pip
 
-If your versions of Python and PyTorch match the requirements, you can install hivemind from pip:
+If your versions of Python and PyTorch match the requirements, you can install bloombee from pip:
 
 ```
 pip install bloombee
@@ -44,50 +44,50 @@ cd BloomBee
 pip install .
 ```
 ## Run a Task    (<a href="https://colab.research.google.com/drive/1pENMOEoEV01DqBImZzuX_4jTV3fNwNga#scrollTo=oyCFDemCZsRs">Try now in Colab</a>)
-#### 1. Set up backbone peers 
+#### 1. Start the main server 
 The bootstrap peers can be used as --initial_peers, to connect new GPU servers to the existing ones. They can also serve as libp2p relays for GPU servers that lack open ports (e.g., because they are behind NAT and/or firewalls).
 
 ```
 python -m petals.cli.run_dht --host_maddrs /ip4/0.0.0.0/tcp/31340 --identity_path bootstrapp1.id 
 
 ```
-Once you run it, look at the outputs and find the following line:  
+Once you run it, check the outputs and find the following line:  
 ```
 Mon 00 01:23:45.678 [INFO] Running a DHT instance. To connect other peers to this one, use --initial_peers /ip4/YOUR_IP_ADDRESS/tcp/31340/p2p/QmefxzDL1DaJ7TcrZjLuz7Xs9sUVKpufyg7f5276ZHFjbQ
 ```  
-You can provide this address as --initial_peers to GPU servers or other backbone peers.
+You can provide this address as --initial_peers to workers or other backbone servers.
 
 If you want your swarm to be accessible outside of your local network, ensure that you have a **public IP address** or set up **port forwarding** correctly, so that your peer is reachable from the outside.
 
-#### 2. Start servers  
-Now, you can run servers with an extra --initial_peers argument pointing to your bootstrap peers:  
+#### 2. Connect the workers to the main bloombee server  
+Now, you can start extra peers and connect to the server:  
 ```
-export PEER=/ip4/10.52.2.249/tcp/31340/p2p/QmefxzDL1DaJ7TcrZjLuz7Xs9sUVKpufyg7f5276ZHFjbQ  
+export BBServer=/ip4/10.52.2.249/tcp/31340/p2p/QmefxzDL1DaJ7TcrZjLuz7Xs9sUVKpufyg7f5276ZHFjbQ  
 
 ```
 ```
-# Machine 1  (server 1) hold 16 blocks(16 tranformer layers)
-python -m petals.cli.run_server huggyllama/llama-7b --initial_peers $PEER --num_blocks 16  --identity_path bootstrap_1.id
+# Start one worker to hold 16 blocks(16 tranformer layers)
+python -m petals.cli.run_server huggyllama/llama-7b --initial_peers $BBSERVER --num_blocks 16  --identity_path bootstrap_1.id
 
-# Machine 2  (server 2) hold another 16 blocks(16 tranformer layers)
-python -m petals.cli.run_server huggyllama/llama-7b --initial_peers $PEER --num_blocks 16  --identity_path bootstrap_1.id
+# Start second worker to hold another 16 blocks(16 tranformer layers)
+python -m petals.cli.run_server huggyllama/llama-7b --initial_peers $BBSERVER --num_blocks 16  --identity_path bootstrap_1.id
 ```
 
-#### 3. Use the models(on servers)  
+#### 3. Run Inference or Fine-tune Jobs
 
 #### Inference   
 ```
 cd Bloombee/
-python benchmarks/benchmark_inference.py --model huggyllama/llama-7b  --initial_peers $PEER --torch_dtype float32 --seq_len 128
+python benchmarks/benchmark_inference.py --model huggyllama/llama-7b  --initial_peers $BBSERVER --torch_dtype float32 --seq_len 128
 ```
 
 #### Fine-tuing  
 
 ```
 cd Bloombee/
-python benchmarks/benchmark_training.py --model huggyllama/llama-7b  --initial_peers $PEER --torch_dtype float32  --n_steps 20 --batch_size 32 --seq_len 128
+python benchmarks/benchmark_training.py --model huggyllama/llama-7b  --initial_peers $BBSERVER --torch_dtype float32  --n_steps 20 --batch_size 32 --seq_len 128
 ```
-More advanced guides ([here](https://github.com/bigscience-workshop/petals/wiki/Launch-your-own-swarm)).
+
 
 ## Acknowledgements  
 
