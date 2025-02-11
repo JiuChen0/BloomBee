@@ -27,7 +27,7 @@ pip install .
 ## How to use BloomBee(<a href="https://colab.research.google.com/drive/1pENMOEoEV01DqBImZzuX_4jTV3fNwNga#scrollTo=oyCFDemCZsRs">Try now in Colab</a>)
 #### 1. Start the main server 
 ```
-python -m petals.cli.run_dht --host_maddrs /ip4/0.0.0.0/tcp/31340 --identity_path bootstrapp1.id 
+python -m bloombee.cli.run_dht --host_maddrs /ip4/0.0.0.0/tcp/31340 --identity_path bootstrapp1.id 
 
 ```
 Now you will get the BloomBee's main server location: 
@@ -46,11 +46,11 @@ export BBServer=/ip4/10.52.2.249/tcp/31340/p2p/QmefxzDL1DaJ7TcrZjLuz7Xs9sUVKpufy
 ```
 Start one worker to hold 16 blocks(16 tranformer layers)
 ```
-python -m petals.cli.run_server huggyllama/llama-7b --initial_peers $BBSERVER --num_blocks 16  --identity_path bootstrap_1.id
+python -m bloombee.cli.run_server huggyllama/llama-7b --initial_peers $BBSERVER --num_blocks 16  --identity_path bootstrap_1.id
 ```
 Start second worker to hold another 16 blocks(16 tranformer layers)
 ```
-python -m petals.cli.run_server huggyllama/llama-7b --initial_peers $BBSERVER --num_blocks 16  --identity_path bootstrap_1.id
+python -m bloombee.cli.run_server huggyllama/llama-7b --initial_peers $BBSERVER --num_blocks 16  --identity_path bootstrap_1.id
 ```
 
 #### 3. Run inference or finetune jobs
