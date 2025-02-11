@@ -91,16 +91,9 @@ More advanced guides ([here](https://github.com/bigscience-workshop/petals/wiki/
 
 ## Acknowledgements  
 
-- **Contributors**:   
-  - [Jian Li](https://github.com/xxnwj)  
-  - [Shuangyan Yang](https://github.com/HaibaraAiChan) 
-  - [Jie Ren](https://github.com/jren73) 
-  - [Arnab Tarafder](https://github.com/Arnab9Codes) 
+Bloombee is built upon a few popular libraries: 
 
-- **Libraries and Tools**:  
   - [Hivemind](https://github.com/learning-at-home/hivemind) - A PyTorch library for decentralized deep learning across the Internet.  
   - [Flexgen](https://tailwindcss.com/) - An offloading-based system running on weak GPUs.  
   - [Petals](https://github.com/bigscience-workshop/petals) - A library for decentralized LLMs fine-tuning and inference without offloading.
 
-- **Support**:  
-  - Special thanks to [Jialin Liu](), [Daniel](), [Dong Li](https://faculty.ucmerced.edu/dong-li/) for their guidance.  
