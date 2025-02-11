@@ -44,11 +44,12 @@ Here is the BloomBee Server location:
 export BBServer=/ip4/10.52.2.249/tcp/31340/p2p/QmefxzDL1DaJ7TcrZjLuz7Xs9sUVKpufyg7f5276ZHFjbQ  
 
 ```
+Start one worker to hold 16 blocks(16 tranformer layers)
 ```
-# Start one worker to hold 16 blocks(16 tranformer layers)
 python -m petals.cli.run_server huggyllama/llama-7b --initial_peers $BBSERVER --num_blocks 16  --identity_path bootstrap_1.id
-
-# Start second worker to hold another 16 blocks(16 tranformer layers)
+```
+Start second worker to hold another 16 blocks(16 tranformer layers)
+```
 python -m petals.cli.run_server huggyllama/llama-7b --initial_peers $BBSERVER --num_blocks 16  --identity_path bootstrap_1.id
 ```
 
