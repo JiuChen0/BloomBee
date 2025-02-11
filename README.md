@@ -13,45 +13,24 @@ We rely on global GPU sharing, which includes more consumer-grade GPUs. If your 
 
 ## Installation
 
-Before installing, make sure that your environment has Python 3.8+ and [PyTorch](https://pytorch.org/get-started/locally/#start-locally) 1.9.0 or newer. They can be installed either
-natively or with [Anaconda](https://www.anaconda.com/products/individual).
-
-You can get [the latest release](https://pypi.org/project/xxxxx) with pip or build BloomBee from source.
-
-#### With pip
-
-If your versions of Python and PyTorch match the requirements, you can install bloombee from pip:
-
+#### From Pypi
 ```
 pip install bloombee
 ```
-#### From source
-
-To install hivemind from source, simply run the following:
-
-##### Clone the repository:  
-
+#### From Source
 ```bash  
 git clone https://github.com/yottalabsai/BloomBee.git  
-```
-##### Install the dependencies:  
-```
 cd BloomBee  
 pip install -r requirements/requirements-dev.txt
-```
-```
-cd BloomBee 
 pip install .
 ```
-## Run a Task    (<a href="https://colab.research.google.com/drive/1pENMOEoEV01DqBImZzuX_4jTV3fNwNga#scrollTo=oyCFDemCZsRs">Try now in Colab</a>)
+## How to use BloomBee(<a href="https://colab.research.google.com/drive/1pENMOEoEV01DqBImZzuX_4jTV3fNwNga#scrollTo=oyCFDemCZsRs">Try now in Colab</a>)
 #### 1. Start the main server 
-The bootstrap peers can be used as --initial_peers, to connect new GPU servers to the existing ones. They can also serve as libp2p relays for GPU servers that lack open ports (e.g., because they are behind NAT and/or firewalls).
-
 ```
 python -m petals.cli.run_dht --host_maddrs /ip4/0.0.0.0/tcp/31340 --identity_path bootstrapp1.id 
 
 ```
-Once you run it, check the outputs and find the following line:  
+Now you will get the BloomBee's main server location: 
 ```
 Mon 00 01:23:45.678 [INFO] Running a DHT instance. To connect other peers to this one, use --initial_peers /ip4/YOUR_IP_ADDRESS/tcp/31340/p2p/QmefxzDL1DaJ7TcrZjLuz7Xs9sUVKpufyg7f5276ZHFjbQ
 ```  
@@ -73,7 +52,7 @@ python -m petals.cli.run_server huggyllama/llama-7b --initial_peers $BBSERVER --
 python -m petals.cli.run_server huggyllama/llama-7b --initial_peers $BBSERVER --num_blocks 16  --identity_path bootstrap_1.id
 ```
 
-#### 3. Run Inference or Fine-tune Jobs
+#### 3. Run inference or finetune jobs
 
 #### Inference   
 ```
@@ -81,7 +60,7 @@ cd Bloombee/
 python benchmarks/benchmark_inference.py --model huggyllama/llama-7b  --initial_peers $BBSERVER --torch_dtype float32 --seq_len 128
 ```
 
-#### Fine-tuing  
+#### Finetune 
 
 ```
 cd Bloombee/
