@@ -39,7 +39,7 @@ You can provide this address as --initial_peers to workers or other backbone ser
 If you want your swarm to be accessible outside of your local network, ensure that you have a **public IP address** or set up **port forwarding** correctly, so that your peer is reachable from the outside.
 
 #### 2. Connect the workers to the main bloombee server  
-Now, you can start extra peers and connect to the server:  
+Here is the BloomBee Server location:
 ```
 export BBServer=/ip4/10.52.2.249/tcp/31340/p2p/QmefxzDL1DaJ7TcrZjLuz7Xs9sUVKpufyg7f5276ZHFjbQ  
 
