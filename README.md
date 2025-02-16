@@ -21,7 +21,6 @@ pip install bloombee
 ```bash  
 git clone https://github.com/yottalabsai/BloomBee.git  
 cd BloomBee  
-pip install -r requirements/requirements-dev.txt
 pip install .
 ```
 ## How to use BloomBee(<a href="https://colab.research.google.com/drive/1pENMOEoEV01DqBImZzuX_4jTV3fNwNga#scrollTo=oyCFDemCZsRs">Try now in Colab</a>)
@@ -74,6 +73,6 @@ python benchmarks/benchmark_training.py --model huggyllama/llama-7b  --initial_p
 Bloombee is built upon a few popular libraries: 
 
   - [Hivemind](https://github.com/learning-at-home/hivemind) - A PyTorch library for decentralized deep learning across the Internet.  
-  - [Flexgen](https://tailwindcss.com/) - An offloading-based system running on weak GPUs.  
+  - [Flexgen](https://github.com/FMInference/FlexLLMGen) - An offloading-based system running on weak GPUs.  
   - [Petals](https://github.com/bigscience-workshop/petals) - A library for decentralized LLMs fine-tuning and inference without offloading.
 
