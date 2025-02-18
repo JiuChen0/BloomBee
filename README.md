@@ -1,6 +1,10 @@
 <p align="center">  
     <img src="figures/bloombee.jpg" alt="Bloombee Logo" /><br>  
-    Run large language models in a heterogeneous decentralized environment with offloading.<br>  
+    Run large language models in a heterogeneous decentralized environment with offloading.<br>
+    <br>
+    <a href="https://pypi.org/project/bloombee/"><img src="https://img.shields.io/pypi/v/bloombee.svg?label=PyPI&color=green"></a>
+    <a href="https://github.com/yottalabsai/bloombee/actions"><img src="https://github.com/yottalabsai/BloomBee/actions/workflows/pylint.yml/badge.svg？branch=main"></a>
+    <a href="https://discord.gg/Ypexx2rxt9"><img src="https://img.shields.io/discord/1267714065166241813?label=Discord&logo=discord&logoColor=white"></a>
 </p>  
 
 The rapid rise of generative AI has boosted demand for large language model (LLM) inference and fine-tuining services. While proprietary models are still favored, advancements in open-source LLMs have made them competitive. However, high costs and limited GPU resources hinder deployment. This work introduces BloomBee, a decentralized offline serving system that leverages idle GPU resources to provide cost-effective access to LLMs.
@@ -40,14 +44,14 @@ If you want your swarm to be accessible outside of your local network, ensure th
 #### 2. Connect the workers to the main bloombee server  
 Here is the BloomBee Server location:
 ```
-export BBServer=/ip4/10.52.2.249/tcp/31340/p2p/QmefxzDL1DaJ7TcrZjLuz7Xs9sUVKpufyg7f5276ZHFjbQ  
+export BBSERVER=/ip4/10.52.2.249/tcp/31340/p2p/QmefxzDL1DaJ7TcrZjLuz7Xs9sUVKpufyg7f5276ZHFjbQ  
 
 ```
-Start one worker to hold 16 blocks(16 tranformer layers)
+Start one worker to hold 16 blocks (16 tranformer layers)
 ```
 python -m bloombee.cli.run_server huggyllama/llama-7b --initial_peers $BBSERVER --num_blocks 16  --identity_path bootstrap_1.id
 ```
-Start second worker to hold another 16 blocks(16 tranformer layers)
+Start second worker to hold another 16 blocks (16 tranformer layers)
 ```
 python -m bloombee.cli.run_server huggyllama/llama-7b --initial_peers $BBSERVER --num_blocks 16  --identity_path bootstrap_1.id
 ```
@@ -73,6 +77,6 @@ python benchmarks/benchmark_training.py --model huggyllama/llama-7b  --initial_p
 Bloombee is built upon a few popular libraries: 
 
   - [Hivemind](https://github.com/learning-at-home/hivemind) - A PyTorch library for decentralized deep learning across the Internet.  
-  - [Flexgen](https://github.com/FMInference/FlexLLMGen) - An offloading-based system running on weak GPUs.  
+  - [FlexLLMGen](https://github.com/FMInference/FlexLLMGen) - An offloading-based system running on weak GPUs.  
   - [Petals](https://github.com/bigscience-workshop/petals) - A library for decentralized LLMs fine-tuning and inference without offloading.
 
