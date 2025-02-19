@@ -1,23 +1,58 @@
 from setuptools import setup, find_packages  
+import os  
+
+# Read the long description from README.md  
+with open("README.md", "r", encoding="utf-8") as f:  
+    long_description = f.read()  
+
+# Get the version from bloombee/__init__.py  
+def get_version():  
+    init_path = os.path.join("src", "bloombee", "__init__.py")  
+    with open(init_path, "r", encoding="utf-8") as f:  
+        for line in f:  
+            if line.startswith("__version__"):  
+                return line.split("=")[1].strip().strip('"')  
+    raise RuntimeError("Unable to find version string.")  
 
 setup(  
-    name="bloombee",  # Change the name to "bloombee"  
-    version="0.1.1",  
-    author="Your Name",  
-    author_email="your.email@example.com",  
+    name="bloombee",  
+    version=get_version(),  
+    author="Sophie",  
+    author_email="syang127@ucmerced.edu",  
     description="A short description of your project",  
-    long_description=open("README.md").read(),  
+    long_description=long_description,  
     long_description_content_type="text/markdown",  
-    url="https://github.com/yottalabsai/BloomBee",  
-    package_dir={"": "src"},  # Specify the source directory  
-    packages=find_packages(where="src"),  # Find packages in the "src" directory  
+    url="https://github.com/yottalabsai/bloombee",  
+    project_urls={  
+        "Bug Tracker": "https://github.com/yottalabsai/bloombee/issues",  
+    },  
+    classifiers=[  
+        "Development Status :: 4 - Beta",  
+        "Intended Audience :: Developers",  
+        "Intended Audience :: Science/Research",  
+        "License :: OSI Approved :: Apache Software License",  
+        "Programming Language :: Python :: 3",  
+        "Programming Language :: Python :: 3.8",  
+        "Programming Language :: Python :: 3.9",  
+        "Programming Language :: Python :: 3.10",  
+        "Programming Language :: Python :: 3.11",  
+        "Topic :: Scientific/Engineering",  
+        "Topic :: Scientific/Engineering :: Mathematics",  
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",  
+        "Topic :: Software Development",  
+        "Topic :: Software Development :: Libraries",  
+        "Topic :: Software Development :: Libraries :: Python Modules",  
+    ],  
+    package_dir={"": "src"},  
+    packages=find_packages(where="src"),  
+    python_requires=">=3.8",  
     install_requires=[  
         "torch>=1.12",  
         "bitsandbytes==0.41.1",  
         "accelerate>=0.27.2",  
         "huggingface-hub>=0.11.1,<1.0.0",  
         "tokenizers>=0.13.3",  
-        "transformers==4.43.1",  # if you change this, please also change version assert in bloombee/__init__.py  
+        "transformers==4.43.1",  
         "speedtest-cli==2.1.3",  
         "hivemind",  
         "tensor_parallel==1.0.23",  
@@ -31,12 +66,6 @@ setup(
         "Dijkstar>=2.6.0",  
         "numpy<2",  
     ],  
-    classifiers=[  
-        "Programming Language :: Python :: 3",  
-        "License :: OSI Approved :: MIT License",  
-        "Operating System :: OS Independent",  
-    ],  
-    python_requires=">=3.9",  
     extras_require={  
         "dev": [  
             "pytest==6.2.5",  
