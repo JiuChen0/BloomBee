@@ -3,7 +3,7 @@
     Run large language models in a heterogeneous decentralized environment with offloading.<br>
     <br>
     <a href="https://pypi.org/project/bloombee/"><img src="https://img.shields.io/pypi/v/bloombee.svg?label=PyPI&color=green"></a>
-    <a href="https://github.com/yottalabsai/bloombee/actions"><img src="https://img.shields.io/github/actions/workflow/status/yottalabsai/bloombee/pylint.yml?branch=main&label=Build"></a>
+    <a href="https://github.com/ai-decentralized/bloombee/actions"><img src="https://img.shields.io/github/actions/workflow/status/ai-decentralized/bloombee/pylint.yml?branch=main&label=Build"></a>
     <a href="https://discord.gg/Ypexx2rxt9"><img src="https://img.shields.io/discord/1267714065166241813?label=Discord&logo=discord&logoColor=white"></a>
 </p>  
 
@@ -23,7 +23,7 @@ pip install bloombee
 ```
 #### From Source
 ```bash  
-git clone https://github.com/yottalabsai/BloomBee.git  
+git clone https://github.com/ai-decentralized/BloomBee.git  
 cd BloomBee  
 pip install .
 ```
@@ -60,21 +60,21 @@ python -m bloombee.cli.run_server huggyllama/llama-7b --initial_peers $BBSERVER 
 
 #### Inference   
 ```
-cd Bloombee/
+cd BloombBee/
 python benchmarks/benchmark_inference.py --model huggyllama/llama-7b  --initial_peers $BBSERVER --torch_dtype float32 --seq_len 128
 ```
 
 #### Finetune 
 
 ```
-cd Bloombee/
+cd BloomBee/
 python benchmarks/benchmark_training.py --model huggyllama/llama-7b  --initial_peers $BBSERVER --torch_dtype float32  --n_steps 20 --batch_size 32 --seq_len 128
 ```
 
 
 ## Acknowledgements  
 
-Bloombee is built upon a few popular libraries: 
+BloomBee is built upon a few popular libraries: 
 
   - [Hivemind](https://github.com/learning-at-home/hivemind) - A PyTorch library for decentralized deep learning across the Internet.  
   - [FlexLLMGen](https://github.com/FMInference/FlexLLMGen) - An offloading-based system running on weak GPUs.  
