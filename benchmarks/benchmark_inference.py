@@ -24,6 +24,14 @@ def main():
     parser.add_argument("--seq_len", type=int, default=2048, help="Sequence length")
     parser.add_argument("--warmup_steps", type=int, default=1, help="Number of warmup steps")
     parser.add_argument("--prompt_len", type=int, default=1, help="Length of initial prompt")
+    
+    # 采样参数选项
+    parser.add_argument("--do_sample", action="store_true", help="Use sampling instead of greedy decoding")
+    parser.add_argument("--temperature", type=float, default=0.7, help="Temperature for sampling (higher = more random)")
+    parser.add_argument("--top_p", type=float, default=0.9, help="Top-p nucleus sampling")
+    parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling")
+    parser.add_argument("--repetition_penalty", type=float, default=1.1, help="Repetition penalty (>1.0 to avoid repetition)")
+    
     args = parser.parse_args()
 
     if args.n_processes == "n_gpus":
@@ -52,7 +60,22 @@ def benchmark_inference(process_idx, args, result_pipe):
     )
     logger.info(f"Created model: {process_idx=} {model.device=}")
 
-    # 🔴 Create real multi-token input to test prompt_len > 1
+    # 构建生成参数
+    generate_kwargs = {"max_new_tokens": 1}
+    
+    if args.do_sample:
+        generate_kwargs.update({
+            "do_sample": True,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "repetition_penalty": args.repetition_penalty
+        })
+        logger.info(f"Using sampling: temperature={args.temperature}, top_p={args.top_p}, top_k={args.top_k}, repetition_penalty={args.repetition_penalty}")
+    else:
+        logger.info("Using greedy decoding (deterministic)")
+
+    #  Create real multi-token input to test prompt_len > 1
     if args.prompt_len > 1:
         # Create an initial prompt containing multiple tokens
         test_prompt = "Simply put, the theory of relativity states that"
@@ -68,40 +91,76 @@ def benchmark_inference(process_idx, args, result_pipe):
         with model.transformer.h.inference_session(max_length=args.seq_len) as sess:
             start_time = perf_counter()
             
-            # 🔴 Key: Use multi-token input for the first inference
-            outputs = model.generate(input_ids, max_new_tokens=1, session=sess)
+            #  Key: Use multi-token input for the first inference
+            outputs = model.generate(input_ids, session=sess, **generate_kwargs)
             result = tokenizer.decode(outputs[0])
             
             step_times = [perf_counter() - start_time]
             logger.info(f"Initial {args.prompt_len}-token input processed successfully!")
             
+            # Track generated length for correct decoding
+            previous_length = len(outputs[0])
+            
             # Continue generating remaining tokens
             for step in range(1, args.seq_len - args.prompt_len):
                 start_time = perf_counter()
-                outputs = model.generate(max_new_tokens=1, session=sess)
-                result += tokenizer.decode(outputs[0])
+                outputs = model.generate(session=sess, **generate_kwargs)
+                
+                # Debug: print outputs info
+                logger.info(f"Step {step}: outputs[0].shape = {outputs[0].shape}, previous_length = {previous_length}")
+                
+                # Only decode the new token(s)
+                if len(outputs[0]) > previous_length:
+                    new_token_ids = outputs[0][previous_length:]
+                    new_token = tokenizer.decode(new_token_ids, skip_special_tokens=True)
+                    previous_length = len(outputs[0])
+                else:
+                    # Fallback: decode last token only
+                    new_token = tokenizer.decode(outputs[0][-1:], skip_special_tokens=True)
+                
+                result += new_token
 
                 if step >= args.warmup_steps:
                     step_times.append(perf_counter() - start_time)
                     speed = 1 / np.mean(step_times)
-                    logger.info(f"{process_idx=} {step=} {speed=:.2f}")
+                    logger.info(f"{process_idx=} {step=} {speed=:.2f} | New token: {repr(new_token)} | Current result: {repr(result)}")
     else:
         # Original single-token logic
         result = ""
         step_times = []
+        previous_length = 0  # Track generated sequence length
+        
         with model.transformer.h.inference_session(max_length=args.seq_len) as sess:
             for step in range(args.seq_len):
                 start_time = perf_counter()
 
-                outputs = model.generate(max_new_tokens=1, session=sess)
-                result += tokenizer.decode(outputs[0])
+                outputs = model.generate(session=sess, **generate_kwargs)
+                
+                # Debug: print outputs info
+                logger.info(f"Step {step}: outputs[0].shape = {outputs[0].shape}, previous_length = {previous_length}")
+                
+                # Only decode the new token(s)
+                if len(outputs[0]) > previous_length:
+                    new_token_ids = outputs[0][previous_length:]
+                    new_token = tokenizer.decode(new_token_ids, skip_special_tokens=True)
+                    previous_length = len(outputs[0])
+                else:
+                    # Fallback: decode last token only
+                    new_token = tokenizer.decode(outputs[0][-1:], skip_special_tokens=True)
+                
+                result += new_token
 
                 if step >= args.warmup_steps:
                     step_times.append(perf_counter() - start_time)
                     speed = 1 / np.mean(step_times)
-                    logger.info(f"{process_idx=} {step=} {speed=:.2f}")
+                    logger.info(f"{process_idx=} {step=} {speed=:.2f} | New token: {repr(new_token)} | Current result: {repr(result)}")
 
     speed = 1 / np.mean(step_times) if step_times else 0.0
+    
+    # Print the generated text result
+    logger.info(f"Generated text (process {process_idx}): {repr(result)}")
+    logger.info(f"Generated text length: {len(result)} characters")
+    
     result_pipe.send(speed)
 
 
