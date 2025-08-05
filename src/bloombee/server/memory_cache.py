@@ -90,26 +90,26 @@ class MemoryCache:
         Returns:
             统一缓存对象，如果不存在返回None
         """
-        offload_logger.info(f" MemoryCache.get_unified_cache被调用 - 句柄: {handle}")
+        offload_logger.info(f" MemoryCache.get_unified_cache called - handle: {handle}")
         
-        # 尝试直接通过句柄获取
+        # Try to get directly by handle
         result = self._unified_caches.get(handle)
         if result is not None:
-            offload_logger.info(f"   - 直接通过句柄找到缓存: {result is not None}")
+            offload_logger.info(f"   - Found cache directly by handle: {result is not None}")
             if result:
-                offload_logger.info(f"   - 缓存设备: {result.device_info.device_id}")
+                offload_logger.info(f"   - Cache device: {result.device_info.device_id}")
             return result
         
-        # 如果直接获取失败，尝试通过 storage_key 格式查找
-        offload_logger.info(f"   - 直接获取失败，尝试通过 storage_key 查找")
+        # If direct lookup fails, try to find by storage_key format
+        offload_logger.info(f"   - Direct lookup failed, trying to find by storage_key")
         for key, value in self._unified_caches.items():
             if key.endswith(f"_{handle}"):
-                offload_logger.info(f"   - 通过 storage_key 找到缓存: {key}")
+                offload_logger.info(f"   - Found cache by storage_key: {key}")
                 if value:
-                    offload_logger.info(f"   - 缓存设备: {value.device_info.device_id}")
+                    offload_logger.info(f"   - Cache device: {value.device_info.device_id}")
                 return value
         
-        offload_logger.info(f"   - 未找到缓存")
+        offload_logger.info(f"   - Cache not found")
         return None
 
     def sync_device_cache(self, unified_cache: UnifiedCache, target_device: str) -> UnifiedCache:
@@ -117,9 +117,9 @@ class MemoryCache:
         Sync cache to target device
         Returns new UnifiedCache with updated device info
         """
-        offload_logger.info(f" MemoryCache.sync_device_cache被调用")
-        offload_logger.info(f"   - 输入设备: {unified_cache.device_info.device_id}")
-        offload_logger.info(f"   - 目标设备: {target_device}")
+        offload_logger.info(f" MemoryCache.sync_device_cache called")
+        offload_logger.info(f"   - Input device: {unified_cache.device_info.device_id}")
+        offload_logger.info(f"   - Target device: {target_device}")
         
         if unified_cache.past_key_value is None:
             offload_logger.warning("Cannot sync cache with None past_key_value")
@@ -127,36 +127,36 @@ class MemoryCache:
         
         # Check if sync is actually needed
         if unified_cache.device_info.device_id == target_device:
-            offload_logger.info("设备已匹配，无需同步")
+            offload_logger.info("Devices match, no sync needed")
             return unified_cache
         
-        offload_logger.info(f" MemoryCache设备同步:")
-        offload_logger.info(f"   - 源设备: {unified_cache.device_info.device_id}")
-        offload_logger.info(f"   - 目标设备: {target_device}")
-        offload_logger.info(f"   - 当前offloaded: {unified_cache.device_info.offloaded}")
-        offload_logger.info(f"   - past_key_value长度: {len(unified_cache.past_key_value)}")
+        offload_logger.info(f" MemoryCache device sync:")
+        offload_logger.info(f"   - Source device: {unified_cache.device_info.device_id}")
+        offload_logger.info(f"   - Target device: {target_device}")
+        offload_logger.info(f"   - Current offloaded: {unified_cache.device_info.offloaded}")
+        offload_logger.info(f"   - past_key_value length: {len(unified_cache.past_key_value)}")
         
         # Sync tensors to target device
         synced_tensors = []
         if isinstance(unified_cache.past_key_value, (tuple, list)):
             for i, tensor in enumerate(unified_cache.past_key_value):
                 if isinstance(tensor, torch.Tensor):
-                    offload_logger.info(f"   - 同步张量{i}: {tensor.device} -> {target_device}")
-                    offload_logger.info(f"     - 张量形状: {tensor.shape}")
-                    offload_logger.info(f"     - 张量dtype: {tensor.dtype}")
+                    offload_logger.info(f"   - Syncing tensor {i}: {tensor.device} -> {target_device}")
+                    offload_logger.info(f"     - Tensor shape: {tensor.shape}")
+                    offload_logger.info(f"     - Tensor dtype: {tensor.dtype}")
                     
-                    # 检查张量是否已经在目标设备上
-                    # 修复设备检查逻辑：比较完整的设备字符串
+                    # Check if tensor is already on target device
+                    # Fix device check logic: compare complete device string
                     if str(tensor.device) == target_device:
-                        offload_logger.info(f"   - 张量{i}已在目标设备上，跳过同步")
+                        offload_logger.info(f"   - Tensor {i} already on target device, skipping sync")
                         synced_tensors.append(tensor)
                     else:
                         synced_tensor = tensor.to(target_device, non_blocking=True)
                         synced_tensors.append(synced_tensor)
-                        offload_logger.info(f"   - 张量{i}同步完成: {tensor.device} -> {synced_tensor.device}")
+                        offload_logger.info(f"   - Tensor {i} sync completed: {tensor.device} -> {synced_tensor.device}")
                 else:
                     synced_tensors.append(tensor)
-                    offload_logger.info(f"   - 张量{i}: 非tensor对象，跳过同步")
+                    offload_logger.info(f"   - Tensor {i}: non-tensor object, skipping sync")
             
             # 更新设备信息
             new_offloaded = target_device != 'cuda:0'
@@ -167,9 +167,9 @@ class MemoryCache:
                 offloaded=new_offloaded
             )
             
-            offload_logger.info(f"   - 新offloaded状态: {new_offloaded}")
-            offload_logger.info(f"   - 新设备信息: {new_device_info}")
-            offload_logger.info(f" 设备同步完成")
+            offload_logger.info(f"   - New offloaded status: {new_offloaded}")
+            offload_logger.info(f"   - New device info: {new_device_info}")
+            offload_logger.info(f" Device sync completed")
             
             return UnifiedCache(
                 past_key_value=tuple(synced_tensors),
@@ -177,20 +177,20 @@ class MemoryCache:
                 cache_handles=unified_cache.cache_handles
             )
         
-        offload_logger.warning(f"⚠️  past_key_value不是tuple/list，跳过同步")
+        offload_logger.warning(f"⚠️  past_key_value is not tuple/list, skipping sync")
         return unified_cache
 
     def _create_handle(self) -> Handle:
-        """创建新的句柄"""
+        """Create new handle"""
         with self._lock_metadata:
-            # 使用进程内句柄计数器，避免多进程共享问题
+            # Use process-local handle counter to avoid multi-process sharing issues
             handle = self._local_handle_counter
             self._local_handle_counter += 1
-            # 同时更新多进程共享的计数器
+            # Also update the multi-process shared counter
             self.handle_counter = self._local_handle_counter
-            offload_logger.info(f" 创建新句柄: {handle} (本地计数器: {self._local_handle_counter})")
-            offload_logger.info(f"   - 进程ID: {os.getpid()}")
-            offload_logger.info(f"   - 运行时PID: {self.runtime_pid}")
+            offload_logger.info(f" Created new handle: {handle} (local counter: {self._local_handle_counter})")
+            offload_logger.info(f"   - Process ID: {os.getpid()}")
+            offload_logger.info(f"   - Runtime PID: {self.runtime_pid}")
             return handle
 
     @contextlib.asynccontextmanager

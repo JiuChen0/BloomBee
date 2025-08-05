@@ -40,6 +40,10 @@ import os
 # sys.path.insert(0,'/flexgen_model_in_petals/src/petals/')
 # from memory_usage import see_memory_usage, nvidia_smi_usage
 from bloombee.utils.memory_usage import see_memory_usage, nvidia_smi_usage
+import logging
+
+offload_logger = logging.getLogger('bloombee.offloading')
+offload_logger.setLevel(logging.INFO)
 
 fix_recursive_import()
 
@@ -330,8 +334,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         self._cached_task = None
         self._is_initialized = False
         
-        # 🔧 添加KVCacheManager支持
-        self.cache_manager = None
+        # 🔧 Initialize cache interface
         self._init_cache_manager()
         
         # print('before init_all_weights OptimizedLlamaDecoderLayer self.config', self.config)
@@ -344,21 +347,33 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         self.temp_hidden = ValueHolder() ######
         
     def _init_cache_manager(self):
-        """Initialize cache manager using shared utility"""
-        from bloombee.server.memory_cache_manager import init_cache_manager_shared
-        from bloombee.server.cache_coordinator import get_cache_interface, create_device_info_from_policy
+        from bloombee.server.cache_coordinator import get_cache_coordinator
         
-        # 使用缓存协调器而不是直接持有cache_manager
-        self.cache_interface = get_cache_interface()
+        self.cache_interface = get_cache_coordinator()
         if self.cache_interface is not None:
-            # 注册当前层到协调器
-            self.cache_interface.register_layer(self.layer_id, {
+            # Calculate actual number of layers based on policy.sep_layer
+            num_workspaces = 1 if self.policy.sep_layer else 2
+            
+            # Register current layer to coordinator with detailed layer information
+            layer_info = {
                 'layer_type': 'llama_decoder',
-                'policy': self.policy
-            })
+                'policy': self.policy,
+                'layer_id': self.layer_id,
+                'num_workspaces': num_workspaces,
+                'sep_layer': self.policy.sep_layer,
+                'config': self.llama_config,
+                'env': self.env
+            }
+            
+            self.cache_interface.register_layer(self.layer_id, layer_info)
+            offload_logger.info(f" Layer {self.layer_id} registered to cache coordinator")
+            offload_logger.info(f"   - sep_layer: {self.policy.sep_layer}")
+            offload_logger.info(f"   - num_workspaces: {num_workspaces}")
+            offload_logger.info(f"   - gpu_batch_size: {self.policy.gpu_batch_size}")
+            offload_logger.info(f"   - num_attention_heads: {self.llama_config.num_attention_heads}")
+        else:
+            offload_logger.warning(f" Cache coordinator unavailable, layer {self.layer_id} will not be able to use cache functionality")
         
-        # 保留原有的cache_manager用于向后兼容
-        self.cache_manager = init_cache_manager_shared(self.policy, self.layer_id)
         
     def set_task(self, task):
         self.task = task
@@ -616,9 +631,9 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
                     generated_tokens_num = position_ids.flatten()[-1].item() - self.task.prompt_len + 1
                 for k in range(self.num_gpu_batches):
                     
-                    # 当前批次依次通过所有层
+                    # Current batch passes through all layers sequentially
                     for j in range(self.num_layers):
-                        # 加载当前层的缓存
+                        # Load cache for current layer
                         # self.load_cache(i, j, k, overlap=False)
                         # self.load_hidden(i, j, k)
                         if j == 0:
@@ -631,9 +646,9 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
                             past_v_new = past_value.permute(2, 0, 1, 3).contiguous().view(s, b * h, d)
                             
                             self.cache_read_buf[0][0].store((past_k_new, past_v_new))
-                        # 计算当前层
-                        # j=0: 使用初始hidden_states
-                        # j=1: 使用temp_hidden (第0层的输出)
+                        # Compute current layer
+                        # j=0: use initial hidden_states
+                        # j=1: use temp_hidden (output from layer 0)
                         layer_output = self.compute_layer(i, j, k, position_ids=position_ids, generated_tokens_num=generated_tokens_num)
                         
                         if j == 0:
@@ -647,12 +662,12 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
                             
                             self.cache_write_buf[0][0].store((k_new, v_new))
                         
-                        # 存储当前层的缓存
+                        # Store cache for current layer
                         # self.store_cache(i, j, k, overlap=False)
                         # torch.cuda.synchronize()
                         # self.store_hidden(i, j, k)
                     
-                    # 保存当前批次的最终输出（经过所有层）
+                    # Save final output of current batch (after passing through all layers)
                     print(f"forward, layer_output: {layer_output}")
                     final_outputs.append(layer_output.data.clone())
                     
@@ -989,59 +1004,46 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
             past_key_values_length=past_key_values_length,
         )
         
-        #  添加缓存管理调用
+        # Add cache management calls
         import logging
         offload_logger = logging.getLogger('bloombee.offloading')
         
-        # 获取当前位置信息 - 修复位置计算逻辑
+        # Get current position information - fix position calculation logic
         if position_ids is not None:
-            # 如果position_ids是[[0]]，说明是prefill阶段，位置应该是0
+            # If position_ids is [[0]], it means prefill stage, position should be 0
             if position_ids.shape == (1, 1) and position_ids[0][0].item() == 0:
                 current_position = 0
             else:
-                # 否则使用position_ids的值
+                # 使用position_ids的值
                 current_position = position_ids[0][0].item()
         else:
-            # 根据past_key_value计算位置
+            # Calculate position based on past_key_value
             if past_key_value is not None:
-                current_position = past_key_value[0].shape[2]  # 使用KV cache的长度作为位置
+                current_position = past_key_value[0].shape[2]  # Use KV cache length as position
             else:
                 current_position = 0
         
         layer_id = getattr(self, 'layer_id', 0)
         
-        offload_logger.info(f" 位置信息 - current_position:{current_position}, layer_id:{layer_id}")
+        offload_logger.info(f" Position info - current_position:{current_position}, layer_id:{layer_id}")
         if position_ids is not None:
-            offload_logger.info(f"   - position_ids形状: {position_ids.shape}")
-            offload_logger.info(f"   - position_ids内容: {position_ids}")
+            offload_logger.info(f"   - position_ids shape: {position_ids.shape}")
+            offload_logger.info(f"   - position_ids content: {position_ids}")
         if past_key_value is not None:
-            offload_logger.info(f"   - past_key_value长度: {past_key_value[0].shape[2]}")
+            offload_logger.info(f"   - past_key_value length: {past_key_value[0].shape[2]}")
         
-        # 使用缓存协调器加载缓存
+        # Use cache coordinator to load cache
         if hasattr(self, 'cache_interface') and self.cache_interface is not None and current_position > 0:
-            offload_logger.info(f" WrappedLlamaBlock.load_cache - 位置:{current_position}, 层:{layer_id}")
+            offload_logger.info(f" WrappedLlamaBlock.load_cache - position:{current_position}, layer:{layer_id}")
             try:
-                # 通过协调器加载缓存
+                # Load cache through coordinator
                 result = self.cache_interface.load_cache(layer_id, current_position, str(hidden_states.device), 0)
                 if result is not None:
-                    offload_logger.info(f" 成功加载缓存 - 位置:{current_position}, 层:{layer_id}")
+                    offload_logger.info(f" Successfully loaded cache - position:{current_position}, layer:{layer_id}")
                 else:
-                    offload_logger.warning(f"⚠️ 缓存不存在 - 位置:{current_position}, 层:{layer_id}")
+                    offload_logger.warning(f"⚠️ Cache does not exist - position:{current_position}, layer:{layer_id}")
             except Exception as e:
-                offload_logger.warning(f"⚠️ 缓存协调器load_cache失败: {e}")
-        # 向后兼容：如果协调器不可用，使用原有的cache_manager
-        elif hasattr(self, 'cache_manager') and self.cache_manager is not None and current_position > 0:
-            offload_logger.info(f" WrappedLlamaBlock.load_cache (fallback) - 位置:{current_position}, 层:{layer_id}")
-            try:
-                result = self.cache_manager.load_cache(current_position, layer_id, 0)  # k=0 for single batch
-                if result is not None:
-                    offload_logger.info(f" 成功加载缓存 (fallback) - 位置:{current_position}, 层:{layer_id}")
-                else:
-                    offload_logger.warning(f"⚠️ 缓存不存在 (fallback) - 位置:{current_position}, 层:{layer_id}")
-            except Exception as e:
-                offload_logger.warning(f"⚠️ KVCacheManager load_cache失败: {e}")
-        
-        # print(f"WrappedLlamaBlock, attention_mask: {attention_mask}")
+                offload_logger.warning(f"⚠️ Cache coordinator load_cache failed: {e}")
 
         outputs = super().forward( ############
             hidden_states,
@@ -1057,58 +1059,23 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
         print(f"WrappedLlamaBlock.forward, past_key_value: {past_key_value}")
         print('use_cache', use_cache)
         
-        # 添加缓存管理调用
-        # 使用缓存协调器存储缓存
+        # Add cache management calls
+        # Use cache coordinator to store cache
         if hasattr(self, 'cache_interface') and self.cache_interface is not None:
-            offload_logger.info(f"WrappedLlamaBlock.store_cache - 位置:{current_position}, 层:{layer_id}")
+            offload_logger.info(f"WrappedLlamaBlock.store_cache - position:{current_position}, layer:{layer_id}")
             try:
                 if past_key_value is not None:
-                    # 通过协调器存储缓存
+                    # Store cache through coordinator
                     handle = self.cache_interface.store_cache(layer_id, current_position, past_key_value, hidden_states.device, 0)
                     if handle is not None:
-                        offload_logger.info(f"成功存储缓存 - 位置:{current_position}, 层:{layer_id}, 句柄:{handle}")
+                        offload_logger.info(f"Successfully stored cache - position:{current_position}, layer:{layer_id}, handle:{handle}")
                     else:
-                        offload_logger.warning(f"⚠️ 存储缓存失败 - 位置:{current_position}, 层:{layer_id}")
+                        offload_logger.warning(f"⚠️ Failed to store cache - position:{current_position}, layer:{layer_id}")
                 else:
-                    offload_logger.warning(f"⚠️ past_key_value为空，跳过store_cache")
+                    offload_logger.warning(f"⚠️ past_key_value is empty, skipping store_cache")
             except Exception as e:
-                offload_logger.warning(f"⚠️ 缓存协调器store_cache失败: {e}")
-        # 向后兼容：如果协调器不可用，使用原有的cache_manager
-        elif hasattr(self, 'cache_manager') and self.cache_manager is not None:
-            offload_logger.info(f"WrappedLlamaBlock.store_cache (fallback) - 位置:{current_position}, 层:{layer_id}")
-            try:
-                # 创建UnifiedCache对象
-                from bloombee.server.memory_cache import UnifiedCache, DeviceInfo
-                
-                # 从past_key_value创建UnifiedCache
-                if past_key_value is not None:
-                    # 使用统一的设备分配工具函数
-                    device_info = create_device_info_from_policy(
-                        self.policy if hasattr(self, 'policy') else None,
-                        str(hidden_states.device)
-                    )
-                    
-                    unified_cache = UnifiedCache(
-                        past_key_value=past_key_value,
-                        device_info=device_info
-                    )
-                    
-                    # 实际调用KVCacheManager的store_cache
-                    self.cache_manager.store_cache(unified_cache, current_position, layer_id, 0)  # k=0 for single batch
-                    offload_logger.info(f"成功存储缓存 (fallback) - 位置:{current_position}, 层:{layer_id}, 设备:{device_info.device_type} ({device_info.device_id})")
-                else:
-                    offload_logger.warning(f"⚠️ past_key_value为空，跳过store_cache")
-            except Exception as e:
-                offload_logger.warning(f"⚠️ KVCacheManager store_cache失败: {e}")
-        
-        # use_cache
-        # if use_cache:
-        #     present_key_value = outputs[-1]
-        #     present_key_value = self._reorder_cache_from_llama_to_bloom(
-        #         present_key_value, batch_size, seq_length_with_past
-        #     )
-        #     outputs = outputs[:-1] + (present_key_value,)
-        
+                offload_logger.warning(f"⚠️ Cache coordinator store_cache failed: {e}")
+
         return outputs
 
     def _reorder_cache_from_bloom_to_llama(

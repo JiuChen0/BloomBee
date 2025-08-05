@@ -140,14 +140,14 @@ def init_weight_list(weight_specs, policy, env):
 # 添加一个新函数，用于从 PyTorch 模型加载权重到 FlexGen 格式
 def load_weights_from_pytorch_model(model, policy, env, weight_home, block_index):
     """
-    从 PyTorch 模型加载权重到 FlexGen 格式
+    Load weights from PyTorch model to FlexGen format
     
     Args:
-        model: PyTorch 模型
-        policy: FlexGen 策略
-        env: FlexGen 环境
-        weight_home: 权重存储位置
-        block_index: 块索引
+        model: PyTorch model
+        policy: FlexGen policy
+        env: FlexGen environment
+        weight_home: Weight storage location
+        block_index: Block index
     """
     weight_specs = []
     
@@ -362,26 +362,38 @@ class FLEX_LlamaAttention(LlamaAttention):
         
         self.task = None
         
-        # 新增：支持KVCacheManager
-        self.cache_manager = None
+        self.cache_interface = None
         self._init_cache_manager()
 
     def _init_cache_manager(self):
-        """Initialize cache manager using shared utility"""
-        from bloombee.server.memory_cache_manager import init_cache_manager_shared
-        from bloombee.server.cache_coordinator import get_cache_interface, create_device_info_from_policy
+        """Initialize cache interface only - no direct cache_manager dependency"""
+        from bloombee.server.cache_coordinator import get_cache_coordinator
         
-        # 使用缓存协调器而不是直接持有cache_manager
-        self.cache_interface = get_cache_interface()
+        self.cache_interface = get_cache_coordinator()
         if self.cache_interface is not None:
-            # 注册当前层到协调器
-            self.cache_interface.register_layer(self.layer_id, {
+            # 根据policy.sep_layer计算实际的层数
+            num_workspaces = 1 if self.policy.sep_layer else 2
+            
+            layer_info = {
                 'layer_type': 'llama_attention',
-                'policy': self.policy
-            })
+                'policy': self.policy,
+                'layer_id': self.layer_id,
+                'num_workspaces': num_workspaces,
+                'sep_layer': self.policy.sep_layer,
+                'config': self.config,
+                'env': self.env
+            }
+            
+            self.cache_interface.register_layer(self.layer_id, layer_info)
+            offload_logger.info(f" Layer {self.layer_id} registered to cache coordinator")
+            offload_logger.info(f"   - sep_layer: {self.policy.sep_layer}")
+            offload_logger.info(f"   - num_workspaces: {num_workspaces}")
+            offload_logger.info(f"   - gpu_batch_size: {self.policy.gpu_batch_size}")
+            offload_logger.info(f"   - num_attention_heads: {self.config.num_attention_heads}")
+        else:
+            offload_logger.warning(f"Cache coordinator unavailable, layer {self.layer_id} will not be able to use cache functionality")
         
-        # 保留原有的cache_manager用于向后兼容
-        self.cache_manager = init_cache_manager_shared(self.policy, self.layer_id)
+        # self.cache_manager = init_cache_manager_shared(self.policy, self.layer_id)
 
     def set_task(self, task):
         self.task = task
@@ -425,17 +437,15 @@ class FLEX_LlamaAttention(LlamaAttention):
             
     def init_cache_one_gpu_batch(self, cache_home):
         """
-        初始化一个GPU批次的缓存
-        支持KVCacheManager的统一接口
+        Initialize cache for one GPU batch
+        Support unified interface for cache coordinator
         """
-        if self.cache_manager is not None:
-            # 使用KVCacheManager的统一接口
+        if hasattr(self, 'cache_interface') and self.cache_interface is not None:
             try:
-                from bloombee.server.memory_cache import UnifiedCache
-                
-                unified_cache = self.cache_manager.init_cache_one_gpu_batch(
+                # 通过cache coordinator初始化cache
+                unified_cache = self.cache_interface.init_cache_one_gpu_batch(
                     layer_id=self.layer_id,
-                    batch_id=0,  # 这里需要根据实际情况调整batch_id
+                    batch_id=0,  ############################### 这里需要根据实际情况调整batch_id
                     config=self.config,
                     task=self.task,
                     policy=self.policy
@@ -443,12 +453,12 @@ class FLEX_LlamaAttention(LlamaAttention):
                 
                 # 将UnifiedCache存储到cache_home
                 cache_home.store(unified_cache)
-                offload_logger.info(f"初始化缓存 - 层:{self.layer_id}")
-                offload_logger.info(f"   - 使用KVCacheManager")
+                offload_logger.info(f"Initialized cache - layer:{self.layer_id}")
+                offload_logger.info(f"   - Using cache coordinator")
                 return
                 
             except Exception as e:
-                offload_logger.warning(f"⚠️ KVCacheManager init_cache失败，使用原有实现: {e}")
+                offload_logger.warning(f"⚠️ Cache coordinator init_cache failed, using original implementation: {e}")
         
         # 原有的实现作为fallback
         if self.policy.cache_gpu_percent == 100:
@@ -480,8 +490,8 @@ class FLEX_LlamaAttention(LlamaAttention):
 
     def load_cache(self, cache_home, cache_read_buf, i):
         """
-        加载缓存
-        支持缓存协调器的统一接口
+        Load cache
+        Support unified interface for cache coordinator
         """
         if i == 0:  # prefill, no cache
             return
@@ -502,47 +512,20 @@ class FLEX_LlamaAttention(LlamaAttention):
                 if unified_cache and unified_cache.past_key_value:
                     # 将UnifiedCache转换为cache_read_buf格式
                     cache_read_buf.store(unified_cache.past_key_value)
-                    offload_logger.info(f"加载缓存 - 层:{self.layer_id}, 位置:{i}")
-                    offload_logger.info(f"   - 使用缓存协调器成功")
+                    offload_logger.info(f"Loaded cache - layer:{self.layer_id}, position:{i}")
+                    offload_logger.info(f"   - Successfully used cache coordinator")
                 else:
                     # 处理缓存不存在的情况
                     cache_read_buf.store(None)
-                    offload_logger.info(f" 加载缓存 - 层:{self.layer_id}, 位置:{i}")
-                    offload_logger.info(f"   - 缓存不存在，使用缓存协调器")
+                    offload_logger.info(f" Loaded cache - layer:{self.layer_id}, position:{i}")
+                    offload_logger.info(f"   - Cache does not exist, using cache coordinator")
                 return
                 
             except Exception as e:
-                offload_logger.warning(f"⚠️ 缓存协调器load_cache失败，使用原有实现: {e}")
+                offload_logger.warning(f"⚠️ Cache coordinator load_cache failed, using original implementation: {e}")
         
-        # 向后兼容：使用原有的cache_manager
-        if self.cache_manager is not None:
-            try:
-                from bloombee.server.memory_cache import UnifiedCache
-                
-                # 确定目标设备
-                target_device = 'cuda:0' if not self.policy.cpu_cache_compute else 'cpu'
-                
-                unified_cache = self.cache_manager.load_cache(
-                    position=i,
-                    layer_id=self.layer_id,
-                    batch_id=0,  # 需要根据实际情况调整
-                    target_device=target_device
-                )
-                
-                if unified_cache and unified_cache.past_key_value:
-                    # 将UnifiedCache转换为cache_read_buf格式
-                    cache_read_buf.store(unified_cache.past_key_value)
-                    offload_logger.info(f"加载缓存 (fallback) - 层:{self.layer_id}, 位置:{i}")
-                    offload_logger.info(f"   - 使用KVCacheManager成功")
-                else:
-                    # 处理缓存不存在的情况
-                    cache_read_buf.store(None)
-                    offload_logger.info(f" 加载缓存 (fallback) - 层:{self.layer_id}, 位置:{i}")
-                    offload_logger.info(f"   - 缓存不存在，使用KVCacheManager")
-                return
-                
-            except Exception as e:
-                offload_logger.warning(f"⚠️ KVCacheManager load_cache失败，使用原有实现: {e}")
+        # ❌ 移除对cache_manager的直接依赖
+        # 原有的实现作为fallback
 
         # 原有的实现作为fallback
         k_home, v_home = cache_home.val
@@ -626,8 +609,8 @@ class FLEX_LlamaAttention(LlamaAttention):
 
     def store_cache(self, cache_home, cache_write_buf, i):
         """
-        存储缓存
-        支持缓存协调器的统一接口
+        Store cache
+        Support unified interface for cache coordinator
         """
         # 使用缓存协调器存储缓存
         if hasattr(self, 'cache_interface') and self.cache_interface is not None:
@@ -646,53 +629,19 @@ class FLEX_LlamaAttention(LlamaAttention):
                     )
                     
                     if handle is not None:
-                        offload_logger.info(f" 存储缓存 - 层:{self.layer_id}, 位置:{i}, 句柄:{handle}")
-                        offload_logger.info(f"   - 使用缓存协调器成功")
+                        offload_logger.info(f" Stored cache - layer:{self.layer_id}, position:{i}, handle:{handle}")
+                        offload_logger.info(f"   - Successfully used cache coordinator")
                     else:
-                        offload_logger.warning(f"⚠️ 存储缓存失败 - 层:{self.layer_id}, 位置:{i}")
+                        offload_logger.warning(f"⚠️ Failed to store cache - layer:{self.layer_id}, position:{i}")
                     return
                 else:
-                    offload_logger.warning(f"⚠️ new_cache_data为空，跳过存储")
+                    offload_logger.warning(f"⚠️ new_cache_data is empty, skipping storage")
                     return
                     
             except Exception as e:
-                offload_logger.warning(f"⚠️ 缓存协调器store_cache失败，使用原有实现: {e}")
+                offload_logger.warning(f"⚠️ Cache coordinator store_cache failed, using original implementation: {e}")
         
-        # 向后兼容：使用原有的cache_manager
-        if self.cache_manager is not None:
-            try:
-                from bloombee.server.memory_cache import UnifiedCache, DeviceInfo
-                
-                # 从cache_write_buf获取新的缓存数据
-                new_cache_data = cache_write_buf.pop()
-                
-                if new_cache_data is not None:
-                    # 创建UnifiedCache
-                    # 使用统一的设备分配工具函数
-                    device_info = create_device_info_from_policy(
-                        self.policy if hasattr(self, 'policy') else None,
-                        'cuda:0',
-                        self.policy.comp_cache_config if hasattr(self, 'policy') and self.policy.compress_cache else None
-                    )
-                    
-                    unified_cache = UnifiedCache(
-                        past_key_value=new_cache_data,
-                        device_info=device_info
-                    )
-                    
-                    # 使用KVCacheManager存储
-                    self.cache_manager.store_cache(
-                        unified_cache=unified_cache,
-                        position=i,
-                        layer_id=self.layer_id,
-                        batch_id=0  # 需要根据实际情况调整
-                    )
-                    offload_logger.info(f" 存储缓存 (fallback) - 层:{self.layer_id}, 位置:{i}, 设备:{device_info.device_type} ({device_info.device_id})")
-                    offload_logger.info(f"   - 使用KVCacheManager成功")
-                    return
-                    
-            except Exception as e:
-                offload_logger.warning(f"⚠️ KVCacheManager store_cache失败，使用原有实现: {e}")
+        #  移除对cache_manager的直接依赖
 
         # 原有的实现作为fallback
         # shape: (s, b * num_attention_heads, head_dim)
@@ -767,12 +716,12 @@ class FLEX_LlamaAttention(LlamaAttention):
         num_attention_heads = self.config.num_attention_heads
         
         # 🔧 添加forward开始调试信息
-        offload_logger.info(f"FLEX_LlamaAttention.forward开始:")
+        offload_logger.info(f"FLEX_LlamaAttention.forward started:")
         offload_logger.info(f"   - layer_id: {self.layer_id}")
         offload_logger.info(f"   - position: {i}")
         offload_logger.info(f"   - batch: {k}")
-        offload_logger.info(f"   - cache_manager可用: {self.cache_manager is not None}")
-        offload_logger.info(f"   - 当前设备: {hidden.val.device if hasattr(hidden, 'val') else 'Unknown'}")
+        offload_logger.info(f"   - cache_interface available: {hasattr(self, 'cache_interface') and self.cache_interface is not None}")
+        offload_logger.info(f"   - Current device: {hidden.val.device if hasattr(hidden, 'val') else 'Unknown'}")
 
         donate = [False] * 16
         h, donate[0] = hidden.val, True
@@ -796,21 +745,21 @@ class FLEX_LlamaAttention(LlamaAttention):
             print(f"attention forward, mask: {mask.data}")
             
             # 🔧 添加prefill调试信息
-            offload_logger.info(f" Prefill阶段:")
-            offload_logger.info(f"   - 使用mha_llama")
-            offload_logger.info(f"   - mask设备: {mask.device}")
-            offload_logger.info(f"   - compute设备: {self.compute}")
+            offload_logger.info(f" Prefill stage:")
+            offload_logger.info(f"   - Using mha_llama")
+            offload_logger.info(f"   - mask device: {mask.device}")
+            offload_logger.info(f"   - compute device: {self.compute}")
             
             h, new_k_cache, new_v_cache = self.compute.mha_llama(h, mask, w_q, w_k, w_v, w_out,
                                        num_attention_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config, input_layernorm, rotary_emb_inv_freq)
             cache_write_buf.store((new_k_cache, new_v_cache))
             
             # 🔧 添加prefill结果调试信息
-            offload_logger.info(f"Prefill完成:")
-            offload_logger.info(f"   - new_k_cache形状: {new_k_cache.shape if hasattr(new_k_cache, 'shape') else 'Unknown'}")
-            offload_logger.info(f"   - new_v_cache形状: {new_v_cache.shape if hasattr(new_v_cache, 'shape') else 'Unknown'}")
-            offload_logger.info(f"   - new_k_cache设备: {new_k_cache.device if hasattr(new_k_cache, 'device') else 'Unknown'}")
-            offload_logger.info(f"   - new_v_cache设备: {new_v_cache.device if hasattr(new_v_cache, 'device') else 'Unknown'}")
+            offload_logger.info(f"Prefill completed:")
+            offload_logger.info(f"   - new_k_cache shape: {new_k_cache.shape if hasattr(new_k_cache, 'shape') else 'Unknown'}")
+            offload_logger.info(f"   - new_v_cache shape: {new_v_cache.shape if hasattr(new_v_cache, 'shape') else 'Unknown'}")
+            offload_logger.info(f"   - new_k_cache device: {new_k_cache.device if hasattr(new_k_cache, 'device') else 'Unknown'}")
+            offload_logger.info(f"   - new_v_cache device: {new_v_cache.device if hasattr(new_v_cache, 'device') else 'Unknown'}")
             
             # see_memory_usage("-----------------------------------------after mha_llama ")
         else:
@@ -831,12 +780,12 @@ class FLEX_LlamaAttention(LlamaAttention):
             print(f"k_cache: {k_cache.shape}, self.policy.compress_cache: {self.policy.compress_cache}")
             
             # 🔧 添加decoding调试信息
-            offload_logger.info(f" Decoding阶段:")
-            offload_logger.info(f"   - 使用mha_gen_llama")
-            offload_logger.info(f"   - k_cache形状: {k_cache.shape if hasattr(k_cache, 'shape') else 'Unknown'}")
-            offload_logger.info(f"   - v_cache形状: {v_cache.shape if hasattr(v_cache, 'shape') else 'Unknown'}")
-            offload_logger.info(f"   - k_cache设备: {k_cache.device if hasattr(k_cache, 'device') else 'Unknown'}")
-            offload_logger.info(f"   - v_cache设备: {v_cache.device if hasattr(v_cache, 'device') else 'Unknown'}")
+            offload_logger.info(f" Decoding stage:")
+            offload_logger.info(f"   - Using mha_gen_llama")
+            offload_logger.info(f"   - k_cache shape: {k_cache.shape if hasattr(k_cache, 'shape') else 'Unknown'}")
+            offload_logger.info(f"   - v_cache shape: {v_cache.shape if hasattr(v_cache, 'shape') else 'Unknown'}")
+            offload_logger.info(f"   - k_cache device: {k_cache.device if hasattr(k_cache, 'device') else 'Unknown'}")
+            offload_logger.info(f"   - v_cache device: {v_cache.device if hasattr(v_cache, 'device') else 'Unknown'}")
             offload_logger.info(f"   - attention_compute: {self.attention_compute}")
             offload_logger.info(f"   - compress_cache: {self.policy.compress_cache}")
             
@@ -851,20 +800,20 @@ class FLEX_LlamaAttention(LlamaAttention):
             cache_write_buf.store((new_k_cache, new_v_cache))
             
             # 🔧 添加decoding结果调试信息
-            offload_logger.info(f" Decoding完成:")
-            offload_logger.info(f"   - new_k_cache形状: {new_k_cache.shape if hasattr(new_k_cache, 'shape') else 'Unknown'}")
-            offload_logger.info(f"   - new_v_cache形状: {new_v_cache.shape if hasattr(new_v_cache, 'shape') else 'Unknown'}")
-            offload_logger.info(f"   - new_k_cache设备: {new_k_cache.device if hasattr(new_k_cache, 'device') else 'Unknown'}")
-            offload_logger.info(f"   - new_v_cache设备: {new_v_cache.device if hasattr(new_v_cache, 'device') else 'Unknown'}")
+            offload_logger.info(f" Decoding completed:")
+            offload_logger.info(f"   - new_k_cache shape: {new_k_cache.shape if hasattr(new_k_cache, 'shape') else 'Unknown'}")
+            offload_logger.info(f"   - new_v_cache shape: {new_v_cache.shape if hasattr(new_v_cache, 'shape') else 'Unknown'}")
+            offload_logger.info(f"   - new_k_cache device: {new_k_cache.device if hasattr(new_k_cache, 'device') else 'Unknown'}")
+            offload_logger.info(f"   - new_v_cache device: {new_v_cache.device if hasattr(new_v_cache, 'device') else 'Unknown'}")
             
             # see_memory_usage("-----------------------------------------after mha_gen_llama ")
         hidden.val = h
         self.temp_hidden_states.val=h
         
         # 🔧 添加forward完成调试信息
-        offload_logger.info(f" FLEX_LlamaAttention.forward完成:")
-        offload_logger.info(f"   - 输出hidden_states形状: {h.shape if hasattr(h, 'shape') else 'Unknown'}")
-        offload_logger.info(f"   - 输出hidden_states设备: {h.device if hasattr(h, 'device') else 'Unknown'}")
+        offload_logger.info(f" FLEX_LlamaAttention.forward completed:")
+        offload_logger.info(f"   - Output hidden_states shape: {h.shape if hasattr(h, 'shape') else 'Unknown'}")
+        offload_logger.info(f"   - Output hidden_states device: {h.device if hasattr(h, 'device') else 'Unknown'}")
         
         return h
 
@@ -1068,7 +1017,7 @@ class LlamaDecoderLayer(nn.Module):
     def load_cache(self, i, j, k, overlap=True):
         # Handle corner cases
         if i == 0:  # prefill, no cache
-            offload_logger.info(f" Prefill阶段，跳过load_cache - 位置:{i}, 层:{j}, 批次:{k}")
+            offload_logger.info(f" Prefill stage, skipping load_cache - position:{i}, layer:{j}, batch:{k}")
             return
         if k == self.num_gpu_batches:
             k = 0
@@ -1080,7 +1029,7 @@ class LlamaDecoderLayer(nn.Module):
                 return
 
         # Load from cache_home to cache_read_buf
-        offload_logger.info(f"LlamaDecoderLayer.load_cache - 位置:{i}, 层:{j}, 批次:{k}")
+        offload_logger.info(f"LlamaDecoderLayer.load_cache - position:{i}, layer:{j}, batch:{k}")
         if overlap:
             with torch.cuda.stream(self.load_cache_stream):
                 self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
@@ -1098,13 +1047,13 @@ class LlamaDecoderLayer(nn.Module):
             if i == -1:
                 return
         if i == self.task.gen_len - 1:  # last token, no need to store cache
-            offload_logger.info(f"最后一个token，跳过store_cache - 位置:{i}, 层:{j}, 批次:{k}")
+            offload_logger.info(f"Last token, skipping store_cache - position:{i}, layer:{j}, batch:{k}")
             self.cache_write_buf[j][k].pop()
             return
 
         # Store cache_write_buf to cache_home
         # Delete cache_write_buf
-        offload_logger.info(f" LlamaDecoderLayer.store_cache - 位置:{i}, 层:{j}, 批次:{k}")
+        offload_logger.info(f" LlamaDecoderLayer.store_cache - position:{i}, layer:{j}, batch:{k}")
         if overlap:
             with torch.cuda.stream(self.store_cache_stream):
                 self.layers[j].store_cache(self.cache_home[j][k], self.cache_write_buf[j][k], i)
@@ -1181,7 +1130,7 @@ class LlamaDecoderLayer(nn.Module):
         
 
         if i > 0:  # 只在decoding阶段调用load_cache
-            offload_logger.info(f" 调用load_cache - 位置:{i}, 层:{j}, 批次:{k}")
+            offload_logger.info(f" Calling load_cache - position:{i}, layer:{j}, batch:{k}")
             self.load_cache(i, j, k, overlap=False)
         
         self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
@@ -1189,7 +1138,7 @@ class LlamaDecoderLayer(nn.Module):
                                self.cache_write_buf[j][k], i, k)
         
 
-        offload_logger.info(f" 调用store_cache - 位置:{i}, 层:{j}, 批次:{k}")
+        offload_logger.info(f" Calling store_cache - position:{i}, layer:{j}, batch:{k}")
         self.store_cache(i, j, k, overlap=False)
 
     def sync(self):

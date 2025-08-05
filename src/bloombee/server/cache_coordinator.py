@@ -18,29 +18,33 @@ offload_logger.setLevel(logging.INFO)
 
 def get_device_allocation_from_policy(policy, fallback_device: str = 'cuda:0') -> Tuple[str, str]:
     """
-    统一的设备分配工具函数
+    Unified device allocation utility function
     
     Args:
-        policy: Policy对象，包含缓存配置
-        fallback_device: 当没有policy时的默认设备
+        policy: Policy object containing cache configuration
+        fallback_device: Default device when no policy is available
         
     Returns:
-        (device_type, device_id): 设备类型和设备ID
+        (device_type, device_id): Device type and device ID
     """
     if policy is not None:
-        if policy.cache_gpu_percent == 100:
+        # 根据policy的缓存分配比例决定设备
+        if policy.cache_gpu_percent > 0:
+            # 优先使用GPU
             device_type = 'gpu'
             device_id = 'cuda:0'
-        elif policy.cache_cpu_percent == 100:
+        elif policy.cache_cpu_percent > 0:
+            # 其次使用CPU
             device_type = 'cpu'
             device_id = 'cpu'
-        elif policy.cache_disk_percent == 100:
+        elif policy.cache_disk_percent > 0:
+            # 最后使用磁盘
             device_type = 'disk'
             device_id = '/tmp/disk_cache'
         else:
-            # Mixed allocation - use CPU as primary for offloading
-            device_type = 'cpu'
-            device_id = 'cpu'
+            # 默认使用GPU
+            device_type = 'gpu'
+            device_id = 'cuda:0'
     else:
         # 如果没有policy，使用默认设备
         if fallback_device.startswith('cuda'):
@@ -56,15 +60,15 @@ def get_device_allocation_from_policy(policy, fallback_device: str = 'cuda:0') -
 def create_device_info_from_policy(policy, fallback_device: str = 'cuda:0', 
                                  compression_config=None) -> DeviceInfo:
     """
-    根据policy创建DeviceInfo对象
+    Create DeviceInfo object based on policy
     
     Args:
-        policy: Policy对象，包含缓存配置
-        fallback_device: 当没有policy时的默认设备
-        compression_config: 压缩配置
+        policy: Policy object containing cache configuration
+        fallback_device: Default device when no policy is available
+        compression_config: Compression configuration
         
     Returns:
-        DeviceInfo对象
+        DeviceInfo object
     """
     device_type, device_id = get_device_allocation_from_policy(policy, fallback_device)
     
@@ -78,8 +82,8 @@ def create_device_info_from_policy(policy, fallback_device: str = 'cuda:0',
 
 class CacheCoordinator:
     """
-    Lightweight adapter for KVCacheManager
-    Provides layer registration and simplified interface without duplicating functionality
+    Unified cache coordinator for model layers
+    Provides layer registration and cache operations with device allocation
     """
     
     def __init__(self, cache_manager: KVCacheManager):
@@ -88,6 +92,16 @@ class CacheCoordinator:
         
         offload_logger.info("Initializing CacheCoordinator")
         offload_logger.info(f"Cache manager: {type(cache_manager).__name__}")
+        if hasattr(cache_manager, 'policy') and cache_manager.policy is not None:
+            policy = cache_manager.policy
+            offload_logger.info(f"Policy configuration:")
+            offload_logger.info(f"  - cache_gpu_percent: {policy.cache_gpu_percent}%")
+            offload_logger.info(f"  - cache_cpu_percent: {policy.cache_cpu_percent}%")
+            offload_logger.info(f"  - cache_disk_percent: {policy.cache_disk_percent}%")
+            offload_logger.info(f"  - compress_cache: {policy.compress_cache}")
+            offload_logger.info(f"  - compress_weight: {policy.compress_weight}")
+            offload_logger.info(f"  - sep_layer: {policy.sep_layer}")
+            offload_logger.info(f"  - cpu_cache_compute: {policy.cpu_cache_compute}")
     
     def register_layer(self, layer_id: int, layer_info: Dict[str, Any] = None):
         """Register a model layer with the coordinator"""
@@ -107,38 +121,38 @@ class CacheCoordinator:
             del self._layer_registry[layer_id]
             offload_logger.info(f"Unregistered layer {layer_id} from coordinator")
     
-    def load_cache_for_layer(self, layer_id: int, position: int, 
-                           target_device: str = 'cuda:0', batch_id: int = 0) -> Optional[UnifiedCache]:
+    def load_cache(self, layer_id: int, position: int, 
+                  target_device: str = 'cuda:0', batch_id: int = 0) -> Optional[UnifiedCache]:
         """
         Load cache for a specific layer and position
         Delegates to KVCacheManager.load_cache()
         """
-        offload_logger.info(f"CacheCoordinator.load_cache_for_layer - layer:{layer_id}, position:{position}")
+        offload_logger.info(f"CacheCoordinator.load_cache - layer:{layer_id}, position:{position}")
         
         # 直接委托给KVCacheManager
         return self.cache_manager.load_cache(position, layer_id, batch_id, target_device)
     
-    def store_cache_for_layer(self, layer_id: int, position: int, 
-                            past_key_value: Tuple[torch.Tensor, ...],
-                            device: torch.device, batch_id: int = 0) -> Optional[Handle]:
+    def store_cache(self, layer_id: int, position: int, 
+                   past_key_value: Tuple[torch.Tensor, ...],
+                   device: torch.device, batch_id: int = 0) -> Optional[Handle]:
         """
         Store cache for a specific layer and position
-        Delegates to KVCacheManager.store_cache()
+        Delegates to KVCacheManager.store_cache() with device allocation
         """
-        offload_logger.info(f"CacheCoordinator.store_cache_for_layer - layer:{layer_id}, position:{position}")
+        offload_logger.info(f"CacheCoordinator.store_cache - layer:{layer_id}, position:{position}")
         
         # 验证位置一致性 - 更智能的位置处理
         expected_position = self._get_expected_position(layer_id)
         
         # 如果是prefill阶段（position=0），不需要修正
         if position == 0:
-            offload_logger.info(f"Prefill阶段 - 位置: {position}, 层: {layer_id}")
+            offload_logger.info(f"Prefill stage - position: {position}, layer: {layer_id}")
         elif position != expected_position:
             offload_logger.warning(f"Position mismatch: expected {expected_position}, got {position}")
             # 只有在非prefill阶段才修正位置
             if expected_position > 0:
                 position = expected_position
-                offload_logger.info(f"位置已修正为: {position}")
+                offload_logger.info(f"Position corrected to: {position}")
         
         # 创建UnifiedCache
         # 根据policy决定设备分配，但优先考虑张量的实际位置
@@ -148,17 +162,17 @@ class CacheCoordinator:
                 first_tensor = past_key_value[0]
                 if isinstance(first_tensor, torch.Tensor):
                     actual_device = str(first_tensor.device)
-                    offload_logger.info(f"张量实际位置: {actual_device}")
+                    offload_logger.info(f"Tensor actual location: {actual_device}")
                     
                     # 根据policy决定目标设备
                     target_device_type, target_device_id = get_device_allocation_from_policy(
                         self.cache_manager.policy, str(device)
                     )
-                    offload_logger.info(f"Policy要求的目标设备: {target_device_id}")
+                    offload_logger.info(f"Policy required target device: {target_device_id}")
                     
                     # 如果张量位置与policy要求不符，需要同步
                     if actual_device != target_device_id:
-                        offload_logger.info(f"需要同步张量从 {actual_device} 到 {target_device_id}")
+                        offload_logger.info(f"Need to sync tensor from {actual_device} to {target_device_id}")
                         
                         # 同步张量到目标设备
                         synced_tensors = []
@@ -166,10 +180,10 @@ class CacheCoordinator:
                             if isinstance(tensor, torch.Tensor):
                                 if str(tensor.device) != target_device_id:
                                     synced_tensor = tensor.to(target_device_id, non_blocking=True)
-                                    offload_logger.info(f"同步张量{i}: {tensor.device} -> {synced_tensor.device}")
+                                    offload_logger.info(f"Syncing tensor {i}: {tensor.device} -> {synced_tensor.device}")
                                 else:
                                     synced_tensor = tensor
-                                    offload_logger.info(f"张量{i}已在目标设备上，跳过同步")
+                                    offload_logger.info(f"Tensor {i} already on target device, skipping sync")
                                 synced_tensors.append(synced_tensor)
                             else:
                                 synced_tensors.append(tensor)
@@ -177,7 +191,7 @@ class CacheCoordinator:
                         # 使用同步后的张量
                         past_key_value = tuple(synced_tensors)
                         actual_device = target_device_id
-                        offload_logger.info(f"同步完成，张量现在在: {actual_device}")
+                        offload_logger.info(f"Sync completed, tensor now at: {actual_device}")
                     
                     # 创建设备信息
                     device_info = DeviceInfo(
@@ -228,18 +242,18 @@ class CacheCoordinator:
         # 更新层状态
         if handle is not None:
             self._update_layer_position(layer_id, position, handle)
-            offload_logger.info(f"成功存储缓存 - 位置:{position}, 层:{layer_id}, 句柄:{handle}, 设备:{device_info.device_type} ({device_info.device_id})")
+            offload_logger.info(f"Successfully stored cache - position:{position}, layer:{layer_id}, handle:{handle}, device:{device_info.device_type} ({device_info.device_id})")
         
         return handle
     
-    def update_cache_for_layer(self, layer_id: int, position: int,
-                             new_past_key_value: Tuple[torch.Tensor, ...],
-                             device: torch.device, batch_id: int = 0) -> Optional[Handle]:
+    def update_cache(self, layer_id: int, position: int,
+                    new_past_key_value: Tuple[torch.Tensor, ...],
+                    device: torch.device, batch_id: int = 0) -> Optional[Handle]:
         """
         Update existing cache for a specific layer and position
         Delegates to KVCacheManager.update_cache()
         """
-        offload_logger.info(f"CacheCoordinator.update_cache_for_layer - layer:{layer_id}, position:{position}")
+        offload_logger.info(f"CacheCoordinator.update_cache - layer:{layer_id}, position:{position}")
         
         # 直接委托给KVCacheManager
         return self.cache_manager.update_cache(new_past_key_value, position, layer_id, batch_id)
@@ -302,56 +316,8 @@ class CacheCoordinator:
         return info
 
 
-class ModelCacheInterface:
-    """
-    Interface for model layers to interact with cache without direct dependency
-    Provides a clean abstraction layer
-    """
-    
-    def __init__(self, coordinator: CacheCoordinator):
-        self.coordinator = coordinator
-    
-    def load_cache(self, layer_id: int, position: int, 
-                  target_device: str = 'cuda:0', batch_id: int = 0) -> Optional[UnifiedCache]:
-        """Load cache for model layer"""
-        return self.coordinator.load_cache_for_layer(layer_id, position, target_device, batch_id)
-    
-    def store_cache(self, layer_id: int, position: int,
-                   past_key_value: Tuple[torch.Tensor, ...],
-                   device: torch.device, batch_id: int = 0) -> Optional[Handle]:
-        """Store cache for model layer"""
-        return self.coordinator.store_cache_for_layer(layer_id, position, past_key_value, device, batch_id)
-    
-    def update_cache(self, layer_id: int, position: int,
-                    new_past_key_value: Tuple[torch.Tensor, ...],
-                    device: torch.device, batch_id: int = 0) -> Optional[Handle]:
-        """Update cache for model layer"""
-        return self.coordinator.update_cache_for_layer(layer_id, position, new_past_key_value, device, batch_id)
-    
-    def register_layer(self, layer_id: int, layer_info: Dict[str, Any] = None):
-        """Register model layer with coordinator"""
-        self.coordinator.register_layer(layer_id, layer_info)
-    
-    def unregister_layer(self, layer_id: int):
-        """Unregister model layer from coordinator"""
-        self.coordinator.unregister_layer(layer_id)
-    
-    def get_layer_info(self, layer_id: int) -> Dict[str, Any]:
-        """Get layer registration information"""
-        return self.coordinator.get_layer_info(layer_id)
-    
-    def is_layer_registered(self, layer_id: int) -> bool:
-        """Check if a layer is registered"""
-        return self.coordinator.is_layer_registered(layer_id)
-    
-    def get_layer_cache_info(self, layer_id: int) -> Dict[str, Any]:
-        """Get detailed cache information for a layer"""
-        return self.coordinator.get_layer_cache_info(layer_id)
-
-
 # Global cache coordinator instance
 _global_cache_coordinator: Optional[CacheCoordinator] = None
-_global_cache_interface: Optional[ModelCacheInterface] = None
 
 
 def get_cache_coordinator() -> Optional[CacheCoordinator]:
@@ -359,17 +325,11 @@ def get_cache_coordinator() -> Optional[CacheCoordinator]:
     return _global_cache_coordinator
 
 
-def get_cache_interface() -> Optional[ModelCacheInterface]:
-    """Get the global cache interface for model layers"""
-    return _global_cache_interface
-
-
 def set_cache_coordinator(cache_manager: KVCacheManager):
     """Set the global cache coordinator"""
-    global _global_cache_coordinator, _global_cache_interface
+    global _global_cache_coordinator
     
     _global_cache_coordinator = CacheCoordinator(cache_manager)
-    _global_cache_interface = ModelCacheInterface(_global_cache_coordinator)
     
     offload_logger.info("Global cache coordinator initialized")
     offload_logger.info(f"Cache manager: {type(cache_manager).__name__}")
@@ -377,9 +337,8 @@ def set_cache_coordinator(cache_manager: KVCacheManager):
 
 def clear_cache_coordinator():
     """Clear the global cache coordinator"""
-    global _global_cache_coordinator, _global_cache_interface
+    global _global_cache_coordinator
     
     _global_cache_coordinator = None
-    _global_cache_interface = None
     
     offload_logger.info("Global cache coordinator cleared") 

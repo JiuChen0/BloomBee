@@ -99,6 +99,11 @@ class KVCacheManager:
         offload_logger.info(f"Cache size: {cache_size / (1024*1024*1024):.2f} GB")
         offload_logger.info(f"Max alloc timeout: {max_alloc_timeout} seconds")
         offload_logger.info(f"Policy: GPU={self.policy.cache_gpu_percent}%, CPU={self.policy.cache_cpu_percent}%, Disk={self.policy.cache_disk_percent}%")
+        offload_logger.info(f"Compression settings:")
+        offload_logger.info(f"  - compress_cache: {self.policy.compress_cache}")
+        offload_logger.info(f"  - compress_weight: {self.policy.compress_weight}")
+        offload_logger.info(f"  - sep_layer: {self.policy.sep_layer}")
+        offload_logger.info(f"  - cpu_cache_compute: {self.policy.cpu_cache_compute}")
         offload_logger.info("KVCacheManager initialization completed")
 
     def _init_device_allocation(self) -> Dict[str, float]:
@@ -127,27 +132,14 @@ class KVCacheManager:
         Initialize cache for one GPU batch
         Creates UnifiedCache with appropriate device allocation
         """
-        # Determine target device based on policy
-        if self.policy.cache_gpu_percent == 100:
-            device_type = 'gpu'
-            device_id = 'cuda:0'
-        elif self.policy.cache_cpu_percent == 100:
-            device_type = 'cpu'
-            device_id = 'cpu'
-        elif self.policy.cache_disk_percent == 100:
-            device_type = 'disk'
-            device_id = '/tmp/disk_cache'
-        else:
-            # Mixed allocation - use GPU as primary
-            device_type = 'gpu'
-            device_id = 'cuda:0'
+        # 使用统一的设备分配工具函数
+        from bloombee.server.cache_coordinator import create_device_info_from_policy
         
-        # Create device info
-        device_info = DeviceInfo(
-            device_type=device_type,
-            device_id=device_id,
-            compression_config=self.policy.comp_cache_config if self.policy.compress_cache else None,
-            offloaded=(device_type != 'gpu')
+        # 根据policy决定设备分配
+        device_info = create_device_info_from_policy(
+            self.policy,
+            'cuda:0',
+            self.policy.comp_cache_config if self.policy.compress_cache else None
         )
         
         # Create empty UnifiedCache
@@ -157,7 +149,7 @@ class KVCacheManager:
         )
         
         offload_logger.info(f"Initialized cache for layer {layer_id}, batch {batch_id}")
-        offload_logger.info(f"Device: {device_type} ({device_id})")
+        offload_logger.info(f"Device: {device_info.device_type} ({device_info.device_id})")
         offload_logger.info(f"Compression: {self.policy.compress_cache}")
         
         return unified_cache
@@ -215,13 +207,13 @@ class KVCacheManager:
             return None
         
         # Sync device if needed
-        offload_logger.info(f"检查设备同步 - 当前设备: {unified_cache.device_info.device_id}, 目标设备: {target_device}")
+        offload_logger.info(f"Checking device sync - current device: {unified_cache.device_info.device_id}, target device: {target_device}")
         if unified_cache.device_info.device_id != target_device:
             offload_logger.info(f"Syncing cache from {unified_cache.device_info.device_id} to {target_device}")
             unified_cache = self.cache.sync_device_cache(unified_cache, target_device)
             self.stats['device_transfers'] += 1
         else:
-            offload_logger.info(f"设备相同，跳过同步")
+            offload_logger.info(f"Devices are the same, skipping sync")
         
         # Update statistics
         cache_size = self._calculate_cache_size(unified_cache)
@@ -252,16 +244,16 @@ class KVCacheManager:
         # Store UnifiedCache directly in MemoryCache using new storage key format
         storage_key = f"layer_{layer_id}_handle_{handle}"
         self.cache._unified_caches[storage_key] = unified_cache
-        offload_logger.info(f"存储缓存 - storage_key: {storage_key}, handle: {handle}")
-        offload_logger.info(f"当前 _unified_caches 键: {list(self.cache._unified_caches.keys())}")
+        offload_logger.info(f"Storing cache - storage_key: {storage_key}, handle: {handle}")
+        offload_logger.info(f"Current _unified_caches keys: {list(self.cache._unified_caches.keys())}")
         # 添加store_unified_cache风格的调试信息
-        offload_logger.info(f"store_cache详细调试:")
-        offload_logger.info(f"   - 句柄: {handle}")
-        offload_logger.info(f"   - 设备: {unified_cache.device_info.device_id}")
-        offload_logger.info(f"   - 当前_unified_caches大小: {len(self.cache._unified_caches)}")
-        offload_logger.info(f"   - 是否覆盖现有句柄: {storage_key in self.cache._unified_caches}")
-        offload_logger.info(f"   - 进程ID: {os.getpid()}")
-        offload_logger.info(f"   - 运行时PID: {os.getpid()}")
+        offload_logger.info(f"store_cache detailed debug:")
+        offload_logger.info(f"   - Handle: {handle}")
+        offload_logger.info(f"   - Device: {unified_cache.device_info.device_id}")
+        offload_logger.info(f"   - Current _unified_caches size: {len(self.cache._unified_caches)}")
+        offload_logger.info(f"   - Overwriting existing handle: {storage_key in self.cache._unified_caches}")
+        offload_logger.info(f"   - Process ID: {os.getpid()}")
+        offload_logger.info(f"   - Runtime PID: {os.getpid()}")
         
         # Update hierarchy structure - use new handle format
         if layer_id not in self.cache_hierarchy:

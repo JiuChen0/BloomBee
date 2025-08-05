@@ -185,12 +185,12 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             print("transformer backend inference step : seq_len", seq_len)
             print(f"🔧 Backend inference_step: batch_size={batch_size}, seq_len={seq_len}, prefix_length={inference_info.prefix_length}")
             
-            # 🔧 添加offloading调试信息
+            # 🔧 Add offloading debug information
             offload_logger.info(f"   - batch_size: {batch_size}")
             offload_logger.info(f"   - seq_len: {seq_len}")
             offload_logger.info(f"   - prefix_length: {inference_info.prefix_length}")
-            offload_logger.info(f"   - cache_handles数量: {len(inference_info.cache_handles)}")
-            offload_logger.info(f"   - 当前设备: {hidden_states.device}")
+            offload_logger.info(f"   - cache_handles count: {len(inference_info.cache_handles)}")
+            offload_logger.info(f"   - current device: {hidden_states.device}")
             
             # see_memory_usage("transformer backend inference step : seq_len")
             
@@ -201,11 +201,11 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 *inference_info.cache_handles  # Use cache to reduce memory requirements
             ) as cache_tensors, self._peft_module.using_adapter(inference_info.active_adapter): # Use adapter for inference
                 
-                # 🔧 添加cache使用调试信息
-                offload_logger.info(f" 使用cache_manager.use_cache:")
-                offload_logger.info(f"   - cache_tensors数量: {len(cache_tensors)}")
-                offload_logger.info(f"   - 第一个tensor设备: {cache_tensors[0].device if cache_tensors else 'None'}")
-                offload_logger.info(f"   - 剩余内存: {self.cache_manager.bytes_left() / (1024*1024*1024):.2f} GB")
+                # 🔧 Add cache usage debug information
+                offload_logger.info(f" Using cache_manager.use_cache:")
+                offload_logger.info(f"   - cache_tensors count: {len(cache_tensors)}")
+                offload_logger.info(f"   - first tensor device: {cache_tensors[0].device if cache_tensors else 'None'}")
+                offload_logger.info(f"   - remaining memory: {self.cache_manager.bytes_left() / (1024*1024*1024):.2f} GB")
                 
                 self._reorder_cache_inplace(cache_tensors, hypo_ids) # Reorder cache based on hypothesis IDs
 
@@ -219,13 +219,13 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # print("transformer backend inference step : output_hidden_states", output_hidden_states) # output_hidden_states:None
                 layer_past = self._select_layer_past(cache_tensors, inference_info.prefix_length) # Select previous layer's cache state
                 
-                # 🔧 添加layer_past调试信息
-                offload_logger.info(f"选择layer_past:")
-                offload_logger.info(f"   - layer_past类型: {type(layer_past)}")
-                offload_logger.info(f"   - layer_past长度: {len(layer_past) if layer_past else 0}")
+                # 🔧 Add layer_past debug information
+                offload_logger.info(f"Selecting layer_past:")
+                offload_logger.info(f"   - layer_past type: {type(layer_past)}")
+                offload_logger.info(f"   - layer_past length: {len(layer_past) if layer_past else 0}")
                 if layer_past and len(layer_past) > 0:
-                    offload_logger.info(f"   - 第一个tensor形状: {layer_past[0].shape}")
-                    offload_logger.info(f"   - 第一个tensor设备: {layer_past[0].device}")
+                    offload_logger.info(f"   - first tensor shape: {layer_past[0].shape}")
+                    offload_logger.info(f"   - first tensor device: {layer_past[0].device}")
                 
                 for offset in range(0, seq_len, max_chunk_length): # Iterate through sequence to process hidden states in chunks   only run offset=0
                     hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :] # Get current hidden states chunk
@@ -244,11 +244,11 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     
                     print(f' Generated position_ids for chunk: shape={position_ids.shape}, content={position_ids}')
                     
-                    # 🔧 添加chunk处理调试信息
-                    offload_logger.info(f" 处理chunk {offset//max_chunk_length + 1}:")
+                    # 🔧 Add chunk processing debug information
+                    offload_logger.info(f" Processing chunk {offset//max_chunk_length + 1}:")
                     offload_logger.info(f"   - chunk_length: {chunk_length}")
-                    offload_logger.info(f"   - hidden_states_chunk设备: {hidden_states_chunk.device}")
-                    offload_logger.info(f"   - position_ids范围: {position_ids.min().item()}-{position_ids.max().item()}")
+                    offload_logger.info(f"   - hidden_states_chunk device: {hidden_states_chunk.device}")
+                    offload_logger.info(f"   - position_ids range: {position_ids.min().item()}-{position_ids.max().item()}")
                     
                     try:
                         # Fixed: Properly handle forward method return values with position_ids
@@ -268,13 +268,13 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         output_hidden_states_chunk, new_kvs = forward_result
                         print(f' Successfully unpacked: output_hidden_states_chunk={output_hidden_states_chunk.shape if output_hidden_states_chunk is not None else None}')
                         
-                        # 🔧 添加forward结果调试信息
-                        offload_logger.info(f" module.forward完成:")
-                        offload_logger.info(f"   - output_hidden_states_chunk形状: {output_hidden_states_chunk.shape if output_hidden_states_chunk is not None else None}")
-                        offload_logger.info(f"   - new_kvs长度: {len(new_kvs) if new_kvs else 0}")
+                        # 🔧 Add forward result debug information
+                        offload_logger.info(f" module.forward completed:")
+                        offload_logger.info(f"   - output_hidden_states_chunk shape: {output_hidden_states_chunk.shape if output_hidden_states_chunk is not None else None}")
+                        offload_logger.info(f"   - new_kvs length: {len(new_kvs) if new_kvs else 0}")
                         if new_kvs and len(new_kvs) > 0:
-                            offload_logger.info(f"   - new_kvs[0]形状: {new_kvs[0].shape}")
-                            offload_logger.info(f"   - new_kvs[0]设备: {new_kvs[0].device}")
+                            offload_logger.info(f"   - new_kvs[0] shape: {new_kvs[0].shape}")
+                            offload_logger.info(f"   - new_kvs[0] device: {new_kvs[0].device}")
                         
                     except Exception as e:
                         print(f' ERROR in module.forward: {type(e).__name__}: {e}')
@@ -293,19 +293,19 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 if layer_past is not None and len(layer_past) > 0:
                     past_key_values_length = layer_past[0].shape[2]
                 
-                # 🔧 添加cache更新调试信息
-                offload_logger.info(f" 更新cache:")
+                # 🔧 Add cache update debug information
+                offload_logger.info(f" Updating cache:")
                 offload_logger.info(f"   - past_key_values_length: {past_key_values_length}")
-                offload_logger.info(f"   - new_kvs长度: {len(new_kvs) if new_kvs else 0}")
+                offload_logger.info(f"   - new_kvs length: {len(new_kvs) if new_kvs else 0}")
                 
                 self._update_cache_inplace(cache_tensors, new_kvs, past_key_values_length) # Update cache
                 print('backend.py output_hidden_states.shape ', output_hidden_states.shape)
                 
-                # 🔧 添加最终结果调试信息
-                offload_logger.info(f" inference_step完成:")
-                offload_logger.info(f"   - output_hidden_states形状: {output_hidden_states.shape}")
-                offload_logger.info(f"   - output_hidden_states设备: {output_hidden_states.device}")
-                offload_logger.info(f"   - 剩余内存: {self.cache_manager.bytes_left() / (1024*1024*1024):.2f} GB")
+                # 🔧 Add final result debug information
+                offload_logger.info(f" inference_step completed:")
+                offload_logger.info(f"   - output_hidden_states shape: {output_hidden_states.shape}")
+                offload_logger.info(f"   - output_hidden_states device: {output_hidden_states.device}")
+                offload_logger.info(f"   - remaining memory: {self.cache_manager.bytes_left() / (1024*1024*1024):.2f} GB")
                 
                 return (output_hidden_states,) # Return output hidden states
                 
