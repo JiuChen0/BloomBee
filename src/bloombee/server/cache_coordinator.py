@@ -210,25 +210,29 @@ class CacheCoordinator:
                 first_tensor = past_key_value[0]
                 if isinstance(first_tensor, torch.Tensor):
                     actual_device = str(first_tensor.device)
+                    # Normalize device type
+                    normalized_type = 'gpu' if actual_device.startswith('cuda') else (
+                        'cpu' if actual_device == 'cpu' else actual_device
+                    )
                     device_info = DeviceInfo(
-                        device_type=actual_device.split(':')[0] if ':' in actual_device else actual_device,
+                        device_type=normalized_type,
                         device_id=actual_device,
                         compression_config=None,
-                        offloaded=(actual_device != 'cuda:0')
+                        offloaded=(not actual_device.startswith('cuda'))
                     )
                 else:
                     device_info = DeviceInfo(
-                        device_type=device.type,
+                        device_type=('gpu' if str(device).startswith('cuda') else ('cpu' if str(device) == 'cpu' else device.type)),
                         device_id=str(device),
                         compression_config=None,
-                        offloaded=(device.type != 'gpu')
+                        offloaded=(not str(device).startswith('cuda'))
                     )
             else:
                 device_info = DeviceInfo(
-                    device_type=device.type,
+                    device_type=('gpu' if str(device).startswith('cuda') else ('cpu' if str(device) == 'cpu' else device.type)),
                     device_id=str(device),
                     compression_config=None,
-                    offloaded=(device.type != 'gpu')
+                    offloaded=(not str(device).startswith('cuda'))
                 )
         
         unified_cache = UnifiedCache(
@@ -255,8 +259,16 @@ class CacheCoordinator:
         """
         offload_logger.info(f"CacheCoordinator.update_cache - layer:{layer_id}, position:{position}")
         
-        # 直接委托给KVCacheManager
-        return self.cache_manager.update_cache(new_past_key_value, position, layer_id, batch_id)
+        # 将传入的 Tensor 元组封装为 KVCache（KVCacheManager.update_cache 期望 KVCache 类型）
+        try:
+            kv_cache = KVCache(
+                kvs=new_past_key_value,
+                device=KVCacheMetadata(device=None, offloaded=False)
+            )
+            return self.cache_manager.update_cache(kv_cache, position, layer_id, batch_id)
+        except Exception as e:
+            offload_logger.warning(f"⚠️ update_cache failed to wrap KVCache: {e}")
+            return None
     
     def get_layer_info(self, layer_id: int) -> Dict[str, Any]:
         """Get layer registration information"""
@@ -341,4 +353,45 @@ def clear_cache_coordinator():
     
     _global_cache_coordinator = None
     
-    offload_logger.info("Global cache coordinator cleared") 
+    offload_logger.info("Global cache coordinator cleared")
+
+
+def init_layer_cache_manager(layer_id: int, policy, llama_config, env) -> Optional[CacheCoordinator]:
+    """
+    Initialize cache manager for a specific layer
+    
+    Args:
+        layer_id: Layer identifier
+        policy: Policy object containing cache configuration
+        llama_config: LlamaConfig object
+        env: Execution environment
+        
+    Returns:
+        CacheCoordinator instance if successful, None otherwise
+    """
+    cache_interface = get_cache_coordinator()
+    if cache_interface is not None:
+        # Calculate actual number of layers based on policy.sep_layer
+        num_workspaces = 1 if policy.sep_layer else 2
+        
+        # Register current layer to coordinator with detailed layer information
+        layer_info = {
+            'layer_type': 'llama_decoder',
+            'policy': policy,
+            'layer_id': layer_id,
+            'num_workspaces': num_workspaces,
+            'sep_layer': policy.sep_layer,
+            'config': llama_config,
+            'env': env
+        }
+        
+        cache_interface.register_layer(layer_id, layer_info)
+        offload_logger.info(f" Layer {layer_id} registered to cache coordinator")
+        offload_logger.info(f"   - sep_layer: {policy.sep_layer}")
+        offload_logger.info(f"   - num_workspaces: {num_workspaces}")
+        offload_logger.info(f"   - gpu_batch_size: {policy.gpu_batch_size}")
+        offload_logger.info(f"   - num_attention_heads: {llama_config.num_attention_heads}")
+    else:
+        offload_logger.warning(f" Cache coordinator unavailable, layer {layer_id} will not be able to use cache functionality")
+    
+    return cache_interface 

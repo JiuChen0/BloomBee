@@ -159,9 +159,13 @@ class MemoryCache:
                     offload_logger.info(f"   - Tensor {i}: non-tensor object, skipping sync")
             
             # 更新设备信息
-            new_offloaded = target_device != 'cuda:0'
+            # Normalize device type to 'gpu'/'cpu'/'disk'
+            new_offloaded = not target_device.startswith('cuda')
+            normalized_type = 'gpu' if target_device.startswith('cuda') else (
+                'cpu' if target_device == 'cpu' else target_device
+            )
             new_device_info = DeviceInfo(
-                device_type=target_device.split(':')[0] if ':' in target_device else target_device,
+                device_type=normalized_type,
                 device_id=target_device,
                 compression_config=unified_cache.device_info.compression_config,
                 offloaded=new_offloaded

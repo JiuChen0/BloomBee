@@ -347,32 +347,14 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         self.temp_hidden = ValueHolder() ######
         
     def _init_cache_manager(self):
-        from bloombee.server.cache_coordinator import get_cache_coordinator
+        from bloombee.server.cache_coordinator import init_layer_cache_manager
         
-        self.cache_interface = get_cache_coordinator()
-        if self.cache_interface is not None:
-            # Calculate actual number of layers based on policy.sep_layer
-            num_workspaces = 1 if self.policy.sep_layer else 2
-            
-            # Register current layer to coordinator with detailed layer information
-            layer_info = {
-                'layer_type': 'llama_decoder',
-                'policy': self.policy,
-                'layer_id': self.layer_id,
-                'num_workspaces': num_workspaces,
-                'sep_layer': self.policy.sep_layer,
-                'config': self.llama_config,
-                'env': self.env
-            }
-            
-            self.cache_interface.register_layer(self.layer_id, layer_info)
-            offload_logger.info(f" Layer {self.layer_id} registered to cache coordinator")
-            offload_logger.info(f"   - sep_layer: {self.policy.sep_layer}")
-            offload_logger.info(f"   - num_workspaces: {num_workspaces}")
-            offload_logger.info(f"   - gpu_batch_size: {self.policy.gpu_batch_size}")
-            offload_logger.info(f"   - num_attention_heads: {self.llama_config.num_attention_heads}")
-        else:
-            offload_logger.warning(f" Cache coordinator unavailable, layer {self.layer_id} will not be able to use cache functionality")
+        self.cache_interface = init_layer_cache_manager(
+            layer_id=self.layer_id,
+            policy=self.policy,
+            llama_config=self.llama_config,
+            env=self.env
+        )
         
         
     def set_task(self, task):

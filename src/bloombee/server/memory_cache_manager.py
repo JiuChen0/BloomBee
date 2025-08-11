@@ -196,11 +196,11 @@ class KVCacheManager:
         
         # Get UnifiedCache from MemoryCache using new storage key format
         storage_key = f"layer_{layer_id}_handle_{handle}"
-        # 使用 get_unified_cache 方法而不是直接访问字典
-        unified_cache = self.cache.get_unified_cache(handle)
+        # 优先精确匹配 storage_key，避免不同 layer 的 handle 尾缀误匹配
+        unified_cache = self.cache._unified_caches.get(storage_key)
         if unified_cache is None:
-            # 如果 get_unified_cache 返回 None，尝试直接访问字典（向后兼容）
-            unified_cache = self.cache._unified_caches.get(storage_key)
+            # 向后兼容：再尝试通过 handle 检索
+            unified_cache = self.cache.get_unified_cache(handle)
         if unified_cache is None:
             offload_logger.warning(f"UnifiedCache not found - storage key:{storage_key}")
             offload_logger.warning(f"Available storage keys: {list(self.cache._unified_caches.keys())}")

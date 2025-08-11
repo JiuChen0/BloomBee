@@ -209,6 +209,12 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 
                 self._reorder_cache_inplace(cache_tensors, hypo_ids) # Reorder cache based on hypothesis IDs
 
+                # Build layer_past safely: allow empty cache_tensors to yield None
+                if cache_tensors and len(cache_tensors) > 0:
+                    layer_past = self._select_layer_past(cache_tensors, inference_info.prefix_length) # Select previous layer's cache state
+                else:
+                    layer_past = None
+
                 # We chunk the inputs so that peak memory for long sequences fits into `autograd_memory`
                 # reserved in `Server._choose_num_blocks()`. This saves us from OOMs if `max_chunk_size_bytes`
                 # is at least 4-6x less than `autograd_memory`.
@@ -217,7 +223,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # see_memory_usage("transformer backend inference step : seq_len")
                 output_hidden_states = torch.empty_like(hidden_states) if seq_len > max_chunk_length else None # Initialize output states
                 # print("transformer backend inference step : output_hidden_states", output_hidden_states) # output_hidden_states:None
-                layer_past = self._select_layer_past(cache_tensors, inference_info.prefix_length) # Select previous layer's cache state
+                # layer_past computed above
                 
                 # 🔧 Add layer_past debug information
                 offload_logger.info(f"Selecting layer_past:")

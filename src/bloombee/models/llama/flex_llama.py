@@ -612,14 +612,14 @@ class FLEX_LlamaAttention(LlamaAttention):
         Store cache
         Support unified interface for cache coordinator
         """
-        # 使用缓存协调器存储缓存
-        if hasattr(self, 'cache_interface') and self.cache_interface is not None:
+        # 关闭在 Attention 层直接写入协调器，避免与 WrappedLlamaBlock.forward 的存储重复
+        # 如需启用，可设置环境变量 BLOOMBEE_ATTENTION_COORDINATOR=1
+        import os
+        use_attn_level_coordinator = os.environ.get('BLOOMBEE_ATTENTION_COORDINATOR', '0') == '1'
+        if use_attn_level_coordinator and hasattr(self, 'cache_interface') and self.cache_interface is not None:
             try:
-                # 从cache_write_buf获取新的缓存数据
                 new_cache_data = cache_write_buf.pop()
-                
                 if new_cache_data is not None:
-                    # 通过协调器存储缓存
                     handle = self.cache_interface.store_cache(
                         layer_id=self.layer_id,
                         position=i,
@@ -627,19 +627,12 @@ class FLEX_LlamaAttention(LlamaAttention):
                         device=torch.device('cuda:0'),
                         batch_id=0
                     )
-                    
                     if handle is not None:
-                        offload_logger.info(f" Stored cache - layer:{self.layer_id}, position:{i}, handle:{handle}")
-                        offload_logger.info(f"   - Successfully used cache coordinator")
-                    else:
-                        offload_logger.warning(f"⚠️ Failed to store cache - layer:{self.layer_id}, position:{i}")
-                    return
-                else:
-                    offload_logger.warning(f"⚠️ new_cache_data is empty, skipping storage")
-                    return
-                    
+                        offload_logger.info(f" Stored cache (attention-level) - layer:{self.layer_id}, position:{i}, handle:{handle}")
+                        return
+                offload_logger.warning(f"⚠️ attention-level new_cache_data empty or store failed, fallback to local store")
             except Exception as e:
-                offload_logger.warning(f"⚠️ Cache coordinator store_cache failed, using original implementation: {e}")
+                offload_logger.warning(f"⚠️ Attention-level coordinator store_cache failed, fallback to local store: {e}")
         
         #  移除对cache_manager的直接依赖
 
