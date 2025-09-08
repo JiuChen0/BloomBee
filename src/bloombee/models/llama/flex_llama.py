@@ -14,13 +14,14 @@ import torch
 import torch.utils.checkpoint
 from bloombee.flexgen_utils.compression import CompressionConfig
 from bloombee.flexgen_utils.llama_config import LlamaConfig, get_llama_config, download_llama_weights
-from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import, general_copy, DeviceType, TorchDevice, TorchDisk, \
+from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import, general_copy, DeviceType, TorchDevice, TorchTensor, TorchDisk, \
     TorchMixedDevice
 from bloombee.flexgen_utils.utils import (GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
     torch_mem_stats, torch_dtype_to_np_dtype, write_benchmark_log,
     read_benchmark_log)
 from bloombee.flexgen_utils.task import Task
+from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
 from torch import nn
 from transformers import AutoTokenizer
@@ -28,7 +29,11 @@ from bloombee.flexgen_utils.timer import timers
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from bloombee.utils.memory_usage import see_memory_usage
 
+from hivemind.utils import get_logger
+
 fix_recursive_import()
+
+logger = get_logger(__name__)
 
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
@@ -40,58 +45,29 @@ from transformers.models.llama.modeling_llama import (
     rotate_half,
 )
 
+class FLEX_LlamaRMSNorm(LlamaRMSNorm): #put in fex_llama
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__(hidden_size, eps=1e-6)
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
 
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
 
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+    
+    
+def apply_rotary_pos_emb(q, k, cos, sin):
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
-
-@dataclasses.dataclass(frozen=True)
-class Policy:
-    gpu_batch_size: int
-    num_gpu_batches: int
-
-    # percent = a means a%
-    w_gpu_percent: float
-    w_cpu_percent: float
-    cache_gpu_percent: float
-    cache_cpu_percent: float
-    act_gpu_percent: float
-    act_cpu_percent: float
-
-    # Whether to overlap the I/O and compute
-    overlap: bool
-
-    # Whether to separate attention and mlp as two layers
-    sep_layer: bool
-
-    # Whether to use pinned memory for weights on CPU
-    pin_weight: bool
-
-    # Whether to compute attention on CPU
-    cpu_cache_compute: bool
-
-    # Sparsity of attention weights
-    attn_sparsity: float
-
-    # Compress weights with group-wise quantization
-    compress_weight: bool
-    comp_weight_config: CompressionConfig
-
-    # Compress KV cache with group-wise quantization
-    compress_cache: bool
-    comp_cache_config: CompressionConfig
-
-    @property
-    def w_disk_percent(self):
-        return 100 - self.w_gpu_percent - self.w_cpu_percent
-
-    @property
-    def cache_disk_percent(self):
-        return 100 - self.cache_gpu_percent - self.cache_cpu_percent
-
-    @property
-    def act_disk_percent(self):
-        return 100 - self.act_gpu_percent - self.act_cpu_percent
 
 from pynvml import *
 
@@ -456,95 +432,26 @@ class FLEX_LlamaAttention(LlamaAttention):
         if self.policy.compress_cache:
             assert device.device_type != DeviceType.MIXED
             device = device.compressed_device
-
-        cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
+            
+        task_copy = Task(
+                inputs=self.task.inputs,
+                prompt_len=self.task.prompt_len,
+                gen_len=max(self.task.gen_len, 128),
+                cut_gen_len=self.task.cut_gen_len,
+                do_sample=self.task.do_sample,
+                temperature=self.task.temperature,
+                stop=self.task.stop,
+                top_p=self.task.top_p,
+        )
+        
+        cache = device.init_cache_one_gpu_batch(self.config, task_copy, self.policy)
         cache_home.store(cache)
 
     def load_cache(self, cache_home, cache_read_buf, i):
-        if i == 0:  # prefill, no cache
-            return
-
-        k_home, v_home = cache_home.val
-
-        # Pick code path
-        if self.policy.compress_cache:
-            path = 0
-            dst = self.attention_compute.compressed_device
-        else:
-            if self.policy.cpu_cache_compute:
-                if (k_home.device.device_type == DeviceType.MIXED and
-                        k_home.data[0][0] is not None):
-                    path = 2
-                else:
-                    path = 1
-            else:
-                path = 0
-            dst = self.attention_compute
-
-        if path == 0:  # Direct copy
-            # shape: (s, b * num_attention_heads, head_dim)
-            indices = (slice(0, self.task.prompt_len + i),
-                       slice(0, k_home.shape[1]))
-
-            if self.policy.attn_sparsity >= 1.0:
-                cache_read_buf.store((
-                    k_home.smart_copy(dst, indices),
-                    v_home.smart_copy(dst, indices),
-                ))
-            else:
-                cache_read_buf.store((
-                    k_home.smart_copy(dst, indices),
-                    (v_home, False),
-                ))
-        elif path == 1:  # Copy to CPU temporary workspace
-            # shape: (s, b * num_attention_heads, head_dim)
-            k_buf, v_buf = dst.next_attention_compute_workspace()
-            indices = (slice(0, self.task.prompt_len + i - 1),
-                       slice(0, k_home.shape[1]))
-            general_copy(k_buf, indices, k_home, indices)
-
-            if self.policy.attn_sparsity >= 1.0:
-                general_copy(v_buf, indices, v_home, indices)
-                cache_read_buf.store(((k_buf, False), (v_buf, False)))
-            else:
-                cache_read_buf.store(((k_buf, False), ((v_home, v_buf), False)))
-        elif path == 2:  # Copy to both GPU and CPU
-            # The caches are stored on both GPU and other devices.
-            # Compute attention on gpu for caches stored on gpu.
-            # Compute attention on cpu for caches stored on cpu/disk.
-            gpu_k_buf = k_home.data[0][0]
-            gpu_v_buf = v_home.data[0][0]
-
-            # shape: (s, b * num_attention_heads, head_dim)
-            k_buf, v_buf = dst.next_attention_compute_workspace()
-            indices = (slice(0, self.task.prompt_len + i - 1),
-                       slice(gpu_k_buf.shape[1], k_home.shape[1]))
-            general_copy(k_buf, indices, k_home, indices)
-            general_copy(v_buf, indices, v_home, indices)
-            cache_read_buf.store((((gpu_k_buf, k_buf,), False),
-                                  ((gpu_v_buf, v_buf,), False)))
-            assert self.policy.attn_sparsity >= 1.0
-        else:
-            raise ValueError(f"Invalid path: {path}")
+        pass
 
     def store_cache(self, cache_home, cache_write_buf, i):
-        # shape: (s, b * num_attention_heads, head_dim)
-        k_home, v_home = cache_home.val
-        k_new, v_new = cache_write_buf.pop()
-
-        if i == self.task.gen_len - 1:  # last token, no need to store cache
-            return
-
-        if i == 0:  # prefill
-            indices = (slice(0, k_new.shape[0]),
-                       slice(0, k_new.shape[1]))
-        else:  # decoding
-            pos = self.task.prompt_len + i
-            indices = (slice(pos - k_new.shape[0], pos),
-                       slice(0, k_new.shape[1]))
-
-        general_copy(k_home, indices, k_new, None)
-        general_copy(v_home, indices, v_new, None)
+        pass
 
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.hidden_size), self.config.dtype
@@ -575,6 +482,7 @@ class FLEX_LlamaAttention(LlamaAttention):
         else:
             ((w_q, _), (w_k, _),  (w_v, _), (w_out, _), (input_layernorm, _), (rotary_emb_inv_freq, _)) = weight_read_buf.val
 
+        
         if i == 0:
             # prefill
             # import pdb;pdb.set_trace()---------------------
@@ -588,7 +496,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             # decoding
             # see_memory_usage("-----------------------------------------before mha_gen_llama ")
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
-            (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
+            k_cache, v_cache = cache_read_buf.pop()
             h, new_k_cache, new_v_cache = self.compute.mha_gen_llama(
                 h, mask, w_q,
                 w_k, w_v, w_out, num_attention_heads,
@@ -599,7 +507,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             cache_write_buf.store((new_k_cache, new_v_cache))
             # see_memory_usage("-----------------------------------------after mha_gen_llama ")
         hidden.val = h
-        
+        self.temp_hidden_states.val=h
         return h
 
 class FLEX_LlamaMLP(LlamaMLP):
@@ -677,7 +585,8 @@ class FLEX_LlamaMLP(LlamaMLP):
         attention_mask,
         cache_write_buf,
         position_ids,
-        k: int = 0
+        k: int = 0,
+        generated_tokens_num: int = 0,
         ):
         donate = [False] * 9
         h, donate[0] = hidden_states.val, True
