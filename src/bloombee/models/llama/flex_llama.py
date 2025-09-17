@@ -27,7 +27,7 @@ from torch import nn
 from transformers import AutoTokenizer
 from bloombee.flexgen_utils.timer import timers
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
-from bloombee.utils.memory_usage import see_memory_usage
+from bloombee.utils.memory_usage import see_memory_usage, log_mem
 
 from hivemind.utils import get_logger
 
@@ -89,6 +89,7 @@ def init_weight_list(weight_specs, policy, env):
     sizes = [np.prod(spec[0]) for spec in weight_specs]
     sizes_cumsum = np.cumsum(sizes)
     ret = []
+    # log_mem("[FlexGen] init_weight_list(start)")
     for i in range(len(weight_specs)):
         mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
         # print('mid_percent ', mid_percent)
@@ -112,13 +113,13 @@ def init_weight_list(weight_specs, policy, env):
                     weight.load_from_np_file(weight_specs[i][2])
                 except (FileNotFoundError, AttributeError) as e:
                     print(f"Warning: Could not load weight from file {weight_specs[i][2]}: {e}")
-                    # 如果文件不存在或加载失败，使用随机初始化
+                    # If file does not exist or loading fails, use random initialization
                     weight.load_from_np(np.random.rand(*shape).astype(dtype))
             else:
                 weight.load_from_np(np.ones(shape, dtype))
                 #weight.load_from_np(np.random.rand(*shape).astype(dtype))
         else:
-            # 检查压缩设备是否可用
+            # Check if compressed device is available
             if hasattr(home, 'compressed_device') and home.compressed_device is not None:
                 weight = home.compressed_device.allocate(
                     shape, dtype, policy.comp_weight_config, pin_memory=pin_memory)
@@ -128,7 +129,7 @@ def init_weight_list(weight_specs, policy, env):
                         weight.load_from_np_file(weight_specs[i][2])
                     except (FileNotFoundError, AttributeError) as e:
                         print(f"Warning: Could not load weight from file {weight_specs[i][2]}: {e}")
-                        # 如果文件不存在或加载失败，使用随机初始化
+                        # If file does not exist or loading fails, use random initialization
                         for i in range(2):
                             x = weight.data[i]
                             x.load_from_np(np.random.rand(*x.shape).astype(torch_dtype_to_np_dtype[x.dtype]))
@@ -137,7 +138,7 @@ def init_weight_list(weight_specs, policy, env):
                         x = weight.data[i]
                         x.load_from_np(np.ones(x.shape, torch_dtype_to_np_dtype[x.dtype]))
             else:
-                # 如果压缩设备不可用，回退到非压缩方式
+                # If compressed device is not available, fall back to non-compressed method
                 print(f"Warning: Compressed device not available, falling back to non-compressed allocation")
                 weight = home.allocate(shape, dtype, pin_memory=pin_memory)
                 if DUMMY_WEIGHT not in filename:
@@ -145,52 +146,53 @@ def init_weight_list(weight_specs, policy, env):
                         weight.load_from_np_file(weight_specs[i][2])
                     except (FileNotFoundError, AttributeError) as e:
                         print(f"Warning: Could not load weight from file {weight_specs[i][2]}: {e}")
-                        # 如果文件不存在或加载失败，使用随机初始化
+                        # If file does not exist or loading fails, use random initialization
                         weight.load_from_np(np.random.rand(*shape).astype(dtype))
                 else:
                     weight.load_from_np(np.ones(shape, dtype))
         # print('weight.data ', weight.data)
         ret.append(weight)
         
+    # log_mem("[FlexGen] init_weight_list(end)")
     return ret
 
-# 添加一个新函数，用于从 PyTorch 模型加载权重到 FlexGen 格式
+# Add a new function to load weights from PyTorch model to FlexGen format
 def load_weights_from_pytorch_model(model, policy, env, weight_home, block_index):
     """
-    从 PyTorch 模型加载权重到 FlexGen 格式
+    Load weights from PyTorch model to FlexGen format
     
     Args:
-        model: PyTorch 模型
-        policy: FlexGen 策略
-        env: FlexGen 环境
-        weight_home: 权重存储位置
-        block_index: 块索引
+        model: PyTorch model
+        policy: FlexGen policy
+        env: FlexGen environment
+        weight_home: weight storage location
+        block_index: block index
     """
     weight_specs = []
     
-    # 遍历模型的所有参数
+    # Iterate through all parameters of the model
     for name, param in model.named_parameters():
-        # 创建权重规格
+        # Create weight specification
         shape = param.shape
         dtype = param.dtype
-        # 使用参数名称作为文件名，确保唯一性
+        # Use parameter name as filename to ensure uniqueness
         filename = f"block_{block_index}_{name}"
         
         weight_specs.append((shape, dtype, filename))
         
-        # 将参数移动到 CPU，避免在 GPU 上存储
+        # Move parameters to CPU to avoid storing on GPU
         param.data = param.data.to('cpu')
     
     try:
-        # 初始化权重列表
+        # Initialize weight list
         weights = init_weight_list(weight_specs, policy, env)
         
-        # 将权重加载到模型中
+        # Load weights into the model
         for (name, _), weight in zip(model.named_parameters(), weights):
             param = getattr(model, name)
             param.data = weight.data.to(param.device)
         
-        # 存储权重规格，以便后续使用
+        # Store weight specifications for later use
         weight_home[block_index] = weight_specs
         
         return weights
@@ -198,12 +200,12 @@ def load_weights_from_pytorch_model(model, policy, env, weight_home, block_index
         print(f"Warning: Failed to initialize weights with FlexGen: {e}")
         print("Falling back to direct parameter assignment")
         
-        # 如果 FlexGen 初始化失败，直接使用参数赋值
+        # If FlexGen initialization fails, use direct parameter assignment
         for name, param in model.named_parameters():
-            # 确保参数在 CPU 上
+            # Ensure parameters are on CPU
             param.data = param.data.to('cpu')
         
-        # 存储空的权重规格
+        # Store empty weight specifications
         weight_home[block_index] = []
         
         return []
@@ -400,9 +402,9 @@ class FLEX_LlamaAttention(LlamaAttention):
             # rotary_embed
             ((64, ), dtype, path + "self_attn.rotary_emb.inv_freq"),
         ]
-        # see_memory_usage("-----------------------------------------before init weights of LLamaAttention ")
+        # log_mem(f"[FlexGen.Attn:{self.layer_id}] init_weight(start)")
         weights = init_weight_list(weight_specs, self.policy, self.env)
-        # see_memory_usage("-----------------------------------------after init weights of LLamaAttention ")
+        # log_mem(f"[FlexGen.Attn:{self.layer_id}] init_weight(end)")
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
@@ -410,6 +412,7 @@ class FLEX_LlamaAttention(LlamaAttention):
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute
+            # log_mem(f"[FlexGen.Attn:{self.layer_id}] load_weight(k={k})")
             weight_read_buf.store((
                 w_q.smart_copy(dst1),
                 w_k.smart_copy(dst1),
@@ -486,15 +489,15 @@ class FLEX_LlamaAttention(LlamaAttention):
         if i == 0:
             # prefill
             # import pdb;pdb.set_trace()---------------------
-            # see_memory_usage("-----------------------------------------before mha_llama ")
+            # log_mem(f"[FlexGen.Attn:{self.layer_id}] forward(start prefill) i={i} k={k}")
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             h, new_k_cache, new_v_cache = self.compute.mha_llama(h, mask, w_q, w_k, w_v, w_out,
                                        num_attention_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config, input_layernorm, rotary_emb_inv_freq)
             cache_write_buf.store((new_k_cache, new_v_cache))
-            # see_memory_usage("-----------------------------------------after mha_llama ")
+            # log_mem(f"[FlexGen.Attn:{self.layer_id}] forward(end prefill) i={i} k={k}")
         else:
             # decoding
-            # see_memory_usage("-----------------------------------------before mha_gen_llama ")
+            # log_mem(f"[FlexGen.Attn:{self.layer_id}] forward(start decode) i={i} k={k}")
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             k_cache, v_cache = cache_read_buf.pop()
             h, new_k_cache, new_v_cache = self.compute.mha_gen_llama(
@@ -505,7 +508,7 @@ class FLEX_LlamaAttention(LlamaAttention):
                 input_layernorm,
                 rotary_emb_inv_freq)
             cache_write_buf.store((new_k_cache, new_v_cache))
-            # see_memory_usage("-----------------------------------------after mha_gen_llama ")
+            # log_mem(f"[FlexGen.Attn:{self.layer_id}] forward(end decode) i={i} k={k}")
         hidden.val = h
         self.temp_hidden_states.val=h
         return h
@@ -549,9 +552,9 @@ class FLEX_LlamaMLP(LlamaMLP):
             # post attention layer norm
             ((h, ), dtype, path + "post_attention_layernorm.weight"),
         ]
-        # see_memory_usage("-----------------------------------------before init weights of LLamaMLP ")
+        # log_mem(f"[FlexGen.MLP:{self.layer_id}] init_weight(start)")
         weights = init_weight_list(weight_specs, self.policy, self.env)
-        # see_memory_usage("-----------------------------------------after init weights of LLamaMLP ")
+        # log_mem(f"[FlexGen.MLP:{self.layer_id}] init_weight(end)")
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
@@ -598,7 +601,9 @@ class FLEX_LlamaMLP(LlamaMLP):
             ((gate, _), (down, _),
              (up, _), (post_attention_layernorm, _)) = weight_read_buf.val
 
+        # log_mem(f"[FlexGen.MLP:{self.layer_id}] forward(start) k={k}")
         h = self.compute.mlp_llama(h, gate, down, up, donate, self.config, post_attention_layernorm)
+        # log_mem(f"[FlexGen.MLP:{self.layer_id}] forward(end) k={k}")
         hidden_states.val = h
         self.temp_hidden_states.val=h
         
