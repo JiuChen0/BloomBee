@@ -30,8 +30,8 @@ from bloombee.flexgen_utils.compression import CompressionConfig
 from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import, TorchTensor, TorchDevice
 from bloombee.flexgen_utils.utils import ValueHolder, array_1d, array_2d, array_3d
-from bloombee.models.llama.flex_llama import FLEX_LlamaAttention, FLEX_LlamaMLP, LlamaDecoderLayer, DUMMY_WEIGHT
-from bloombee.flexgen_utils.llama_config import get_llama_config, download_llama_weights
+from bloombee.models.tinyllama.flex_llama import FLEX_LlamaAttention, FLEX_LlamaMLP, LlamaDecoderLayer, DUMMY_WEIGHT
+from bloombee.models.tinyllama.flexgen_llama_config import get_llama_config, download_llama_weights
 from bloombee.flexgen_utils.task import Task
 from transformers import AutoTokenizer
 import os
@@ -141,11 +141,11 @@ class OptimizedLlamaAttention(FLEX_LlamaAttention):
         # see_memory_usage("-----------------------------------------enter llama attention forward ")
         # 
         
-        # Enhanced position_ids handling with detailed debugging
-        print('OptimizedLlamaAttention.forward(): received position_ids:', position_ids)
+        # 🔧 Enhanced position_ids handling with detailed debugging
+        print('🔧 OptimizedLlamaAttention.forward(): received position_ids:', position_ids)
         if position_ids is not None:
-            print(f'position_ids shape: {position_ids.shape}, dtype: {position_ids.dtype}')
-            print(f'position_ids content: {position_ids}')
+            print(f'🔧 position_ids shape: {position_ids.shape}, dtype: {position_ids.dtype}')
+            print(f'🔧 position_ids content: {position_ids}')
         
         if position_ids is None:
             past_seen_tokens = past_key_value[0].shape[2] if past_key_value is not None else 0
@@ -155,32 +155,32 @@ class OptimizedLlamaAttention(FLEX_LlamaAttention):
                 device=hidden_states.device,
                 dtype=torch.long
             ).unsqueeze(0)
-            print(f'Generated fallback position_ids: {position_ids}')
+            print(f'🔧 Generated fallback position_ids: {position_ids}')
         
-        print('Final position_ids before processing:', position_ids)
+        print('🔧 Final position_ids before processing:', position_ids)
         # see_memory_usage("-----------------------------------------after position_ids ")
         
-        # Enhanced position_ids handling - more robust extraction
+        # 🟢 Enhanced position_ids handling - more robust extraction
         if position_ids.numel() == 0:
             start_position = 0
-            print('position_ids is empty, using start_position=0')
+            print('🔧 position_ids is empty, using start_position=0')
         elif position_ids.dim() == 0:  # 0-dimensional tensor (scalar)
             start_position = int(position_ids.item())
-            print(f'position_ids is scalar: {start_position}')
+            print(f'🔧 position_ids is scalar: {start_position}')
         elif position_ids.dim() == 1:  # 1-dimensional tensor
             start_position = int(position_ids[0].item())
-            print(f'position_ids is 1D, using first element: {start_position}')
+            print(f'🔧 position_ids is 1D, using first element: {start_position}')
         elif position_ids.dim() == 2:  # 2-dimensional tensor [batch, seq_len]
             start_position = int(position_ids[0, 0].item())
-            print(f'position_ids is 2D [{position_ids.shape[0]}, {position_ids.shape[1]}], using first element: {start_position}')
+            print(f'🔧 position_ids is 2D [{position_ids.shape[0]}, {position_ids.shape[1]}], using first element: {start_position}')
             # For debugging: show the full sequence if it's reasonable length
             if position_ids.shape[1] <= 10:
-                print(f'Full position sequence: {position_ids[0].tolist()}')
+                print(f'🔧 Full position sequence: {position_ids[0].tolist()}')
         else:
             start_position = 0  # fallback
-            print(f'position_ids has unexpected dimensions {position_ids.dim()}, using fallback start_position=0')
+            print(f'🔧 position_ids has unexpected dimensions {position_ids.dim()}, using fallback start_position=0')
         
-        print(f'Extracted start_position: {start_position}')
+        print(f'🔧 Extracted start_position: {start_position}')
         
         super(OptimizedLlamaAttention, self).forward(hidden_states,cache_read_buf, weight_read_buf,attention_mask,cache_write_buf,start_position,k)
         # see_memory_usage("-----------------------------------------after OptimizedLlamaAttention forward ")
@@ -354,11 +354,9 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
             
     def init_weight(self, j):
         # Extract model name from _name_or_path
-        print(f"DEBUG: _name_or_path = '{self.llama_config._name_or_path}'")
-        
-        # For TinyLlama, use the same path construction as download_llama_weights
         if "tinyllama" in self.llama_config._name_or_path.lower():
-            model_name = self.llama_config._name_or_path.replace("/", "-").lower()
+            # For TinyLlama, use the model name without the repository prefix
+            model_name = "tinyllama-1.1b-chat-v1.0"
         else:
             model_name = os.path.basename(self.llama_config._name_or_path.rstrip('/'))
         
@@ -468,7 +466,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         
         # Performance optimization: Use cached tokenizer, avoid repeated creation
         if self._cached_tokenizer is None:
-            self._cached_tokenizer = AutoTokenizer.from_pretrained(f"huggyllama/{self.llama_config.name}", padding_side="left", legacy=False)
+            self._cached_tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0", padding_side="left", legacy=False)
             self._cached_tokenizer.pad_token = '[PAD]'
         tokenizer = self._cached_tokenizer
         

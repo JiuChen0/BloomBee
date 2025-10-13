@@ -17,11 +17,10 @@ from tqdm import tqdm
 class LlamaConfig:
     name: str="llama-7b"
     vocab_size: int=32000
-    type_vocab_size=2
-    input_dim: int=4096
+    hidden_size: int=4096
     intermediate_size: int=11008
     num_hidden_layers: int=32
-    n_head: int=32
+    num_attention_heads: int=32
     hidden_act: str="silu"
     max_position_embeddings: int=2048
     initializer_range: float=0.02
@@ -32,17 +31,17 @@ class LlamaConfig:
 
     def model_bytes(self):
         V = self.vocab_size
-        H = self.input_dim
+        H = self.hidden_size
         L = self.num_hidden_layers
         I = self.intermediate_size
         num_params = L*(4*H*H + 3*I*H + 2*H) + V*H*2 + H
         return num_params * 2    
 
     def cache_bytes(self, batch_size, seq_len):
-        return 2 * batch_size * seq_len * self.num_hidden_layers * self.input_dim * 2
+        return 2 * batch_size * seq_len * self.num_hidden_layers * self.hidden_size * 2
 
     def hidden_bytes(self, batch_size, seq_len):
-        return batch_size * seq_len * self.input_dim * 2
+        return batch_size * seq_len * self.hidden_size * 2
 
 def get_llama_config(name, **kwargs):
     if "/" in name:
@@ -51,14 +50,18 @@ def get_llama_config(name, **kwargs):
 
     arch_name = name
 
-    if arch_name == "llama-7b":
-        config = LlamaConfig(name=name, input_dim=4096, n_head=32, num_hidden_layers=32, intermediate_size=11008)
+    if arch_name == "tinyllama-1.1b-chat-v1.0":
+        config = LlamaConfig(name=name, hidden_size=2048, num_attention_heads=32, num_hidden_layers=22, intermediate_size=5632, vocab_size=32000)
+    elif arch_name == "llama-7b":
+        config = LlamaConfig(name=name, hidden_size=4096, num_attention_heads=32, num_hidden_layers=32, intermediate_size=11008)
     elif arch_name == "llama-13b":
-        config = LlamaConfig(name=name, input_dim=5120, n_head=40, num_hidden_layers=40, intermediate_size=13824)
+        config = LlamaConfig(name=name, hidden_size=5120, num_attention_heads=40, num_hidden_layers=40, intermediate_size=13824)
     elif arch_name == "llama-30b":
-        config = LlamaConfig(name=name, input_dim=6656, n_head=52, num_hidden_layers=60, intermediate_size=17920)
+        config = LlamaConfig(name=name, hidden_size=6656, num_attention_heads=52, num_hidden_layers=60, intermediate_size=17920)
     elif arch_name == "llama-65b":
-        config = LlamaConfig(name=name, input_dim=8192, n_head=64, num_hidden_layers=80, intermediate_size=22016)
+        config = LlamaConfig(name=name, hidden_size=8192, num_attention_heads=64, num_hidden_layers=80, intermediate_size=22016)
+    elif arch_name == "llama-70b":
+        config = LlamaConfig(name=name, hidden_size=8192, num_attention_heads=64, num_hidden_layers=80, intermediate_size=28672)
     else:
         raise ValueError(f"Invalid model name: {name}")
     
@@ -148,36 +151,22 @@ def download_llama_weights(model_name, path):
           f"If it seems to get stuck, you can monitor the progress by "
           f"checking the memory usage of this process.")
     
-    print(f"DEBUG: model_name = '{model_name}', type = {type(model_name)}")
-    
     # Handle different model naming conventions
     if "tinyllama" in model_name.lower():
         hf_model_name = model_name  # TinyLlama uses full path like "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-    elif "llama" in model_name.lower() and "/" not in model_name:
-        # Only add huggyllama/ prefix if it's not already there
+    elif "llama" in model_name.lower():
         hf_model_name = "huggyllama/" + model_name
     else:
-        hf_model_name = model_name  # Fallback to original name (already has namespace)
-    
-    print(f"DEBUG: hf_model_name = '{hf_model_name}'")
+        hf_model_name = model_name  # Fallback to original name
 
     # Download both .bin and .safetensors files (TinyLlama uses safetensors)
     folder = snapshot_download(hf_model_name, allow_patterns=["*.bin", "*.safetensors"])
     bin_files = glob.glob(os.path.join(folder, "*.bin"))
     safetensors_files = glob.glob(os.path.join(folder, "*.safetensors"))
 
-    # For TinyLlama, keep the full path; for others, use basename
-    if "tinyllama" in model_name.lower():
-        # Keep the full path for TinyLlama
-        path_model_name = model_name.replace("/", "-").lower()
-    else:
-        # Use basename for regular Llama models
-        if "/" in model_name:
-            path_model_name = model_name.split("/")[1].lower()
-        else:
-            path_model_name = model_name.lower()
-    
-    path = os.path.join(path, f"{path_model_name}-np")
+    if "/" in model_name:
+        model_name = model_name.split("/")[1].lower()
+    path = os.path.join(path, f"{model_name}-np")
     path = os.path.abspath(os.path.expanduser(path))
     os.makedirs(path, exist_ok=True)
 
