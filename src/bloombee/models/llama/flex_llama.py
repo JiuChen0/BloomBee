@@ -476,13 +476,7 @@ class FLEX_LlamaAttention(LlamaAttention):
         donate = [False] * 16
         h, donate[0] = hidden.val, True
 
-        # k is batch index
-        if k == self.policy.num_gpu_batches - 1:
-            # Clear the weight_read_buf if it is the last gpu batch
-            ((w_q, donate[2]), (w_k, donate[4]), (w_v, donate[6]), (w_out, donate[8]), (input_layernorm, donate[10]), (rotary_emb_inv_freq, donate[12])) \
-                = weight_read_buf.pop()
-        else:
-            ((w_q, _), (w_k, _),  (w_v, _), (w_out, _), (input_layernorm, _), (rotary_emb_inv_freq, _)) = weight_read_buf.val
+        ((w_q, _), (w_k, _), (w_v, _), (w_out, _), (input_layernorm, _), (rotary_emb_inv_freq, _)) = weight_read_buf.val
 
         
         if i == 0:
@@ -591,13 +585,8 @@ class FLEX_LlamaMLP(LlamaMLP):
         ):
         donate = [False] * 9
         h, donate[0] = hidden_states.val, True
-        if k == self.policy.num_gpu_batches - 1:
-            # Clear the weight_read_buf if it is the last gpu batch
-            ((gate, donate[1]), (down, donate[3]),
-             (up, donate[5]), (post_attention_layernorm, donate[7])) = weight_read_buf.pop()
-        else:
-            ((gate, _), (down, _),
-             (up, _), (post_attention_layernorm, _)) = weight_read_buf.val
+        ((gate, _), (down, _),
+         (up, _), (post_attention_layernorm, _)) = weight_read_buf.val
 
         # log_mem(f"[FlexGen.MLP:{self.layer_id}] forward(start) k={k}")
         h = self.compute.mlp_llama(h, gate, down, up, donate, self.config, post_attention_layernorm)
@@ -718,10 +707,7 @@ class LlamaDecoderLayer(nn.Module):
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 cache_write_buf, i, k):
-        if k == self.policy.num_gpu_batches - 1:
-            read_buf1, read_buf2 = weight_read_buf.pop()
-        else:
-            read_buf1, read_buf2 = weight_read_buf.val
+        read_buf1, read_buf2 = weight_read_buf.val
         # Self Attention
         self.self_attn.forward(
             hidden=hidden,
@@ -809,6 +795,7 @@ class LlamaLM:
             i += 1
             if i == self.execute_gen_len:
                 return
+                
         # Load from weight_home to weight_read_buf
         if overlap:
             with torch.cuda.stream(self.load_weight_stream):
@@ -918,15 +905,21 @@ class LlamaLM:
         if j == self.num_layers - 1:  # store to output
             gpu_batch_size = self.policy.gpu_batch_size
             left, right = k * gpu_batch_size, (k + 1) * gpu_batch_size
-            ids = self.hidden[i][j][k].pop().data.detach().cpu().numpy()
-            pos = self.task.prompt_len + i
+            
             if self.task.stop:
+                # [Optimization] Maintain output ids on GPU to avoid calling .cpu().numpy() for each token
+                # If stop token is set, revert to original method (requires synchronization)
+                ids = self.hidden[i][j][k].pop().data.detach().cpu().numpy()
+                pos = self.task.prompt_len + i
                 stopped = self.stopped[left:right]
                 self.output_ids[left:right, pos:pos + 1] = np.where(
                     stopped, self.config.pad_token_id, ids)
                 stopped[:] = np.logical_or(stopped, ids == self.task.stop)
             else:
-                self.output_ids[left:right, pos:pos + 1] = ids
+                # [Optimization] Write output ids directly to GPU to avoid .cpu().numpy() synchronization
+                ids_gpu = self.hidden[i][j][k].pop().data.detach()  # keep on GPU
+                # Asynchronously write to GPU tensor (will not stall)
+                self.output_ids_gpu[left:right, i:i+1] = ids_gpu.to(torch.int32)
         else:  # move to home
             x = self.hidden[i][j][k]
             if x.val:  # x may already be moved due to overlapping
@@ -1007,6 +1000,14 @@ class LlamaLM:
         self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
         self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
         assert gpu_batch_size * num_gpu_batches == len(task.inputs)
+        
+        # [Optimization] Maintain output ids on GPU to avoid calling .cpu().numpy() for each token
+        self.output_ids_gpu = torch.full(
+            (len(task.inputs), gen_len), 
+            self.config.pad_token_id, 
+            dtype=torch.int32, 
+            device=self.env.gpu.dev
+        )
 
         # Intermediate tensors
         # The following buffers store values used
@@ -1060,6 +1061,20 @@ class LlamaLM:
                 self.delete_cache(j, k)
         if self.policy.cpu_cache_compute:
             self.env.cpu.del_attention_compute_workspace()
+
+        # Copy output ids from GPU to CPU in one go if stop is not set
+        if not task.stop:
+            torch.cuda.synchronize()  # 确保所有 GPU 写入完成
+            generated_ids = self.output_ids_gpu.cpu().numpy()
+            self.output_ids[:, prompt_len:prompt_len + gen_len] = generated_ids
+        
+        # Clean up GPU tensor
+        if hasattr(self, 'output_ids_gpu'):
+            del self.output_ids_gpu
+
+        #  Clear weight_read_buf after reuse (no need to pop)
+        for j in range(num_layers):
+            self.weight_read_buf[j].clear()
 
         return self.output_ids
 
@@ -1163,23 +1178,33 @@ class LlamaLM:
                 print(f"{name:22s} (per-batch): {np.mean(costs):.6f} s")
 
     def generation_loop_overlap_single_batch(self):
-        # Prologue
+        # Prologue: Preload the first layer weights
         for k in range(self.num_gpu_batches):
             self.load_weight(0, 0, k)
-        self.sync()
+        self.sync()  # Ensure the first layer weights are loaded
 
         # Generate
         for i in range(self.execute_gen_len):
             timers("generate").start()
             self.update_attention_mask(i, 0)
             for j in range(self.num_layers):
+                # Asynchronously load the next layer's weights and cache
                 self.load_weight(i, j+1, 0)
                 self.load_cache(i, j+1, 0)
                 self.load_hidden(i, j, 0)
+                
+                # [Optimization] Use stream-level sync instead of global sync
+                # Only wait for the current layer's needed I/O to complete, allowing store ops to overlap with next-layer compute
+                torch.cuda.current_stream().wait_stream(self.load_weight_stream)
+                torch.cuda.current_stream().wait_stream(self.load_cache_stream)
+                
                 self.compute_layer(i, j, 0)
                 self.store_cache(i, j-1, 0)
                 self.store_hidden(i, j, 0)
-                self.sync()
+                # [Optimization] Remove per-layer sync(), allowing store to overlap with next layer's load/compute
+            
+            # Sync at the end of each token, ensuring all operations are finished
+            self.sync()
             timers("generate").stop()
 
             if self.task.stop and np.all(self.stopped):
@@ -1203,9 +1228,17 @@ class LlamaLM:
                     self.load_cache(i, j, k+1)
                     self.store_hidden(i, j, k-1)
                     self.load_hidden(i, j, k+1)
+                    
+                    #Use stream-level synchronization instead of global sync
+                    torch.cuda.current_stream().wait_stream(self.load_weight_stream)
+                    torch.cuda.current_stream().wait_stream(self.load_cache_stream)
+                    
                     self.compute_layer(i, j, k)
                     self.store_cache(i, j, k-1)
-                    self.sync()
+                    # Remove per-(j,k) sync()
+            
+            # Synchronize at the end of each token
+            self.sync()
             timers("generate").stop()
 
         # Epilogue

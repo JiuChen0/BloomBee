@@ -464,6 +464,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
                 for k in range(num_gpu_batches):
                     self.cache_read_buf[j][k].clear()
                     self.cache_write_buf[j][k].clear()
+
             for j in range(num_layers):
                 self.weight_read_buf[j].clear()
             for k in range(num_gpu_batches):
@@ -521,116 +522,109 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         overlap = self.policy.overlap if hasattr(self.policy, 'overlap') else False
 
         if debug_mode is None:
-            if not overlap:
-                if position_ids is not None and position_ids.numel() > 0:
-                    #   Optimized: Avoid .item() sync
-                    current_position = position_ids.flatten()[0]
-                    # print(f' Using actual position from position_ids: {current_position}')
+
+            if position_ids is not None and position_ids.numel() > 0:
+                current_position = position_ids.flatten()[0]
+            else:
+                current_position = 0
+
+            i = current_position
+
+            for k in range(self.num_gpu_batches):
+                if i == 0:
+                    mask_length = hidden_states.shape[1]
                 else:
-                    current_position = 0
-                    # print(f' No position_ids provided, using fallback position: {current_position}')
+                    mask_length = i + 1
+                self.update_attention_mask(0, k, mask_length)
 
-                i = current_position
+            # Preload the first layer weights
+            if overlap:
+                self.load_weight(i, 0, 0, overlap=True)  # Asynchronous load
+                if self.load_weight_stream is not None:
+                    torch.cuda.current_stream().wait_stream(self.load_weight_stream)
+            else:
+                self.load_weight(i, 0, 0, overlap=False)  # Synchronously load the first layer
 
-                for k in range(self.num_gpu_batches):
-                    if i == 0:
-                        mask_length = hidden_states.shape[1]
-                    else:
-                        mask_length = i + 1
-                    self.update_attention_mask(0, k, mask_length)
-
-                # Weight loading performance monitoring and optimization
-                weight_load_start = time.time()
+            final_outputs = []
+            generated_tokens_num = 0
+            if position_ids is not None and position_ids.numel() > 0:
+                generated_tokens_num = position_ids.flatten()[-1] - self.task.prompt_len + 1
+            for k in range(self.num_gpu_batches):
                 for j in range(self.num_layers):
-                    for k in range(self.num_gpu_batches):
-                        self.load_weight(i, j, k, overlap=False)
-                weight_load_time = (time.time() - weight_load_start) * 1000
-                if weight_load_time > 10.0:
-                    print(f"[FLEXGEN_PERF] Layer {self.layer_id} Weight loading took: {weight_load_time:.3f}ms")
-
-                final_outputs = []
-                generated_tokens_num = 0
-                if position_ids is not None and position_ids.numel() > 0:
-                    #   Optimized: Avoid .item() sync - keep as tensor for faster ops
-                    generated_tokens_num = position_ids.flatten()[-1] - self.task.prompt_len + 1
-                for k in range(self.num_gpu_batches):
-                    for j in range(self.num_layers):
-
-                        # Load current layer cache
-                        # self.load_cache(i, j, k, overlap=False)
-                        # self.load_hidden(i, j, k)
-                        if j == 0 and past_key_value is not None:
-
-                            past_key, past_value = past_key_value
-                            # Normalize past shapes into [B, H, S, D]
-                            # logger.info(f"before format past_key: {past_key.shape}")
-                            if past_key.dim() == 3:
-                                # from backend packed: [B*H, D, S] or [B*H, S, D]
-                                bh, x1, x2 = past_key.shape
-                                b = hidden_states.shape[0]
-                                h = bh // b
-                                d = self.self_attn.head_dim
-                                s = x2 if x1 == d else x1
-                                if x1 == d and x2 == s:
-                                    k_bhsd = past_key.permute(0, 2, 1)
-                                else:
-                                    k_bhsd = past_key
-                                v_bhsd = past_value if past_value.shape[1] == s else past_value.permute(0, 2, 1)
-                                past_key = k_bhsd.view(b, h, s, d)
-                                past_value = v_bhsd.view(b, h, s, d)
-                            # Transform to FlexGen expected (s, b*h, d)
-                            b, h, s, d = past_key.shape
-                            # logger.info(f"after format past_key: {past_key.shape}")
-                            #   Optimized: Use reshape instead of permute+contiguous+view
-                            # reshape() will avoid copy when possible
-                            past_k_new = past_key.permute(2, 0, 1, 3).reshape(s, b * h, d)
-                            past_v_new = past_value.permute(2, 0, 1, 3).reshape(s, b * h, d)
-                            # logger.info(f"past_key: {past_k_new.shape}")
-                            self.cache_read_buf[0][0].store((past_k_new, past_v_new))
-
-                        # log_mem(f"[Layer:{self.layer_id}] before self_attn layer={j} i={i} k={k}")
-                        layer_output = self.compute_layer(i, j, k, position_ids=position_ids, generated_tokens_num=generated_tokens_num)
-                        # log_mem(f"[Layer:{self.layer_id}] after self_attn/MLP layer={j} i={i} k={k}")
-
-                        if j == 0:
-                            k_new, v_new = self.cache_write_buf[0][0].pop()
-
-                            # Support compressed KV: decompress to torch.Tensor when needed
-                            try:
-                                from bloombee.flexgen_utils.pytorch_backend import DeviceType
-                                def to_torch_tensor(x):
-                                    # If FlexGen compressed tensor, decompress
-                                    if hasattr(x, 'device') and (
-                                        getattr(getattr(x, 'device', None), 'device_type', None) == DeviceType.COMPRESSED
-                                        or (hasattr(x, 'data') and isinstance(getattr(x, 'data'), tuple) and len(getattr(x, 'data')) == 3)
-                                    ):
-                                        return x.device.decompress(x)
-                                    # If FlexGen TorchTensor, return underlying torch tensor
-                                    return getattr(x, 'data', x)
-                                k_new_tensor = to_torch_tensor(k_new)
-                                v_new_tensor = to_torch_tensor(v_new)
-                            except Exception:
-                                # Fallback to raw data if decompress pathway is unavailable
-                                k_new_tensor = getattr(k_new, 'data', k_new)
-                                v_new_tensor = getattr(v_new, 'data', v_new)
-                            # Backend expects new_kvs shapes:
-                            #   key:   (b*h, d, s)
-                            #   value: (b*h, s, d)
-                            key = k_new_tensor.permute(1, 2, 0)  # → (b*h, d, s)
-                            value = v_new_tensor.permute(1, 0, 2)  # → (b*h, s, d)
-                            # print(f"decoder, k_new shaped for backend: {key.shape}, v_new: {value.shape}")
-                            past_key_value = (key, value)
-
-                            self.cache_write_buf[0][0].store((k_new, v_new))
-
-                    # print(f"forward, layer_output: {layer_output}")
-                    #   Optimized: Avoid clone if not necessary
-                    # Only clone if tensor has grad or is a view that might be modified
-                    if layer_output.data.requires_grad or layer_output.data._base is not None:
-                        final_outputs.append(layer_output.data.clone())
+                    if overlap:
+                        # [Pipeline Optimization] Asynchronously start loading the next layer weights before computing the current layer
+                        if j + 1 < self.num_layers:
+                            self.load_weight(i, j + 1, k, overlap=True)  # Asynchronously load the next layer
                     else:
-                        # Safe to use directly - no grad, not a view
-                        final_outputs.append(layer_output.data)
+                        # [Non-overlap mode] Synchronously load the current layer's weights (the first layer was loaded outside this loop)
+                        if j > 0:
+                            self.load_weight(i, j, k, overlap=False)  # Synchronously load the current layer
+
+                    # Load current layer cache
+                    if j == 0 and past_key_value is not None:
+                        past_key, past_value = past_key_value
+                        # Normalize past shapes into [B, H, S, D]
+                        if past_key.dim() == 3:
+                            # from backend packed: [B*H, D, S] or [B*H, S, D]
+                            bh, x1, x2 = past_key.shape
+                            b = hidden_states.shape[0]
+                            h = bh // b
+                            d = self.self_attn.head_dim
+                            s = x2 if x1 == d else x1
+                            if x1 == d and x2 == s:
+                                k_bhsd = past_key.permute(0, 2, 1)
+                            else:
+                                k_bhsd = past_key
+                            v_bhsd = past_value if past_value.shape[1] == s else past_value.permute(0, 2, 1)
+                            past_key = k_bhsd.view(b, h, s, d)
+                            past_value = v_bhsd.view(b, h, s, d)
+                        # Transform to FlexGen expected (s, b*h, d)
+                        b, h, s, d = past_key.shape
+                        past_k_new = past_key.permute(2, 0, 1, 3).reshape(s, b * h, d)
+                        past_v_new = past_value.permute(2, 0, 1, 3).reshape(s, b * h, d)
+                        self.cache_read_buf[0][0].store((past_k_new, past_v_new))
+
+                    # [Pipeline Optimization] If not the first layer, wait for asynchronous weight loading to complete
+                    if overlap and j > 0 and self.load_weight_stream is not None:
+                        torch.cuda.current_stream().wait_stream(self.load_weight_stream)
+                    
+                    layer_output = self.compute_layer(i, j, k, position_ids=position_ids, generated_tokens_num=generated_tokens_num)
+
+                    if j == 0:
+                        k_new, v_new = self.cache_write_buf[0][0].pop()
+
+                        # Support compressed KV: decompress to torch.Tensor when needed
+                        try:
+                            from bloombee.flexgen_utils.pytorch_backend import DeviceType
+                            def to_torch_tensor(x):
+                                # If FlexGen compressed tensor, decompress
+                                if hasattr(x, 'device') and (
+                                    getattr(getattr(x, 'device', None), 'device_type', None) == DeviceType.COMPRESSED
+                                    or (hasattr(x, 'data') and isinstance(getattr(x, 'data'), tuple) and len(getattr(x, 'data')) == 3)
+                                ):
+                                    return x.device.decompress(x)
+                                # If FlexGen TorchTensor, return underlying torch tensor
+                                return getattr(x, 'data', x)
+                            k_new_tensor = to_torch_tensor(k_new)
+                            v_new_tensor = to_torch_tensor(v_new)
+                        except Exception:
+                            # Fallback to raw data if decompress pathway is unavailable
+                            k_new_tensor = getattr(k_new, 'data', k_new)
+                            v_new_tensor = getattr(v_new, 'data', v_new)
+                        # Backend expects new_kvs shapes:
+                        #   key:   (b*h, d, s)
+                        #   value: (b*h, s, d)
+                        key = k_new_tensor.permute(1, 2, 0)  # → (b*h, d, s)
+                        value = v_new_tensor.permute(1, 0, 2)  # → (b*h, s, d)
+                        past_key_value = (key, value)
+
+                        self.cache_write_buf[0][0].store((k_new, v_new))
+                
+                # Add output only after processing all layers (outside j loop, inside k loop)
+                if layer_output.data.requires_grad or layer_output.data._base is not None:
+                    final_outputs.append(layer_output.data.clone())
+                else:
+                    final_outputs.append(layer_output.data)
 
         # print(f"final_outputs: {len(final_outputs)}")
         if len(final_outputs) == 1:

@@ -281,11 +281,10 @@ class Server:
         # Default to GPU-only, no offloading, no compression
         self.policy = Policy(
             batch_size, 1,            # gpu_batch_size, num_gpu_batches
-            100, 0,                   # w_gpu_percent, w_cpu_percent
+            100, 0                   # w_gpu_percent, w_cpu_percent
             100, 0,                   # cache_gpu_percent, cache_cpu_percent (KV on GPU)
             100, 0,                   # act_gpu_percent, act_cpu_percent (activations on GPU)
-            overlap=False, sep_layer=True, pin_weight=True,
-            cpu_cache_compute=False, attn_sparsity=1.0,
+            overlap=False, sep_layer=True, pin_weight=True,  
             compress_weight=False,
             comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False),
             compress_cache=False,
