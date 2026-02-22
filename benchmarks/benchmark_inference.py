@@ -30,6 +30,12 @@ def main():
     parser.add_argument("--torch_dtype", type=str, default="float32", help="Torch dtype")
     parser.add_argument("--n_processes", type=str, default=1, help="Number of concurrent processes")
     parser.add_argument("--seq_len", type=int, default=2048, help="Number of tokens to generate (generation length)")
+    parser.add_argument(
+        "--eval_tokens",
+        type=int,
+        default=0,
+        help="Early terminate after this many generated tokens for fair comparison (0 = use seq_len)",
+    )
     parser.add_argument("--prompt_len", type=int, default=None, help="Desired prompt/prefill length in tokens (optional)")
     parser.add_argument("--warmup_steps", type=int, default=1, help="Number of warmup steps")
     parser.add_argument("--batch_size", type=int, default=1, help="Client batch size (number of sequences to generate in parallel)")
@@ -159,6 +165,10 @@ def benchmark_inference(process_idx, args, result_pipe):
 
     total_max_length = prompt_length + args.seq_len
     logger.info(f"{process_idx=} prompt_length={prompt_length}, generating {args.seq_len} tokens, total_max_length={total_max_length}")
+    eval_tokens = args.seq_len if args.eval_tokens <= 0 else min(args.eval_tokens, args.seq_len)
+    logger.info(
+        f"{process_idx=} eval_tokens={eval_tokens} (early terminate {'enabled' if eval_tokens < args.seq_len else 'disabled'})"
+    )
     
     step_times = []
     step_latencies = []  # Track individual step latencies for cross-GPU analysis
@@ -167,7 +177,10 @@ def benchmark_inference(process_idx, args, result_pipe):
     
     with model.transformer.h.inference_session(max_length=total_max_length) as sess:
         logger.info(f"{process_idx=} Created inference session with max_length={total_max_length}")
-        logger.info(f"[BENCHMARK_START] Process={process_idx} | BatchSize={batch_size} | SeqLen={args.seq_len}")
+        logger.info(
+            f"[BENCHMARK_START] Process={process_idx} | BatchSize={batch_size} | "
+            f"SeqLen={args.seq_len} | EvalTokens={eval_tokens}"
+        )
         
         for step in range(args.seq_len):
             step_start_time = perf_counter()
@@ -193,7 +206,7 @@ def benchmark_inference(process_idx, args, result_pipe):
             log_step_tokens = (
                 args.log_all_tokens
                 or step < 2
-                or step == args.seq_len - 1
+                or step == eval_tokens - 1
                 or (args.token_log_every > 0 and step % args.token_log_every == 0)
             )
             if log_step_tokens:
@@ -217,11 +230,26 @@ def benchmark_inference(process_idx, args, result_pipe):
                 # Collect latencies for analysis
                 cross_gpu_latencies.append(step_latency_ms)
                 server_processing_latencies.append(step_latency_ms)
+
+            # Early terminate for fair A/B comparison under fixed generated-token window.
+            if step + 1 >= eval_tokens:
+                if step_times:
+                    current_speed = 1.0 / np.mean(step_times)
+                    current_effective = current_speed * batch_size
+                else:
+                    current_speed = 0.0
+                    current_effective = 0.0
+                logger.info(
+                    f"[EARLY_TERMINATE] Process={process_idx} | GeneratedTokens={step + 1} | "
+                    f"TargetEvalTokens={eval_tokens} | Throughput={current_speed:.2f} tokens/sec/sequence | "
+                    f"EffectiveThroughput={current_effective:.2f} tokens/sec"
+                )
+                break
         
         # Calculate and log statistics
         warmup_latencies = step_latencies[args.warmup_steps:]
-        warmup_cross_gpu_latencies = cross_gpu_latencies[args.warmup_steps:]
-        warmup_server_processing_latencies = server_processing_latencies[args.warmup_steps:]
+        warmup_cross_gpu_latencies = cross_gpu_latencies
+        warmup_server_processing_latencies = server_processing_latencies
         
         if warmup_latencies:
             mean_latency = np.mean(warmup_latencies)

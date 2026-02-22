@@ -4,6 +4,8 @@ import os
 import struct
 import zlib
 from functools import lru_cache
+from threading import Lock
+from time import perf_counter
 from typing import AsyncIterator, Iterable, List
 
 import torch
@@ -36,6 +38,56 @@ _HEADER_STRUCT = struct.Struct("!4sBBQ")
 _HEADER_SIZE = _HEADER_STRUCT.size
 
 _MISSING_ZSTD_WARNING_EMITTED = False
+
+
+def _new_profile_counters() -> dict:
+    return {
+        # TX-side (serialize path)
+        "tx_serialize_calls": 0.0,
+        "tx_base_serialize_ms": 0.0,
+        "tx_wrap_ms": 0.0,
+        "tx_compress_attempts": 0.0,
+        "tx_compress_success_calls": 0.0,
+        "tx_compress_ms": 0.0,
+        "tx_raw_bytes": 0.0,
+        "tx_wrapped_bytes": 0.0,
+        # RX-side (deserialize path)
+        "rx_deserialize_calls": 0.0,
+        "rx_base_deserialize_ms": 0.0,
+        "rx_unwrap_ms": 0.0,
+        "rx_decompress_calls": 0.0,
+        "rx_decompress_ms": 0.0,
+        "rx_input_bytes": 0.0,
+        "rx_output_bytes": 0.0,
+    }
+
+
+_profile_lock = Lock()
+_profile_counters = _new_profile_counters()
+
+
+def _record_profile(**kwargs) -> None:
+    if not kwargs:
+        return
+    with _profile_lock:
+        for key, value in kwargs.items():
+            if key not in _profile_counters:
+                continue
+            _profile_counters[key] += float(value)
+
+
+def get_lossless_profile_snapshot(reset: bool = False) -> dict:
+    with _profile_lock:
+        snapshot = dict(_profile_counters)
+        if reset:
+            _profile_counters.clear()
+            _profile_counters.update(_new_profile_counters())
+    return snapshot
+
+
+def diff_lossless_profile(before: dict, after: dict) -> dict:
+    keys = set(before.keys()) | set(after.keys())
+    return {key: float(after.get(key, 0.0)) - float(before.get(key, 0.0)) for key in keys}
 
 
 def _get_env_bool(name: str, default: str = "0") -> bool:
@@ -197,30 +249,44 @@ def wrap_serialized_tensor(serialized_tensor: runtime_pb2.Tensor) -> runtime_pb2
     Optionally wrap runtime_pb2.Tensor.buffer with a lossless compression header.
     This only affects transport bytes; tensor protobuf fields (dtype/shape/compression) stay intact.
     """
+    wrap_start = perf_counter()
     if not _lossless_send_enabled():
+        _record_profile(tx_wrap_ms=(perf_counter() - wrap_start) * 1000.0)
         return serialized_tensor
 
     raw = serialized_tensor.buffer
     if not raw:
+        _record_profile(tx_wrap_ms=(perf_counter() - wrap_start) * 1000.0)
         return serialized_tensor
     if len(raw) < _lossless_min_bytes():
+        _record_profile(tx_wrap_ms=(perf_counter() - wrap_start) * 1000.0)
         return serialized_tensor
     if _parse_wrapper(raw, strict=False) is not None:
+        _record_profile(tx_wrap_ms=(perf_counter() - wrap_start) * 1000.0)
         return serialized_tensor
 
+    compress_start = perf_counter()
     algo_id, compressed = _compress_buffer(raw)
+    compress_ms = (perf_counter() - compress_start) * 1000.0
+    _record_profile(tx_compress_attempts=1, tx_compress_ms=compress_ms)
     if algo_id == 0:
+        _record_profile(tx_wrap_ms=(perf_counter() - wrap_start) * 1000.0)
         return serialized_tensor
 
     wrapped_buffer = _HEADER_STRUCT.pack(_MAGIC, _VERSION, algo_id, len(raw)) + compressed
 
     # Skip compression if it does not reduce payload enough to amortize header/CPU overhead.
     if len(wrapped_buffer) + _lossless_min_gain_bytes() >= len(raw):
+        _record_profile(tx_wrap_ms=(perf_counter() - wrap_start) * 1000.0)
         return serialized_tensor
 
     wrapped = runtime_pb2.Tensor()
     wrapped.CopyFrom(serialized_tensor)
     wrapped.buffer = wrapped_buffer
+    _record_profile(
+        tx_compress_success_calls=1,
+        tx_wrap_ms=(perf_counter() - wrap_start) * 1000.0,
+    )
     return wrapped
 
 
@@ -230,17 +296,32 @@ def unwrap_serialized_tensor(serialized_tensor: runtime_pb2.Tensor) -> runtime_p
     - Wrapped tensor: decode and restore original buffer.
     - Legacy/raw tensor: returned unchanged.
     """
+    unwrap_start = perf_counter()
     wrapped_buffer = serialized_tensor.buffer
+    _record_profile(rx_input_bytes=len(wrapped_buffer))
     parsed = _parse_wrapper(wrapped_buffer, strict=True)
     if parsed is None:
+        _record_profile(
+            rx_output_bytes=len(wrapped_buffer),
+            rx_unwrap_ms=(perf_counter() - unwrap_start) * 1000.0,
+        )
         return serialized_tensor
 
     algo_id, original_size, payload = parsed
+    decompress_start = perf_counter()
     raw_buffer = _decompress_buffer(algo_id, payload, original_size)
+    _record_profile(
+        rx_decompress_calls=1,
+        rx_decompress_ms=(perf_counter() - decompress_start) * 1000.0,
+    )
 
     unwrapped = runtime_pb2.Tensor()
     unwrapped.CopyFrom(serialized_tensor)
     unwrapped.buffer = raw_buffer
+    _record_profile(
+        rx_output_bytes=len(raw_buffer),
+        rx_unwrap_ms=(perf_counter() - unwrap_start) * 1000.0,
+    )
     return unwrapped
 
 
@@ -251,6 +332,7 @@ def serialize_torch_tensor(
     allow_inplace: bool = False,
     **kwargs,
 ) -> runtime_pb2.Tensor:
+    base_serialize_start = perf_counter()
     serialized = _serialize_torch_tensor(
         tensor,
         compression_type=compression_type,
@@ -258,12 +340,28 @@ def serialize_torch_tensor(
         allow_inplace=allow_inplace,
         **kwargs,
     )
-    return wrap_serialized_tensor(serialized)
+    base_serialize_ms = (perf_counter() - base_serialize_start) * 1000.0
+    raw_bytes = len(serialized.buffer) if serialized.buffer is not None else 0
+    wrapped = wrap_serialized_tensor(serialized)
+    wrapped_bytes = len(wrapped.buffer) if wrapped.buffer is not None else 0
+    _record_profile(
+        tx_serialize_calls=1,
+        tx_base_serialize_ms=base_serialize_ms,
+        tx_raw_bytes=raw_bytes,
+        tx_wrapped_bytes=wrapped_bytes,
+    )
+    return wrapped
 
 
 def deserialize_torch_tensor(serialized_tensor: runtime_pb2.Tensor) -> torch.Tensor:
+    base_deserialize_start = perf_counter()
     unwrapped = unwrap_serialized_tensor(serialized_tensor)
-    return _deserialize_torch_tensor(unwrapped)
+    tensor = _deserialize_torch_tensor(unwrapped)
+    _record_profile(
+        rx_deserialize_calls=1,
+        rx_base_deserialize_ms=(perf_counter() - base_deserialize_start) * 1000.0,
+    )
+    return tensor
 
 
 async def deserialize_tensor_stream(
