@@ -38,7 +38,8 @@ STEP_TIMING_BREAKDOWN_RE = re.compile(
     r"serialize=(?P<serialize_ms>-?[0-9.]+)ms residual=(?P<residual_ms>-?[0-9.]+)ms "
     r"step_total=(?P<step_total_ms>-?[0-9.]+)ms total_with_queue=(?P<total_with_queue_ms>-?[0-9.]+)ms "
     r"cross_gpu_window=(?P<cross_gpu_window_ms>-?[0-9.]+)ms "
-    r"batch=(?P<batch>\d+) seq_inc=(?P<seq_inc>\d+) is_spec_dec=(?P<is_spec_dec>\d+)"
+    r"batch=(?P<batch>\d+) seq_inc=(?P<seq_inc>-?\d+)"
+    r"(?: raw_seq=(?P<raw_seq>-?\d+))? is_spec_dec=(?P<is_spec_dec>\d+)"
 )
 STEP_TIMING_BREAKDOWN_MB_RE = re.compile(
     r"\[STEP_TIMING_BREAKDOWN_MB\] step_id=(?P<step_id>\S+) mode=micro_batch "
