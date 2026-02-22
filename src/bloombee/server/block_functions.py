@@ -1880,11 +1880,14 @@ async def iterate_rpc_inference(
             first_idx = first_uid.split('.')[-1] if '.' in first_uid else "0"
             last_idx = last_uid.split('.')[-1] if '.' in last_uid else "0"
             stage_id = f"blocks_{first_idx}_{last_idx}"
+            # Use explicit phase metrics for stable buffer decisions.
+            stage_compute_ms = max(0.0, compute_time)
+            stage_comm_ms = max(0.0, step_total_time - stage_compute_ms)
             
             log_stage_timing(
                 logger, stage_id,
-                compute_time_ms=step_total_time - cross_gpu_receive_time,  # Compute time (excluding comm)
-                comm_time_ms=cross_gpu_receive_time,  # Communication time (if any)
+                compute_time_ms=stage_compute_ms,
+                comm_time_ms=stage_comm_ms,
                 component="iterate_rpc_inference"
             )
         except Exception as e:

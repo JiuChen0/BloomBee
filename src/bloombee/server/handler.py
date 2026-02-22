@@ -203,6 +203,124 @@ def _cleanup_microbatch_files(acc_key: str, expected_num: int) -> None:
         logger.debug(f"{MBPIPE_LOG_PREFIX} Failed to cleanup files: {e}")
 
 
+class AdaptivePushConcurrency:
+    """
+    Self-tuning limiter for cross-stage micro-batch pushes.
+
+    The limiter adjusts in-flight push concurrency from runtime signals:
+    - acquire wait (queue pressure inside sender)
+    - RPC send duration (network pressure)
+    - send failures (stability signal)
+
+    No external tuning knobs are required; limits are bounded to keep behavior stable.
+    """
+
+    def __init__(
+        self,
+        *,
+        logger_: logging.Logger,
+        name: str,
+        initial_limit: int = 4,
+        min_limit: int = 2,
+        max_limit: int = 12,
+        ewma_alpha: float = 0.2,
+        decision_interval: int = 8,
+    ):
+        self._logger = logger_
+        self._name = name
+        self._limit = max(min_limit, min(max_limit, int(initial_limit)))
+        self._min_limit = int(min_limit)
+        self._max_limit = int(max_limit)
+        self._ewma_alpha = float(ewma_alpha)
+        self._decision_interval = max(1, int(decision_interval))
+
+        self._in_flight = 0
+        self._cond = asyncio.Condition()
+
+        self._ewma_wait_ms = 0.0
+        self._ewma_send_ms = 0.0
+        self._release_events = 0
+        self._recent_failures = 0
+        self._consecutive_failures = 0
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def in_flight(self) -> int:
+        return self._in_flight
+
+    def _update_ewma(self, prev: float, sample: float) -> float:
+        if prev <= 0.0:
+            return sample
+        a = self._ewma_alpha
+        return prev * (1.0 - a) + sample * a
+
+    async def acquire(self) -> float:
+        wait_start = perf_counter()
+        async with self._cond:
+            while self._in_flight >= self._limit:
+                await self._cond.wait()
+            self._in_flight += 1
+        wait_ms = (perf_counter() - wait_start) * 1000.0
+        self._ewma_wait_ms = self._update_ewma(self._ewma_wait_ms, wait_ms)
+        return wait_ms
+
+    async def release(self, *, send_time_ms: float, success: bool) -> None:
+        change_log = None
+        async with self._cond:
+            self._in_flight = max(0, self._in_flight - 1)
+            self._ewma_send_ms = self._update_ewma(self._ewma_send_ms, max(0.0, float(send_time_ms)))
+
+            if success:
+                self._consecutive_failures = 0
+                self._recent_failures = max(0, self._recent_failures - 1)
+            else:
+                self._consecutive_failures += 1
+                self._recent_failures = min(16, self._recent_failures + 1)
+
+            self._release_events += 1
+            if self._release_events % self._decision_interval == 0:
+                old_limit = self._limit
+                reason = None
+
+                # Stability first: back off quickly on repeated failures.
+                if self._consecutive_failures >= 2 or self._recent_failures >= 3:
+                    self._limit = max(self._min_limit, self._limit - 1)
+                    self._consecutive_failures = 0
+                    reason = "send_failures"
+                # If local wait is non-trivial while network send remains moderate,
+                # increase concurrency to reduce sender-side queue pressure.
+                elif self._ewma_wait_ms > 8.0 and self._ewma_send_ms < 220.0 and self._in_flight >= max(1, self._limit - 1):
+                    self._limit = min(self._max_limit, self._limit + 1)
+                    reason = "queue_pressure"
+                # If network send slows down a lot, decrease concurrency to avoid congestion collapse.
+                elif self._ewma_send_ms > 320.0 and self._ewma_wait_ms < 2.0:
+                    self._limit = max(self._min_limit, self._limit - 1)
+                    reason = "network_backpressure"
+
+                if self._limit != old_limit:
+                    change_log = (
+                        old_limit,
+                        self._limit,
+                        reason or "unspecified",
+                        self._ewma_wait_ms,
+                        self._ewma_send_ms,
+                        self._in_flight,
+                    )
+
+            self._cond.notify_all()
+
+        if change_log is not None:
+            old_limit, new_limit, reason, ewma_wait_ms, ewma_send_ms, in_flight = change_log
+            self._logger.info(
+                f"{MBPIPE_LOG_PREFIX} [FLOW_CONTROL] adaptive_limit[{self._name}] "
+                f"{old_limit}->{new_limit} reason={reason} "
+                f"ewma_wait={ewma_wait_ms:.1f}ms ewma_send={ewma_send_ms:.1f}ms in_flight={in_flight}"
+            )
+
+
 class TransformerConnectionHandler(ConnectionHandler):
     """Handles three request types: forward, backward and forward-incremental (inference)"""
 
@@ -279,6 +397,16 @@ class TransformerConnectionHandler(ConnectionHandler):
         logger.info(
             f"{MBPIPE_LOG_PREFIX} Clock sync enabled: alpha={self._clock_sync_alpha:.2f}, "
             f"max_rtt={self._clock_sync_max_rtt_us/1000:.1f}ms, log_every={self._clock_sync_log_every}"
+        )
+
+        # [FLOW_CONTROL] Internal adaptive limiter for cross-stage async pushes.
+        # Keeps pipeline stable while seeking higher throughput from runtime feedback.
+        self._push_limiter = AdaptivePushConcurrency(
+            logger_=logger,
+            name=self.dht_prefix,
+            initial_limit=4,
+            min_limit=2,
+            max_limit=12,
         )
 
 
@@ -639,6 +767,37 @@ class TransformerConnectionHandler(ConnectionHandler):
                             logger.debug(f"[KVCACHE_DEBUG] cache_handles[{i}]: {len(handles) if handles else 0} handles")
                     
                     background_tasks = set()
+                    background_task_errors: List[Exception] = []
+
+                    def _track_background_task(task: asyncio.Task) -> None:
+                        """Track task lifecycle and capture async push failures."""
+                        background_tasks.add(task)
+
+                        def _on_done(done_task: asyncio.Task) -> None:
+                            background_tasks.discard(done_task)
+                            if done_task.cancelled():
+                                return
+                            exc = done_task.exception()
+                            if exc is not None:
+                                background_task_errors.append(exc)
+                                logger.warning(
+                                    f"{MBPIPE_LOG_PREFIX} Async push task failed: {exc}",
+                                    exc_info=True,
+                                )
+
+                        task.add_done_callback(_on_done)
+
+                    async def _drain_background_tasks() -> None:
+                        """Wait for pending background pushes and surface failures."""
+                        if not background_tasks:
+                            return
+                        pending = list(background_tasks)
+                        results = await asyncio.gather(*pending, return_exceptions=True)
+                        for result in results:
+                            if isinstance(result, Exception):
+                                background_task_errors.append(result)
+                        if background_task_errors:
+                            raise RuntimeError("Background push tasks failed") from background_task_errors[0]
                     step_=0
                     warmup_completed = False  # Track if warmup/prefill phase is completed
                     
@@ -664,11 +823,16 @@ class TransformerConnectionHandler(ConnectionHandler):
                             # Must be async because _push_outputs is async
                             async def buffered_push_fn(item):
                                 req, tensors, meta = item
-                                await self._push_outputs(req, tensors, meta)
+                                await self._push_outputs(req, tensors, meta, raise_on_error=True)
                             
                             await output_buffer.start_sender(buffered_push_fn)
                             logger.info(
                                 f"{MBPIPE_LOG_PREFIX} AsyncOutputBuffer started for cross-stage overlap"
+                            )
+                        elif use_buffer and buffer_pos == "consumer":
+                            logger.info(
+                                f"{MBPIPE_LOG_PREFIX} Buffer decision=consumer; "
+                                f"consumer-side buffering is not implemented, using direct push path"
                             )
                     
                     # [MBPIPE] Cross-stage streaming push callback (for micro-batch level streaming)
@@ -742,14 +906,26 @@ class TransformerConnectionHandler(ConnectionHandler):
                                     )
                                 except Exception as e:
                                     logger.warning(f"{MBPIPE_LOG_PREFIX} Buffer put failed, falling back to direct send: {e}")
-                                    task = asyncio.create_task(self._push_outputs(request, output_tensors, step_metadata))
-                                    background_tasks.add(task)
-                                    task.add_done_callback(background_tasks.discard)
+                                    task = asyncio.create_task(
+                                        self._push_outputs(
+                                            request,
+                                            output_tensors,
+                                            step_metadata,
+                                            raise_on_error=True,
+                                        )
+                                    )
+                                    _track_background_task(task)
                             else:
                                 # Original direct task creation
-                                task = asyncio.create_task(self._push_outputs(request, output_tensors, step_metadata))
-                                background_tasks.add(task)  # Keep reference until it is done to save it from GC
-                                task.add_done_callback(background_tasks.discard)
+                                task = asyncio.create_task(
+                                    self._push_outputs(
+                                        request,
+                                        output_tensors,
+                                        step_metadata,
+                                        raise_on_error=True,
+                                    )
+                                )
+                                _track_background_task(task)
                         start_ExpertResponse_time=perf_counter() ###
                         push_schedule_ms = (start_ExpertResponse_time - can_push_case_time) * 1000.0
                         push_time.append(push_schedule_ms) ###
@@ -788,10 +964,13 @@ class TransformerConnectionHandler(ConnectionHandler):
                     # [MBPIPE] Cleanup async buffer if used
                     if output_buffer is not None:
                         try:
-                            await output_buffer.flush()  # Wait for pending sends
-                            await output_buffer.stop()   # Stop background sender
+                            await output_buffer.stop(raise_on_error=True)
                         except Exception as e:
                             logger.warning(f"{MBPIPE_LOG_PREFIX} Buffer cleanup failed: {e}")
+                            raise
+
+                    # Ensure async push tasks complete before request finalization
+                    await _drain_background_tasks()
             
             finally:
                 # [MBPIPE_FIX] Clear offload state (CPU staging buffers) ONLY after the entire
@@ -1334,10 +1513,17 @@ class TransformerConnectionHandler(ConnectionHandler):
         )
 
     async def _push_outputs(
-        self, request: runtime_pb2.ExpertRequest, serialized_outputs: runtime_pb2.Tensor, metadata: dict
+        self,
+        request: runtime_pb2.ExpertRequest,
+        serialized_outputs: runtime_pb2.Tensor,
+        metadata: dict,
+        raise_on_error: bool = False,
     ) -> None:
         # print('_push_outputs metadata ', metadata)
-        push_start_time = perf_counter()
+        next_peer_id = None
+        next_session_id = None
+        next_start = None
+        next_end = None
         try:
             next_servers = metadata.get("next_servers")
             if not next_servers:
@@ -1393,10 +1579,12 @@ class TransformerConnectionHandler(ConnectionHandler):
                        f"transfer_time={transfer_time_ms:.2f}ms")
             
         except Exception:
-            logger.debug(
+            logger.warning(
                 f"Failed to push outputs to peer_id={next_peer_id}, session_id={next_session_id}, blocks={next_start}:{next_end}:",
                 exc_info=True,
             )
+            if raise_on_error:
+                raise
 
     async def _push_microbatch(
         self,
@@ -1537,26 +1725,21 @@ class TransformerConnectionHandler(ConnectionHandler):
                 metadata=MSGPackSerializer.dumps(push_metadata),
             )
             
-            # [PHASE2] Flow control: limit concurrent pending pushes to prevent queue buildup
-            # Initialize semaphore lazily (max 4 concurrent pushes)
-            if not hasattr(self, '_push_semaphore'):
-                self._push_semaphore = asyncio.Semaphore(4)
-            
             # Prioritize MB0 delivery to reduce per-step startup bubble on downstream stage.
             mb0_bypass_enabled = os.environ.get("BLOOMBEE_MB0_SEMAPHORE_BYPASS", "1") == "1"
-            bypass_semaphore = mb0_bypass_enabled and int(mb_idx) == 0
-            acquired_semaphore = False
-            if not bypass_semaphore:
-                # Acquire semaphore before queueing (non-blocking check for logging)
-                sem_wait_start = perf_counter()
-                await self._push_semaphore.acquire()
-                acquired_semaphore = True
-                sem_wait_time = (perf_counter() - sem_wait_start) * 1000
+            bypass_limiter = mb0_bypass_enabled and int(mb_idx) == 0
+            acquired_slot = False
+            if not bypass_limiter:
+                sem_wait_time = await self._push_limiter.acquire()
+                acquired_slot = True
                 if sem_wait_time > 1.0:  # Only log if we had to wait
-                    logger.info(f"{MBPIPE_LOG_PREFIX} [FLOW_CONTROL] MB{mb_idx} waited {sem_wait_time:.1f}ms for push slot")
+                    logger.info(
+                        f"{MBPIPE_LOG_PREFIX} [FLOW_CONTROL] MB{mb_idx} waited {sem_wait_time:.1f}ms "
+                        f"for push slot (limit={self._push_limiter.limit}, in_flight={self._push_limiter.in_flight})"
+                    )
             else:
                 logger.debug(
-                    f"{MBPIPE_LOG_PREFIX} [FLOW_CONTROL] MB0 bypassed semaphore "
+                    f"{MBPIPE_LOG_PREFIX} [FLOW_CONTROL] MB0 bypassed limiter "
                     f"(set BLOOMBEE_MB0_SEMAPHORE_BYPASS=0 to disable)"
                 )
             
@@ -1568,7 +1751,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                     mb_idx,
                     push_start_time,
                     next_peer_id_str,
-                    release_semaphore=acquired_semaphore,
+                    release_slot=acquired_slot,
                 )
             )
             
@@ -1595,7 +1778,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         queue_start_time: float,
         peer_id: str,
         *,
-        release_semaphore: bool = True,
+        release_slot: bool = True,
     ) -> None:
         """
         [ASYNC_PUSH] Actually perform the RPC push in background.
@@ -1604,6 +1787,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         to continue without waiting for the network round-trip.
         """
         send_start = perf_counter()
+        send_time = 0.0
+        success = False
         try:
             sender_send_us = self._now_us()
             if request.metadata:
@@ -1629,14 +1814,16 @@ class TransformerConnectionHandler(ConnectionHandler):
                 f"{MBPIPE_LOG_PREFIX} [ASYNC_PUSH] MB{mb_idx} sent: "
                 f"send={send_time:.1f}ms, total_from_queue={total_time:.1f}ms"
             )
+            success = True
         except Exception as e:
             logger.warning(
                 f"{MBPIPE_LOG_PREFIX} [ASYNC_PUSH] MB{mb_idx} send failed: {e}"
             )
         finally:
-            # [PHASE2] Release semaphore to allow next push
-            if release_semaphore and hasattr(self, '_push_semaphore'):
-                self._push_semaphore.release()
+            # Release slot and feed metrics to adaptive limiter.
+            if release_slot and hasattr(self, "_push_limiter"):
+                measured_send_ms = send_time if send_time > 0 else (perf_counter() - send_start) * 1000.0
+                await self._push_limiter.release(send_time_ms=measured_send_ms, success=success)
 
     async def rpc_forward(self, request: runtime_pb2.ExpertRequest, context: P2PContext) -> runtime_pb2.ExpertResponse:
         async with timeout(self.request_timeout):

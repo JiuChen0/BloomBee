@@ -24,7 +24,7 @@ ENV_MICRO_BATCH_SIZE = "BLOOMBEE_MICRO_BATCH_SIZE"
 
 # Default values
 # Micro-batch size for pipeline overlap. Each micro-batch writes to its own slice of the KV cache.
-DEFAULT_MICRO_BATCH_SIZE = 0  # Default micro-batch size for pipeline overlap
+DEFAULT_MICRO_BATCH_SIZE = 6  # Default micro-batch size for pipeline overlap
 
 
 def _is_microbatch_flag_enabled() -> bool:
@@ -635,7 +635,7 @@ def log_timing_summary(logger: logging.Logger) -> None:
 # =============================================================================
 
 import asyncio
-from typing import Callable, Any
+from typing import Callable
 from time import perf_counter as _perf_counter
 
 
@@ -683,9 +683,11 @@ class AsyncOutputBuffer:
         self._send_task: Optional[asyncio.Task] = None
         self._push_fn: Optional[Callable] = None
         self._running = False
+        self._first_error: Optional[Exception] = None
         self._stats = {
             "total_puts": 0,
             "total_sends": 0,
+            "total_send_failures": 0,
             "total_send_time_ms": 0.0,
             "max_queue_depth": 0,
         }
@@ -703,6 +705,7 @@ class AsyncOutputBuffer:
         
         self._push_fn = push_fn
         self._running = True
+        self._first_error = None
         self._send_task = asyncio.create_task(self._sender_loop())
         
         if self.logger:
@@ -738,6 +741,9 @@ class AsyncOutputBuffer:
                             f"queue_size={self._queue.qsize()})"
                         )
                 except Exception as e:
+                    self._stats["total_send_failures"] += 1
+                    if self._first_error is None:
+                        self._first_error = e
                     if self.logger:
                         self.logger.warning(
                             f"{MBPIPE_LOG_PREFIX} AsyncOutputBuffer[{self.name}] "
@@ -769,6 +775,10 @@ class AsyncOutputBuffer:
         """
         if not self._running:
             raise RuntimeError("Buffer not started. Call start_sender() first.")
+        if self._first_error is not None:
+            raise RuntimeError(
+                f"AsyncOutputBuffer[{self.name}] has a prior send failure"
+            ) from self._first_error
         
         wait_start = _perf_counter()
         
@@ -797,19 +807,26 @@ class AsyncOutputBuffer:
     async def flush(self) -> None:
         """Wait for all buffered items to be sent."""
         await self._queue.join()
+        self._raise_if_failed()
         
         if self.logger:
             self.logger.debug(
                 f"{MBPIPE_LOG_PREFIX} AsyncOutputBuffer[{self.name}] flushed"
             )
     
-    async def stop(self) -> None:
+    def _raise_if_failed(self) -> None:
+        if self._first_error is not None:
+            raise RuntimeError(
+                f"AsyncOutputBuffer[{self.name}] send failed"
+            ) from self._first_error
+
+    async def stop(self, raise_on_error: bool = True) -> None:
         """Stop the background sender and wait for completion."""
         self._running = False
         
         if self._send_task:
-            # Give sender time to finish remaining items
-            await self.flush()
+            # Give sender time to finish remaining items.
+            await self._queue.join()
             self._send_task.cancel()
             try:
                 await self._send_task
@@ -825,9 +842,12 @@ class AsyncOutputBuffer:
                 f"{MBPIPE_LOG_PREFIX} AsyncOutputBuffer[{self.name}] stopped: "
                 f"puts={self._stats['total_puts']}, "
                 f"sends={self._stats['total_sends']}, "
+                f"failures={self._stats['total_send_failures']}, "
                 f"avg_send={avg_send_time:.1f}ms, "
                 f"max_depth={self._stats['max_queue_depth']}"
             )
+        if raise_on_error:
+            self._raise_if_failed()
     
     @property
     def stats(self) -> dict:
@@ -886,7 +906,7 @@ class BufferedPipelineManager:
     async def stop_all(self) -> None:
         """Stop all buffers."""
         for buffer in self._buffers.values():
-            await buffer.stop()
+            await buffer.stop()   
         self._buffers.clear()
     
     def should_use_buffer_for_stage(self, stage_id: str) -> bool:
