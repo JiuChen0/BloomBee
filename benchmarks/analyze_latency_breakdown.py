@@ -32,10 +32,6 @@ CROSS_STAGE_SUMMARY_RE = re.compile(
     r"efficiency=(?P<efficiency_pct>[0-9.]+)%, strict_efficiency=(?P<strict_efficiency_pct>[0-9.]+)%, "
     r"comparable_compute=(?P<comparable_compute_ms>[0-9.]+)ms"
 )
-LOSSLESS_PROFILE_RE = re.compile(
-    r"\[LOSSLESS_PROFILE\] side=(?P<side>\S+) dir=(?P<dir>\S+) "
-    r"stage=(?P<stage>\S+) step_id=(?P<step_id>[a-f0-9\-]+) batch=(?P<batch>\d+) (?P<body>.+)$"
-)
 STEP_TIMING_BREAKDOWN_RE = re.compile(
     r"\[STEP_TIMING_BREAKDOWN\] step_id=(?P<step_id>\S+) mode=(?P<mode>\S+) "
     r"queue_wait=(?P<queue_wait_ms>-?[0-9.]+)ms queue_source=(?P<queue_source>\S+) "
@@ -68,20 +64,20 @@ HANDLER_STEP_TIMING_RE = re.compile(
     r"handler_total=(?P<handler_total_ms>-?[0-9.]+)ms "
     r"can_push=(?P<can_push>[01])"
 )
-
-
-def _extract_named_values(text: str, expected_keys):
-    """
-    Parse key=value tokens with optional unit suffixes (ms/KB).
-    Returns {key: float} for keys listed in expected_keys.
-    """
-    expected = set(expected_keys)
-    values = {}
-    for m in re.finditer(r"(?P<key>[A-Za-z0-9_]+)=(?P<val>-?[0-9.]+)(?P<unit>ms|KB)?", text):
-        key = m.group("key")
-        if key in expected:
-            values[key] = float(m.group("val"))
-    return values
+COMP_RATIO_RE = re.compile(
+    r"\[COMP_RATIO\]\s+"
+    r"source=(?P<source>\S+)\s+"
+    r"channel=(?P<channel>\S+)\s+"
+    r"blocks=(?P<blocks>\S+)\s+"
+    r"step_id=(?P<step_id>\S+)\s+"
+    r"batch=(?P<batch>\d+)\s+"
+    r"tensor=(?P<tensor>\S+)\s+"
+    r"raw_bytes=(?P<raw_bytes>\d+)\s+"
+    r"wire_bytes=(?P<wire_bytes>\d+)\s+"
+    r"ratio=(?P<ratio>-?[0-9.]+)\s+"
+    r"savings=(?P<savings>-?[0-9.]+)\s+"
+    r"nnz=(?P<nnz>-?[0-9.]+)"
+)
 
 
 def _safe_mean(xs):
@@ -96,38 +92,50 @@ def _fmt(v):
     return f"{v:.2f}"
 
 
-def _pearson_corr(xs, ys):
-    if len(xs) != len(ys) or len(xs) < 2:
+def _weighted_ratio(rows):
+    raw_total = sum(float(x.get("raw_bytes", 0.0)) for x in rows)
+    wire_total = sum(float(x.get("wire_bytes", 0.0)) for x in rows)
+    if raw_total <= 0:
+        return 1.0
+    return wire_total / raw_total
+
+
+def _parse_block_key(s: str):
+    """
+    Parse block-span strings like "0:20" or "0:20->20:40" for ordering.
+    """
+    m = re.match(r"(?P<a>\d+):(?P<b>\d+)(?:->(?P<c>\d+):(?P<d>\d+))?", s)
+    if not m:
+        return (10**9, 10**9, s)
+    a = int(m.group("a"))
+    b = int(m.group("b"))
+    return (a, b, s)
+
+
+def _pearson(xs, ys):
+    if len(xs) < 2 or len(xs) != len(ys):
         return 0.0
-    mean_x = _safe_mean(xs)
-    mean_y = _safe_mean(ys)
-    cov = 0.0
-    var_x = 0.0
-    var_y = 0.0
+    mx = _safe_mean(xs)
+    my = _safe_mean(ys)
+    num = 0.0
+    den_x = 0.0
+    den_y = 0.0
     for x, y in zip(xs, ys):
-        dx = x - mean_x
-        dy = y - mean_y
-        cov += dx * dy
-        var_x += dx * dx
-        var_y += dy * dy
-    if var_x <= 0 or var_y <= 0:
+        dx = x - mx
+        dy = y - my
+        num += dx * dy
+        den_x += dx * dx
+        den_y += dy * dy
+    den = math.sqrt(max(den_x * den_y, 0.0))
+    if den <= 0:
         return 0.0
-    return cov / math.sqrt(var_x * var_y)
-
-
-def _parse_stage_start(stage: str):
-    try:
-        head = str(stage).split(":", 1)[0]
-        return int(head)
-    except Exception:
-        return None
+    return num / den
 
 
 def parse_client_log(path: Path):
     step_network = defaultdict(list)
     server_duration = defaultdict(list)
     step_latency = []
-    lossless_rows = []
 
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         for line in f:
@@ -154,40 +162,8 @@ def parse_client_log(path: Path):
             m = STEP_LATENCY_RE.search(line)
             if m:
                 step_latency.append(float(m.group("latency_ms")))
-                continue
 
-            m = LOSSLESS_PROFILE_RE.search(line)
-            if m:
-                body_values = _extract_named_values(
-                    m.group("body"),
-                    expected_keys={
-                        "serialize_base",
-                        "wrap",
-                        "compress",
-                        "raw",
-                        "wire",
-                        "ratio",
-                        "act_nnz_ratio",
-                        "serialize_calls",
-                        "compress_ok",
-                        "deserialize_base",
-                        "unwrap",
-                        "decompress",
-                        "deserialize_calls",
-                        "decompress_calls",
-                    },
-                )
-                row = {
-                    "side": m.group("side"),
-                    "dir": m.group("dir"),
-                    "stage": m.group("stage"),
-                    "step_id": m.group("step_id"),
-                    "batch": int(m.group("batch")),
-                }
-                row.update(body_values)
-                lossless_rows.append(row)
-
-    return step_network, server_duration, step_latency, lossless_rows
+    return step_network, server_duration, step_latency
 
 
 def parse_server1_log(path: Path):
@@ -236,21 +212,6 @@ def parse_detailed_server_logs(logs):
             for line in f:
                 m = STEP_TIMING_BREAKDOWN_RE.search(line)
                 if m:
-                    lossless_vals = _extract_named_values(
-                        line,
-                        expected_keys={
-                            "lossless_rx_base",
-                            "lossless_rx_decompress",
-                            "lossless_rx_wire",
-                            "lossless_rx_raw",
-                            "lossless_rx_ratio",
-                            "lossless_tx_base",
-                            "lossless_tx_compress",
-                            "lossless_tx_raw",
-                            "lossless_tx_wire",
-                            "lossless_tx_ratio",
-                        },
-                    )
                     step_rows.append(
                         {
                             "source": source_name,
@@ -265,37 +226,12 @@ def parse_detailed_server_logs(logs):
                             "step_total_ms": float(m.group("step_total_ms")),
                             "total_with_queue_ms": float(m.group("total_with_queue_ms")),
                             "cross_gpu_window_ms": float(m.group("cross_gpu_window_ms")),
-                            "lossless_rx_base_ms": lossless_vals.get("lossless_rx_base"),
-                            "lossless_rx_decompress_ms": lossless_vals.get("lossless_rx_decompress"),
-                            "lossless_rx_wire_kb": lossless_vals.get("lossless_rx_wire"),
-                            "lossless_rx_raw_kb": lossless_vals.get("lossless_rx_raw"),
-                            "lossless_rx_ratio": lossless_vals.get("lossless_rx_ratio"),
-                            "lossless_tx_base_ms": lossless_vals.get("lossless_tx_base"),
-                            "lossless_tx_compress_ms": lossless_vals.get("lossless_tx_compress"),
-                            "lossless_tx_raw_kb": lossless_vals.get("lossless_tx_raw"),
-                            "lossless_tx_wire_kb": lossless_vals.get("lossless_tx_wire"),
-                            "lossless_tx_ratio": lossless_vals.get("lossless_tx_ratio"),
                         }
                     )
                     continue
 
                 m = STEP_TIMING_BREAKDOWN_MB_RE.search(line)
                 if m:
-                    lossless_vals = _extract_named_values(
-                        line,
-                        expected_keys={
-                            "lossless_rx_base_sum",
-                            "lossless_rx_decompress_sum",
-                            "lossless_rx_wire_sum",
-                            "lossless_rx_raw_sum",
-                            "lossless_rx_ratio",
-                            "lossless_tx_base",
-                            "lossless_tx_compress",
-                            "lossless_tx_raw",
-                            "lossless_tx_wire",
-                            "lossless_tx_ratio",
-                        },
-                    )
                     queue_wait_pre_ms = m.group("queue_wait_pre_ms")
                     queue_wait_inter_ms = m.group("queue_wait_inter_ms")
                     total_with_pre_wait_ms = m.group("total_with_pre_wait_ms")
@@ -317,16 +253,6 @@ def parse_detailed_server_logs(logs):
                             "total_with_pre_wait_ms": float(total_with_pre_wait_ms)
                             if total_with_pre_wait_ms is not None
                             else None,
-                            "lossless_rx_base_sum_ms": lossless_vals.get("lossless_rx_base_sum"),
-                            "lossless_rx_decompress_sum_ms": lossless_vals.get("lossless_rx_decompress_sum"),
-                            "lossless_rx_wire_sum_kb": lossless_vals.get("lossless_rx_wire_sum"),
-                            "lossless_rx_raw_sum_kb": lossless_vals.get("lossless_rx_raw_sum"),
-                            "lossless_rx_ratio": lossless_vals.get("lossless_rx_ratio"),
-                            "lossless_tx_base_ms": lossless_vals.get("lossless_tx_base"),
-                            "lossless_tx_compress_ms": lossless_vals.get("lossless_tx_compress"),
-                            "lossless_tx_raw_kb": lossless_vals.get("lossless_tx_raw"),
-                            "lossless_tx_wire_kb": lossless_vals.get("lossless_tx_wire"),
-                            "lossless_tx_ratio": lossless_vals.get("lossless_tx_ratio"),
                         }
                     )
                     continue
@@ -350,12 +276,41 @@ def parse_detailed_server_logs(logs):
     return step_rows, mb_rows, handler_rows
 
 
+def parse_comp_ratio_logs(logs):
+    rows = []
+    for source_name, path in logs:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                m = COMP_RATIO_RE.search(line)
+                if not m:
+                    continue
+                rows.append(
+                    {
+                        "source": source_name,
+                        "channel": m.group("channel"),
+                        "blocks": m.group("blocks"),
+                        "step_id": m.group("step_id"),
+                        "batch": int(m.group("batch")),
+                        "tensor": m.group("tensor"),
+                        "raw_bytes": int(m.group("raw_bytes")),
+                        "wire_bytes": int(m.group("wire_bytes")),
+                        "ratio": float(m.group("ratio")),
+                        "savings": float(m.group("savings")),
+                        "nnz": float(m.group("nnz")),
+                    }
+                )
+    return rows
+
+
 def summarize(client_log: Path, server1_log: Path, server2_log: Path):
-    step_network, server_duration, step_latency, client_lossless_rows = parse_client_log(client_log)
+    step_network, server_duration, step_latency = parse_client_log(client_log)
     s1_vals = parse_server1_log(server1_log)
     s2_vals = parse_server2_log(server2_log)
     step_breakdown_rows, mb_breakdown_rows, handler_step_rows = parse_detailed_server_logs(
         [("server1", server1_log), ("server2", server2_log)]
+    )
+    comp_rows = parse_comp_ratio_logs(
+        [("client", client_log), ("server1", server1_log), ("server2", server2_log)]
     )
 
     step_records = []
@@ -380,97 +335,6 @@ def summarize(client_log: Path, server1_log: Path, server2_log: Path):
             "stage1_network_ms": e1["network_ms"] if e1 else 0.0,
         }
         step_records.append(rec)
-
-    client_lossless_by_step = {}
-    for row in client_lossless_rows:
-        step_id = row.get("step_id")
-        if not step_id:
-            continue
-        rec = client_lossless_by_step.setdefault(
-            step_id,
-            {
-                "tx_serialize_base_ms": 0.0,
-                "tx_wrap_ms": 0.0,
-                "tx_compress_ms": 0.0,
-                "tx_raw_kb": 0.0,
-                "tx_wire_kb": 0.0,
-                "tx_serialize_calls": 0.0,
-                "tx_compress_ok": 0.0,
-                "tx_act_nnz_sum": 0.0,
-                "tx_act_nnz_count": 0.0,
-                "rx_deserialize_base_ms": 0.0,
-                "rx_unwrap_ms": 0.0,
-                "rx_decompress_ms": 0.0,
-                "rx_wire_kb": 0.0,
-                "rx_raw_kb": 0.0,
-                "rx_deserialize_calls": 0.0,
-                "rx_decompress_calls": 0.0,
-                "rx_act_nnz_sum": 0.0,
-                "rx_act_nnz_count": 0.0,
-            },
-        )
-        if row.get("dir") == "tx":
-            rec["tx_serialize_base_ms"] += float(row.get("serialize_base", 0.0))
-            rec["tx_wrap_ms"] += float(row.get("wrap", 0.0))
-            rec["tx_compress_ms"] += float(row.get("compress", 0.0))
-            rec["tx_raw_kb"] += float(row.get("raw", 0.0))
-            rec["tx_wire_kb"] += float(row.get("wire", 0.0))
-            rec["tx_serialize_calls"] += float(row.get("serialize_calls", 0.0))
-            rec["tx_compress_ok"] += float(row.get("compress_ok", 0.0))
-            rec["tx_act_nnz_sum"] += float(row.get("act_nnz_ratio", 0.0))
-            rec["tx_act_nnz_count"] += 1.0
-        elif row.get("dir") == "rx":
-            rec["rx_deserialize_base_ms"] += float(row.get("deserialize_base", 0.0))
-            rec["rx_unwrap_ms"] += float(row.get("unwrap", 0.0))
-            rec["rx_decompress_ms"] += float(row.get("decompress", 0.0))
-            rec["rx_wire_kb"] += float(row.get("wire", 0.0))
-            rec["rx_raw_kb"] += float(row.get("raw", 0.0))
-            rec["rx_deserialize_calls"] += float(row.get("deserialize_calls", 0.0))
-            rec["rx_decompress_calls"] += float(row.get("decompress_calls", 0.0))
-            rec["rx_act_nnz_sum"] += float(row.get("act_nnz_ratio", 0.0))
-            rec["rx_act_nnz_count"] += 1.0
-
-    client_lossless_records = []
-    for rec in client_lossless_by_step.values():
-        tx_ratio = rec["tx_wire_kb"] / rec["tx_raw_kb"] if rec["tx_raw_kb"] > 0 else 1.0
-        rx_ratio = rec["rx_wire_kb"] / rec["rx_raw_kb"] if rec["rx_raw_kb"] > 0 else 1.0
-        tx_nnz_ratio = rec["tx_act_nnz_sum"] / rec["tx_act_nnz_count"] if rec["tx_act_nnz_count"] > 0 else 0.0
-        rx_nnz_ratio = rec["rx_act_nnz_sum"] / rec["rx_act_nnz_count"] if rec["rx_act_nnz_count"] > 0 else 0.0
-        merged = dict(rec)
-        merged["tx_ratio"] = tx_ratio
-        merged["rx_ratio"] = rx_ratio
-        merged["tx_act_nnz_ratio"] = tx_nnz_ratio
-        merged["rx_act_nnz_ratio"] = rx_nnz_ratio
-        client_lossless_records.append(merged)
-
-    client_lossless_rows_enriched = []
-    stage_starts = sorted(
-        {
-            s
-            for s in (_parse_stage_start(r.get("stage", "")) for r in client_lossless_rows)
-            if s is not None
-        }
-    )
-    split_point = (len(stage_starts) + 1) // 2
-    front_starts = set(stage_starts[:split_point])
-    for row in client_lossless_rows:
-        raw_kb = float(row.get("raw", 0.0))
-        wire_kb = float(row.get("wire", 0.0))
-        ratio = (wire_kb / raw_kb) if raw_kb > 0 else float(row.get("ratio", 1.0))
-        stage_start = _parse_stage_start(row.get("stage", ""))
-        if stage_start is None:
-            layer_bucket = "unknown"
-        elif stage_start in front_starts:
-            layer_bucket = "front"
-        else:
-            layer_bucket = "back"
-        enriched = dict(row)
-        enriched["raw_kb"] = raw_kb
-        enriched["wire_kb"] = wire_kb
-        enriched["ratio_wire_over_raw"] = ratio
-        enriched["act_nnz_ratio"] = float(row.get("act_nnz_ratio", 0.0))
-        enriched["layer_bucket"] = layer_bucket
-        client_lossless_rows_enriched.append(enriched)
 
     print("=" * 92)
     print("Latency/Volume Breakdown (from existing logs)")
@@ -505,120 +369,6 @@ def summarize(client_log: Path, server1_log: Path, server2_log: Path):
     if step_latency:
         print(f"{'step_latency_ms':38} {_fmt(_safe_mean(step_latency)):>12} {_fmt(_safe_median(step_latency)):>12} {len(step_latency):>10}")
         print("-" * 92)
-
-    print()
-    print("Client lossless wrapper profiling (from [LOSSLESS_PROFILE]):")
-    print("-" * 92)
-    print(f"{'metric':38} {'mean':>12} {'median':>12} {'count':>10}")
-    print("-" * 92)
-    if client_lossless_records:
-        for key, label in [
-            ("tx_serialize_base_ms", "tx_serialize_base_ms"),
-            ("tx_compress_ms", "tx_compress_ms"),
-            ("tx_wrap_ms", "tx_wrap_ms"),
-            ("tx_raw_kb", "tx_raw_kb"),
-            ("tx_wire_kb", "tx_wire_kb"),
-            ("tx_ratio", "tx_wire_over_raw_ratio"),
-            ("tx_act_nnz_ratio", "tx_act_nnz_ratio"),
-            ("rx_deserialize_base_ms", "rx_deserialize_base_ms"),
-            ("rx_decompress_ms", "rx_decompress_ms"),
-            ("rx_unwrap_ms", "rx_unwrap_ms"),
-            ("rx_wire_kb", "rx_wire_kb"),
-            ("rx_raw_kb", "rx_raw_kb"),
-            ("rx_ratio", "rx_wire_over_raw_ratio"),
-            ("rx_act_nnz_ratio", "rx_act_nnz_ratio"),
-        ]:
-            vals = [r[key] for r in client_lossless_records]
-            print(f"{label:38} {_fmt(_safe_mean(vals)):>12} {_fmt(_safe_median(vals)):>12} {len(vals):>10}")
-    else:
-        print("No [LOSSLESS_PROFILE] entries found in client log.")
-    print("-" * 92)
-
-    print()
-    print("Client compression ratio by stage/layer (from [LOSSLESS_PROFILE]):")
-    print("-" * 92)
-    stage_groups = defaultdict(list)
-    for row in client_lossless_rows_enriched:
-        key = (row.get("dir", "?"), row.get("stage", "?"), row.get("layer_bucket", "unknown"))
-        stage_groups[key].append(row)
-    if stage_groups:
-        print(f"{'dir':>5} {'stage':>12} {'bucket':>8} {'ratio_mean':>12} {'nnz_mean':>10} {'raw_kb':>10} {'wire_kb':>10} {'count':>8}")
-        for (dir_name, stage_name, bucket), rows in sorted(stage_groups.items()):
-            ratios = [r["ratio_wire_over_raw"] for r in rows]
-            nnzs = [r["act_nnz_ratio"] for r in rows]
-            raws = [r["raw_kb"] for r in rows]
-            wires = [r["wire_kb"] for r in rows]
-            print(
-                f"{dir_name:>5} {str(stage_name):>12} {bucket:>8} {_fmt(_safe_mean(ratios)):>12} "
-                f"{_fmt(_safe_mean(nnzs)):>10} {_fmt(_safe_mean(raws)):>10} {_fmt(_safe_mean(wires)):>10} {len(rows):>8}"
-            )
-    else:
-        print("No per-stage compression rows found.")
-    print("-" * 92)
-
-    print()
-    print("Client compression ratio by layer bucket (front/back):")
-    print("-" * 92)
-    bucket_groups = defaultdict(list)
-    for row in client_lossless_rows_enriched:
-        key = (row.get("dir", "?"), row.get("layer_bucket", "unknown"))
-        bucket_groups[key].append(row)
-    if bucket_groups:
-        print(f"{'dir':>5} {'bucket':>10} {'ratio_mean':>12} {'nnz_mean':>10} {'raw_kb':>10} {'wire_kb':>10} {'count':>8}")
-        for (dir_name, bucket), rows in sorted(bucket_groups.items()):
-            ratios = [r["ratio_wire_over_raw"] for r in rows]
-            nnzs = [r["act_nnz_ratio"] for r in rows]
-            raws = [r["raw_kb"] for r in rows]
-            wires = [r["wire_kb"] for r in rows]
-            print(
-                f"{dir_name:>5} {bucket:>10} {_fmt(_safe_mean(ratios)):>12} {_fmt(_safe_mean(nnzs)):>10} "
-                f"{_fmt(_safe_mean(raws)):>10} {_fmt(_safe_mean(wires)):>10} {len(rows):>8}"
-            )
-    else:
-        print("No bucket-level compression rows found.")
-    print("-" * 92)
-
-    print()
-    print("Client compression ratio by batch size (from [LOSSLESS_PROFILE]):")
-    print("-" * 92)
-    batch_groups = defaultdict(list)
-    for row in client_lossless_rows_enriched:
-        key = (row.get("dir", "?"), int(row.get("batch", 0)))
-        batch_groups[key].append(row)
-    if batch_groups:
-        print(f"{'dir':>5} {'batch':>8} {'ratio_mean':>12} {'nnz_mean':>10} {'raw_kb':>10} {'wire_kb':>10} {'count':>8}")
-        for (dir_name, batch), rows in sorted(batch_groups.items()):
-            ratios = [r["ratio_wire_over_raw"] for r in rows]
-            nnzs = [r["act_nnz_ratio"] for r in rows]
-            raws = [r["raw_kb"] for r in rows]
-            wires = [r["wire_kb"] for r in rows]
-            print(
-                f"{dir_name:>5} {batch:>8} {_fmt(_safe_mean(ratios)):>12} {_fmt(_safe_mean(nnzs)):>10} "
-                f"{_fmt(_safe_mean(raws)):>10} {_fmt(_safe_mean(wires)):>10} {len(rows):>8}"
-            )
-    else:
-        print("No batch-level compression rows found.")
-    print("-" * 92)
-
-    print()
-    print("Compression ratio vs activation non-zero ratio (from [LOSSLESS_PROFILE]):")
-    print("-" * 92)
-    print(f"{'dir':>5} {'pearson(ratio,nnz)':>22} {'mean_ratio':>12} {'mean_nnz':>10} {'count':>8}")
-    printed_corr = False
-    for dir_name in ("tx", "rx"):
-        rows = [r for r in client_lossless_rows_enriched if r.get("dir") == dir_name]
-        ratios = [r["ratio_wire_over_raw"] for r in rows]
-        nnzs = [r["act_nnz_ratio"] for r in rows]
-        if len(ratios) >= 2:
-            corr = _pearson_corr(ratios, nnzs)
-            printed_corr = True
-            print(
-                f"{dir_name:>5} {_fmt(corr):>22} {_fmt(_safe_mean(ratios)):>12} "
-                f"{_fmt(_safe_mean(nnzs)):>10} {len(rows):>8}"
-            )
-    if not printed_corr:
-        print("Not enough rows to compute correlation.")
-    print("-" * 92)
 
     print()
     print("Client server-span duration (from [CLIENT_SERVER_END]):")
@@ -699,34 +449,6 @@ def summarize(client_log: Path, server1_log: Path, server2_log: Path):
     print("-" * 92)
 
     print()
-    print("Server lossless profiling (from [STEP_TIMING_BREAKDOWN]):")
-    print("-" * 92)
-    print(f"{'metric':38} {'mean':>12} {'median':>12} {'count':>10}")
-    print("-" * 92)
-    step_lossless_metrics = [
-        ("lossless_rx_base_ms", "lossless_rx_base_ms"),
-        ("lossless_rx_decompress_ms", "lossless_rx_decompress_ms"),
-        ("lossless_rx_wire_kb", "lossless_rx_wire_kb"),
-        ("lossless_rx_raw_kb", "lossless_rx_raw_kb"),
-        ("lossless_rx_ratio", "lossless_rx_wire_over_raw_ratio"),
-        ("lossless_tx_base_ms", "lossless_tx_base_ms"),
-        ("lossless_tx_compress_ms", "lossless_tx_compress_ms"),
-        ("lossless_tx_raw_kb", "lossless_tx_raw_kb"),
-        ("lossless_tx_wire_kb", "lossless_tx_wire_kb"),
-        ("lossless_tx_ratio", "lossless_tx_wire_over_raw_ratio"),
-    ]
-    printed_step_lossless = False
-    if step_breakdown_rows:
-        for key, label in step_lossless_metrics:
-            vals = [r[key] for r in step_breakdown_rows if r.get(key) is not None]
-            if vals:
-                printed_step_lossless = True
-                print(f"{label:38} {_fmt(_safe_mean(vals)):>12} {_fmt(_safe_median(vals)):>12} {len(vals):>10}")
-    if not printed_step_lossless:
-        print("No lossless fields found in [STEP_TIMING_BREAKDOWN] entries.")
-    print("-" * 92)
-
-    print()
     print("Server merged micro-batch step breakdown (from [STEP_TIMING_BREAKDOWN_MB]):")
     print("-" * 92)
     if mb_breakdown_rows:
@@ -760,34 +482,6 @@ def summarize(client_log: Path, server1_log: Path, server2_log: Path):
     print("-" * 92)
 
     print()
-    print("Server micro-batch lossless profiling (from [STEP_TIMING_BREAKDOWN_MB]):")
-    print("-" * 92)
-    print(f"{'metric':38} {'mean':>12} {'median':>12} {'count':>10}")
-    print("-" * 92)
-    mb_lossless_metrics = [
-        ("lossless_rx_base_sum_ms", "lossless_rx_base_sum_ms"),
-        ("lossless_rx_decompress_sum_ms", "lossless_rx_decompress_sum_ms"),
-        ("lossless_rx_wire_sum_kb", "lossless_rx_wire_sum_kb"),
-        ("lossless_rx_raw_sum_kb", "lossless_rx_raw_sum_kb"),
-        ("lossless_rx_ratio", "lossless_rx_wire_over_raw_ratio"),
-        ("lossless_tx_base_ms", "lossless_tx_base_ms"),
-        ("lossless_tx_compress_ms", "lossless_tx_compress_ms"),
-        ("lossless_tx_raw_kb", "lossless_tx_raw_kb"),
-        ("lossless_tx_wire_kb", "lossless_tx_wire_kb"),
-        ("lossless_tx_ratio", "lossless_tx_wire_over_raw_ratio"),
-    ]
-    printed_mb_lossless = False
-    if mb_breakdown_rows:
-        for key, label in mb_lossless_metrics:
-            vals = [r[key] for r in mb_breakdown_rows if r.get(key) is not None]
-            if vals:
-                printed_mb_lossless = True
-                print(f"{label:38} {_fmt(_safe_mean(vals)):>12} {_fmt(_safe_median(vals)):>12} {len(vals):>10}")
-    if not printed_mb_lossless:
-        print("No lossless fields found in [STEP_TIMING_BREAKDOWN_MB] entries.")
-    print("-" * 92)
-
-    print()
     print("Handler-side step overhead (from [HANDLER_STEP_TIMING]):")
     print("-" * 92)
     if handler_step_rows:
@@ -812,6 +506,86 @@ def summarize(client_log: Path, server1_log: Path, server2_log: Path):
             print(f"{label:38} {_fmt(_safe_mean(vals)):>12} {_fmt(_safe_median(vals)):>12} {len(vals):>10}")
     else:
         print("No [HANDLER_STEP_TIMING] entries found.")
+    print("-" * 92)
+
+    print()
+    print("Compression ratio factor analysis (from [COMP_RATIO]):")
+    print("-" * 92)
+    print("Method / formulas:")
+    print("1) ratio = wire_bytes / raw_bytes  (lower is better, savings = 1 - ratio)")
+    print("2) layer/span weighted ratio = sum(wire_bytes) / sum(raw_bytes) within each blocks group")
+    print("3) batch weighted ratio = sum(wire_bytes) / sum(raw_bytes) within each batch group")
+    print("4) nnz relation uses Pearson r between per-record ratio and nnz")
+    print("   r = cov(ratio, nnz) / (std(ratio) * std(nnz))")
+    print("-" * 92)
+    if comp_rows:
+        print(
+            f"overall: samples={len(comp_rows)}, "
+            f"weighted_ratio={_fmt(_weighted_ratio(comp_rows))}, "
+            f"mean_ratio={_fmt(_safe_mean([r['ratio'] for r in comp_rows]))}, "
+            f"mean_nnz={_fmt(_safe_mean([r['nnz'] for r in comp_rows]))}"
+        )
+
+        print()
+        print("By layer/span (blocks):")
+        print(f"{'blocks':24} {'w_ratio':>10} {'mean_ratio':>12} {'mean_nnz':>10} {'count':>8}")
+        by_blocks = defaultdict(list)
+        for r in comp_rows:
+            by_blocks[r["blocks"]].append(r)
+        ordered_blocks = sorted(by_blocks.items(), key=lambda kv: _parse_block_key(kv[0]))
+        for blocks, rows in ordered_blocks:
+            print(
+                f"{blocks:24} "
+                f"{_fmt(_weighted_ratio(rows)):>10} "
+                f"{_fmt(_safe_mean([x['ratio'] for x in rows])):>12} "
+                f"{_fmt(_safe_mean([x['nnz'] for x in rows])):>10} "
+                f"{len(rows):>8}"
+            )
+        if len(ordered_blocks) >= 2:
+            front_blocks, front_rows = ordered_blocks[0]
+            back_blocks, back_rows = ordered_blocks[-1]
+            front_w = _weighted_ratio(front_rows)
+            back_w = _weighted_ratio(back_rows)
+            print(
+                f"front_vs_back: front={front_blocks}({front_w:.4f}) "
+                f"back={back_blocks}({back_w:.4f}) delta(back-front)={(back_w-front_w):.4f}"
+            )
+
+        print()
+        print("By batch size:")
+        print(f"{'batch':>8} {'w_ratio':>10} {'mean_ratio':>12} {'mean_nnz':>10} {'count':>8}")
+        by_batch = defaultdict(list)
+        for r in comp_rows:
+            by_batch[int(r["batch"])].append(r)
+        for batch in sorted(by_batch):
+            rows = by_batch[batch]
+            print(
+                f"{batch:>8} "
+                f"{_fmt(_weighted_ratio(rows)):>10} "
+                f"{_fmt(_safe_mean([x['ratio'] for x in rows])):>12} "
+                f"{_fmt(_safe_mean([x['nnz'] for x in rows])):>10} "
+                f"{len(rows):>8}"
+            )
+
+        ratios = [r["ratio"] for r in comp_rows]
+        nnzs = [r["nnz"] for r in comp_rows]
+        pearson_r = _pearson(nnzs, ratios)
+        median_nnz = _safe_median(nnzs)
+        low_rows = [r for r in comp_rows if r["nnz"] <= median_nnz]
+        high_rows = [r for r in comp_rows if r["nnz"] > median_nnz]
+        print()
+        print("nnz vs ratio:")
+        print(
+            f"pearson_r={pearson_r:.4f} (negative means denser activations tend to compress better)"
+        )
+        print(
+            f"median_split: median_nnz={median_nnz:.4f}, "
+            f"low_nnz_w_ratio={_weighted_ratio(low_rows):.4f}, "
+            f"high_nnz_w_ratio={_weighted_ratio(high_rows):.4f}"
+        )
+    else:
+        print("No [COMP_RATIO] entries found.")
+        print("Hint: ensure BLOOMBEE_COMP_RATIO_PROFILE=1 and rerun inference.")
     print("-" * 92)
 
     if step_records and step_latency and s1_vals and s2_vals:

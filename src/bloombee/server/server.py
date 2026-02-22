@@ -290,14 +290,6 @@ class Server:
         from bloombee.utils.microbatch_config import get_micro_batch_size, get_micro_batch_config
         mb_config = get_micro_batch_config()
         micro_batch_size = get_micro_batch_size()
-        offload_enabled = os.environ.get("BLOOMBEE_ENABLE_KV_OFFLOAD", "1") != "0"
-        if not offload_enabled and mb_config["enabled"]:
-            logger.info(
-                "[POLICY_OFFLOAD_DISABLED] BLOOMBEE_ENABLE_KV_OFFLOAD=0 -> forcing full-batch GPU policy; "
-                "micro-batch multiplexing disabled for correctness"
-            )
-            mb_config = dict(mb_config)
-            mb_config["enabled"] = False
         
         if mb_config['enabled']:
             gpu_batch_size = micro_batch_size  # GPU only allocates for ONE micro-batch
@@ -307,42 +299,11 @@ class Server:
             gpu_batch_size = batch_size  # Full batch for backwards compatibility
             logger.info(f"[POLICY_NO_MB] GPU batch_size={gpu_batch_size} (full batch, micro-batching disabled)")
         
-        def _env_pct(name: str, default: int) -> int:
-            raw = os.environ.get(name)
-            if raw is None or raw == "":
-                return int(default)
-            try:
-                val = int(raw)
-            except ValueError:
-                logger.warning("Invalid %s=%r, fallback to %d", name, raw, default)
-                return int(default)
-            if val < 0:
-                return 0
-            if val > 100:
-                return 100
-            return val
-
-        w_gpu_percent = _env_pct("BLOOMBEE_POLICY_W_GPU_PERCENT", 100)
-        w_cpu_percent = _env_pct("BLOOMBEE_POLICY_W_CPU_PERCENT", 0)
-        cache_gpu_percent = _env_pct("BLOOMBEE_POLICY_CACHE_GPU_PERCENT", 100)
-        cache_cpu_percent = _env_pct("BLOOMBEE_POLICY_CACHE_CPU_PERCENT", 0)
-        act_gpu_percent = _env_pct("BLOOMBEE_POLICY_ACT_GPU_PERCENT", 100)
-        act_cpu_percent = _env_pct("BLOOMBEE_POLICY_ACT_CPU_PERCENT", 0)
-        logger.info(
-            "[POLICY_PCT] w_gpu=%d w_cpu=%d cache_gpu=%d cache_cpu=%d act_gpu=%d act_cpu=%d",
-            w_gpu_percent,
-            w_cpu_percent,
-            cache_gpu_percent,
-            cache_cpu_percent,
-            act_gpu_percent,
-            act_cpu_percent,
-        )
-
         self.policy = Policy(
             gpu_batch_size, 1,        # gpu_batch_size controls GPU cache allocation
-            w_gpu_percent, w_cpu_percent,
-            cache_gpu_percent, cache_cpu_percent,
-            act_gpu_percent, act_cpu_percent,
+            100, 0,                   # w_gpu_percent, w_cpu_percent
+            100, 0,                   # cache_gpu_percent=100% (GPU cache only holds micro_batch_size slots)
+            100, 0,                   # act_gpu_percent, act_cpu_percent (activations on GPU)
             overlap=False, sep_layer=True, pin_weight=True,
             cpu_cache_compute=False, attn_sparsity=1.0,
             compress_weight=False,

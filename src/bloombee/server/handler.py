@@ -37,7 +37,14 @@ from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_backw
 from bloombee.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritizerBase
 from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
 from bloombee.utils.convert_block import QuantType
-from bloombee.utils.lossless_transport import deserialize_tensor_stream, deserialize_torch_tensor, serialize_torch_tensor
+from bloombee.utils.lossless_transport import (
+    deserialize_tensor_stream,
+    deserialize_torch_tensor,
+    serialize_torch_tensor,
+    log_comp_ratio_event,
+    tensor_nnz_ratio,
+    tensor_raw_nbytes,
+)
 from bloombee.utils.packaging import unpack_args_kwargs
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
@@ -1657,6 +1664,20 @@ class TransformerConnectionHandler(ConnectionHandler):
                 mb_hidden.to(outputs_schema[0].dtype),
                 outputs_schema[0].compression,
                 allow_inplace=True
+            )
+            sender_blocks = str(metadata.get("sender_blocks", "unknown"))
+            log_comp_ratio_event(
+                logger,
+                source="server",
+                channel="rpc_push_microbatch",
+                blocks=f"{sender_blocks}->{next_start}:{next_end}",
+                step_id=str(metadata.get("step_id", "unknown")),
+                batch_size=int(mb_size),
+                tensor_name="hidden_states",
+                raw_bytes=tensor_raw_nbytes(mb_hidden),
+                wire_bytes=len(serialized_hidden.buffer),
+                nnz_ratio=tensor_nnz_ratio(mb_hidden),
+                extra={"mb_idx": int(mb_idx)},
             )
             
             # Serialize keep_indices if present
