@@ -46,7 +46,15 @@ class KVCacheManager:
         # so each block keeps its own micro-batch history.
         self._mb_cpu_staging = {}  # {(slot_id, mb_index): (k_cpu, v_cpu, prefix_len)}
         self._current_gpu_mb = {}  # {slot_id: mb_index} currently materialized on GPU
-        self._offload_enabled = True  # Enable/disable offloading
+        # Explicit on/off switch for KV offloading path.
+        # 1 (default): enable micro-batch KV offload/prefetch.
+        # 0: disable KV offload/prefetch helpers.
+        offload_env = os.environ.get("BLOOMBEE_ENABLE_KV_OFFLOAD")
+        self._offload_enabled = (offload_env != "0")
+        logger.info(
+            "[KVCACHE_OFFLOAD] KV offload enabled: %s (set BLOOMBEE_ENABLE_KV_OFFLOAD=0 to disable)",
+            "YES" if self._offload_enabled else "NO",
+        )
         # Async KV transfer mode:
         # - explicit override via BLOOMBEE_ENABLE_ASYNC_KV_TRANSFER=0/1
         # - otherwise default to enabled when micro-batching is enabled

@@ -17,7 +17,12 @@ from bloombee.server.backend import TransformerBackend
 from bloombee.server.task_pool import PrioritizedTaskPool
 from bloombee.server.task_prioritizer import TaskPrioritizerBase
 from bloombee.utils.convert_block import QuantType
-from bloombee.utils.lossless_transport import deserialize_torch_tensor, serialize_torch_tensor
+from bloombee.utils.lossless_transport import (
+    deserialize_torch_tensor,
+    diff_lossless_profile,
+    get_lossless_profile_snapshot,
+    serialize_torch_tensor,
+)
 from bloombee.utils.misc import DUMMY, is_dummy
 from bloombee.utils.packaging import unpack_args_kwargs
 from bloombee.server.speculative_pruner.pruner_manager import SpeculativePrunerManager
@@ -537,9 +542,12 @@ async def iterate_rpc_inference(
             logger.debug(f"[MB_DEBUG] step_id={step_id}, session_id={session_id}")
             
             # Deserialize only the 2 tensors from micro-batch push
+            mb_rx_profile_before = get_lossless_profile_snapshot()
             mb_deserialize_start = perf_counter()
             flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
             mb_deserialize_ms = (perf_counter() - mb_deserialize_start) * 1000.0
+            mb_rx_profile_after = get_lossless_profile_snapshot()
+            mb_rx_profile_delta = diff_lossless_profile(mb_rx_profile_before, mb_rx_profile_after)
             
             # [MB_DEBUG] Log deserialized tensors
             logger.debug(f"[MB_DEBUG] Deserialized {len(flat_tensors)} tensors from request")
@@ -876,6 +884,10 @@ async def iterate_rpc_inference(
                     'compute_ms_sum': 0.0,
                     'queue_source_counts': {},
                     'token_increment': int(token_increment),
+                    'lossless_rx_base_ms_sum': 0.0,
+                    'lossless_rx_decompress_ms_sum': 0.0,
+                    'lossless_rx_wire_bytes_sum': 0.0,
+                    'lossless_rx_raw_bytes_sum': 0.0,
                 }
             
             accum = iterate_rpc_inference._mb_accumulators[mb_accum_key]
@@ -893,6 +905,10 @@ async def iterate_rpc_inference(
                 accum['queue_wait_inter_ms'] += queue_wait_ms
             accum['deserialize_ms_sum'] += mb_deserialize_ms
             accum['compute_ms_sum'] += process_time_ms
+            accum['lossless_rx_base_ms_sum'] += float(mb_rx_profile_delta.get('rx_base_deserialize_ms', 0.0))
+            accum['lossless_rx_decompress_ms_sum'] += float(mb_rx_profile_delta.get('rx_decompress_ms', 0.0))
+            accum['lossless_rx_wire_bytes_sum'] += float(mb_rx_profile_delta.get('rx_input_bytes', 0.0))
+            accum['lossless_rx_raw_bytes_sum'] += float(mb_rx_profile_delta.get('rx_output_bytes', 0.0))
             accum['queue_source_counts'][queue_source] = accum['queue_source_counts'].get(queue_source, 0) + 1
             if log_mb_detail:
                 logger.info(
@@ -1125,6 +1141,7 @@ async def iterate_rpc_inference(
                     )
                 
                 need_pruning_next = torch.tensor(0)
+                mb_tx_profile_before = get_lossless_profile_snapshot()
                 merge_serialize_start = perf_counter()
                 output_tensors = [
                     serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
@@ -1134,12 +1151,32 @@ async def iterate_rpc_inference(
                     )
                 ]
                 merge_serialize_ms = (perf_counter() - merge_serialize_start) * 1000.0
+                mb_tx_profile_after = get_lossless_profile_snapshot()
+                mb_tx_profile_delta = diff_lossless_profile(mb_tx_profile_before, mb_tx_profile_after)
                 merge_total_ms = (perf_counter() - accum.get('step_start_time', step_receive_time)) * 1000.0
                 queue_wait_sum_ms = float(accum.get('queue_wait_ms_sum', 0.0))
                 queue_wait_pre_ms = float(accum.get('queue_wait_pre_ms', 0.0))
                 queue_wait_inter_ms = float(accum.get('queue_wait_inter_ms', 0.0))
                 deserialize_sum_ms = float(accum.get('deserialize_ms_sum', 0.0))
                 compute_sum_ms = float(accum.get('compute_ms_sum', 0.0))
+                lossless_rx_base_sum_ms = float(accum.get('lossless_rx_base_ms_sum', 0.0))
+                lossless_rx_decompress_sum_ms = float(accum.get('lossless_rx_decompress_ms_sum', 0.0))
+                lossless_rx_wire_sum_kb = float(accum.get('lossless_rx_wire_bytes_sum', 0.0)) / 1024.0
+                lossless_rx_raw_sum_kb = float(accum.get('lossless_rx_raw_bytes_sum', 0.0)) / 1024.0
+                lossless_rx_ratio = (
+                    lossless_rx_wire_sum_kb / lossless_rx_raw_sum_kb
+                    if lossless_rx_raw_sum_kb > 0
+                    else 1.0
+                )
+                lossless_tx_base_ms = float(mb_tx_profile_delta.get('tx_base_serialize_ms', 0.0))
+                lossless_tx_compress_ms = float(mb_tx_profile_delta.get('tx_compress_ms', 0.0))
+                lossless_tx_raw_kb = float(mb_tx_profile_delta.get('tx_raw_bytes', 0.0)) / 1024.0
+                lossless_tx_wire_kb = float(mb_tx_profile_delta.get('tx_wrapped_bytes', 0.0)) / 1024.0
+                lossless_tx_ratio = (
+                    lossless_tx_wire_kb / lossless_tx_raw_kb
+                    if lossless_tx_raw_kb > 0
+                    else 1.0
+                )
                 merge_residual_ms = merge_total_ms - (
                     deserialize_sum_ms + compute_sum_ms + merge_serialize_ms
                 )
@@ -1160,7 +1197,17 @@ async def iterate_rpc_inference(
                     f"queue_sources={queue_source_stats} "
                     f"queue_wait_pre={queue_wait_pre_ms:.2f}ms "
                     f"queue_wait_inter={queue_wait_inter_ms:.2f}ms "
-                    f"total_with_pre_wait={total_with_pre_wait_ms:.2f}ms"
+                    f"total_with_pre_wait={total_with_pre_wait_ms:.2f}ms "
+                    f"lossless_rx_base_sum={lossless_rx_base_sum_ms:.2f}ms "
+                    f"lossless_rx_decompress_sum={lossless_rx_decompress_sum_ms:.2f}ms "
+                    f"lossless_rx_wire_sum={lossless_rx_wire_sum_kb:.2f}KB "
+                    f"lossless_rx_raw_sum={lossless_rx_raw_sum_kb:.2f}KB "
+                    f"lossless_rx_ratio={lossless_rx_ratio:.4f} "
+                    f"lossless_tx_base={lossless_tx_base_ms:.2f}ms "
+                    f"lossless_tx_compress={lossless_tx_compress_ms:.2f}ms "
+                    f"lossless_tx_raw={lossless_tx_raw_kb:.2f}KB "
+                    f"lossless_tx_wire={lossless_tx_wire_kb:.2f}KB "
+                    f"lossless_tx_ratio={lossless_tx_ratio:.4f}"
                 )
                 # Cleanup accumulator
                 del iterate_rpc_inference._mb_accumulators[mb_accum_key]
@@ -1173,9 +1220,12 @@ async def iterate_rpc_inference(
             continue
 
         # [MERGED] Use upstream's standard tensor unpacking for full-batch path
+        rx_profile_before = get_lossless_profile_snapshot()
         deserialize_start = perf_counter()
         flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
         deserialize_time = (perf_counter() - deserialize_start) * 1000.0
+        rx_profile_after = get_lossless_profile_snapshot()
+        rx_profile_delta = diff_lossless_profile(rx_profile_before, rx_profile_after)
         if args_structure is not None:
             flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
 
@@ -1833,6 +1883,7 @@ async def iterate_rpc_inference(
                 device=hidden_states.device
             ).unsqueeze(0).expand(hidden_states.shape[0], -1)
         
+        tx_profile_before = get_lossless_profile_snapshot()
         serialize_start = perf_counter()
         need_pruning_next = torch.tensor(0)
         output_tensors = [
@@ -1841,6 +1892,8 @@ async def iterate_rpc_inference(
         ]
         serialize_end = perf_counter()
         serialize_time = (serialize_end - serialize_start) * 1000  # ms
+        tx_profile_after = get_lossless_profile_snapshot()
+        tx_profile_delta = diff_lossless_profile(tx_profile_before, tx_profile_after)
         # print('after serialize and send last layer outputs ', )
         # print_time_now('')
         # print('hidden_states ', hidden_states)
@@ -1861,6 +1914,16 @@ async def iterate_rpc_inference(
         step_total_time = (step_end_time - step_receive_time) * 1000  # ms
         step_residual_ms = step_total_time - (deserialize_time + compute_time + serialize_time)
         step_total_with_queue_ms = step_total_time + queue_wait_ms
+        lossless_rx_base_ms = float(rx_profile_delta.get("rx_base_deserialize_ms", 0.0))
+        lossless_rx_decompress_ms = float(rx_profile_delta.get("rx_decompress_ms", 0.0))
+        lossless_rx_wire_kb = float(rx_profile_delta.get("rx_input_bytes", 0.0)) / 1024.0
+        lossless_rx_raw_kb = float(rx_profile_delta.get("rx_output_bytes", 0.0)) / 1024.0
+        lossless_rx_ratio = (lossless_rx_wire_kb / lossless_rx_raw_kb) if lossless_rx_raw_kb > 0 else 1.0
+        lossless_tx_base_ms = float(tx_profile_delta.get("tx_base_serialize_ms", 0.0))
+        lossless_tx_compress_ms = float(tx_profile_delta.get("tx_compress_ms", 0.0))
+        lossless_tx_raw_kb = float(tx_profile_delta.get("tx_raw_bytes", 0.0)) / 1024.0
+        lossless_tx_wire_kb = float(tx_profile_delta.get("tx_wrapped_bytes", 0.0)) / 1024.0
+        lossless_tx_ratio = (lossless_tx_wire_kb / lossless_tx_raw_kb) if lossless_tx_raw_kb > 0 else 1.0
         logger.info(
             f"[STEP_TIMING_BREAKDOWN] step_id={step_id_for_log} mode={execution_mode} "
             f"queue_wait={queue_wait_ms:.2f}ms queue_source={queue_source} "
@@ -1868,7 +1931,13 @@ async def iterate_rpc_inference(
                 f"serialize={serialize_time:.2f}ms residual={step_residual_ms:.2f}ms "
                 f"step_total={step_total_time:.2f}ms total_with_queue={step_total_with_queue_ms:.2f}ms "
                 f"cross_gpu_window={cross_gpu_receive_time:.2f}ms "
-                f"batch={batch_size} seq_inc={token_increment} raw_seq={length_increment} is_spec_dec={int(bool(is_spec_dec))}"
+                f"batch={batch_size} seq_inc={token_increment} raw_seq={length_increment} is_spec_dec={int(bool(is_spec_dec))} "
+                f"lossless_rx_base={lossless_rx_base_ms:.2f}ms "
+                f"lossless_rx_decompress={lossless_rx_decompress_ms:.2f}ms "
+                f"lossless_rx_wire={lossless_rx_wire_kb:.2f}KB lossless_rx_raw={lossless_rx_raw_kb:.2f}KB lossless_rx_ratio={lossless_rx_ratio:.4f} "
+                f"lossless_tx_base={lossless_tx_base_ms:.2f}ms "
+                f"lossless_tx_compress={lossless_tx_compress_ms:.2f}ms "
+                f"lossless_tx_raw={lossless_tx_raw_kb:.2f}KB lossless_tx_wire={lossless_tx_wire_kb:.2f}KB lossless_tx_ratio={lossless_tx_ratio:.4f}"
             )
         
         # [MBPIPE] Record stage timing for cross-stage overlap decisions

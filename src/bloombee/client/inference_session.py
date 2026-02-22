@@ -17,7 +17,12 @@ from bloombee.client.config import ClientConfig
 from bloombee.client.routing import RemoteSequenceManager, maybe_log_traceback
 from bloombee.data_structures import CHAIN_DELIMITER, ModuleUID, RemoteSpanInfo, RPCInfo
 from bloombee.server.handler import TransformerConnectionHandler
-from bloombee.utils.lossless_transport import deserialize_torch_tensor, serialize_torch_tensor
+from bloombee.utils.lossless_transport import (
+    deserialize_torch_tensor,
+    diff_lossless_profile,
+    get_lossless_profile_snapshot,
+    serialize_torch_tensor,
+)
 from bloombee.utils.misc import DUMMY, DUMMY_INT64, is_dummy
 from bloombee.utils.packaging import pack_args_kwargs, normalize_arg
 from bloombee.utils.microbatch_config import (
@@ -30,6 +35,18 @@ from bloombee.utils.microbatch_config import (
 )
 
 logger = get_logger(__name__)
+
+
+def _tensor_nnz_ratio(t: Optional[torch.Tensor]) -> float:
+    if t is None or not torch.is_tensor(t):
+        return 0.0
+    if t.numel() == 0:
+        return 0.0
+    try:
+        nnz = torch.count_nonzero(t).item()
+        return float(nnz) / float(t.numel())
+    except Exception:
+        return 0.0
 
 
 class _ServerInferenceSession:
@@ -219,6 +236,7 @@ class _ServerInferenceSession:
         # ), "Hidden_state, prompts and hypo_ids tensors are necessary for an inference step"
 
         # [NETWORK_TIMING] Measure serialization time
+        tx_profile_before = get_lossless_profile_snapshot()
         serialize_start = time.perf_counter()
         
         # Serialize and send data (debug output removed for performance)
@@ -234,6 +252,8 @@ class _ServerInferenceSession:
         
         serialize_end = time.perf_counter()
         serialize_time_ms = (serialize_end - serialize_start) * 1000
+        tx_profile_after = get_lossless_profile_snapshot()
+        tx_profile_delta = diff_lossless_profile(tx_profile_before, tx_profile_after)
         
         # [NETWORK_TIMING] Measure serialized data size
         total_tensor_bytes = sum(len(t.buffer) for t in serialized_tensors)
@@ -245,6 +265,22 @@ class _ServerInferenceSession:
                    f"metadata_size={metadata_bytes}B | "
                    f"total={total_send_bytes/1024:.2f}KB | "
                    f"serialize_time={serialize_time_ms:.2f}ms")
+        tx_raw_kb = tx_profile_delta.get("tx_raw_bytes", 0.0) / 1024.0
+        tx_wire_kb = tx_profile_delta.get("tx_wrapped_bytes", 0.0) / 1024.0
+        tx_ratio = (tx_wire_kb / tx_raw_kb) if tx_raw_kb > 0 else 1.0
+        tx_act_nnz_ratio = _tensor_nnz_ratio(input_tensors[0]) if input_tensors else 0.0
+        logger.info(
+            f"[LOSSLESS_PROFILE] side=client dir=tx "
+            f"stage={self.span.start}:{self.span.end} step_id={step_id} "
+            f"batch={inputs.shape[0] if inputs.ndim >= 1 else 1} "
+            f"serialize_base={tx_profile_delta.get('tx_base_serialize_ms', 0.0):.2f}ms "
+            f"wrap={tx_profile_delta.get('tx_wrap_ms', 0.0):.2f}ms "
+            f"compress={tx_profile_delta.get('tx_compress_ms', 0.0):.2f}ms "
+            f"raw={tx_raw_kb:.2f}KB wire={tx_wire_kb:.2f}KB ratio={tx_ratio:.4f} "
+            f"act_nnz_ratio={tx_act_nnz_ratio:.6f} "
+            f"serialize_calls={int(tx_profile_delta.get('tx_serialize_calls', 0.0))} "
+            f"compress_ok={int(tx_profile_delta.get('tx_compress_success_calls', 0.0))}"
+        )
         
         # [NETWORK_TIMING] Measure network round-trip time
         network_start = time.perf_counter()
@@ -263,10 +299,13 @@ class _ServerInferenceSession:
         network_rtt_ms = (network_end - network_start) * 1000
         
         # [NETWORK_TIMING] Measure deserialization time
+        rx_profile_before = get_lossless_profile_snapshot()
         deserialize_start = time.perf_counter()
         outputs = list(map(deserialize_torch_tensor, outputs_serialized.tensors))
         deserialize_end = time.perf_counter()
         deserialize_time_ms = (deserialize_end - deserialize_start) * 1000
+        rx_profile_after = get_lossless_profile_snapshot()
+        rx_profile_delta = diff_lossless_profile(rx_profile_before, rx_profile_after)
         
         # [NETWORK_TIMING] Measure received data size
         total_recv_bytes = sum(len(t.buffer) for t in outputs_serialized.tensors)
@@ -275,6 +314,22 @@ class _ServerInferenceSession:
                    f"recv_size={total_recv_bytes/1024:.2f}KB | "
                    f"network_rtt={network_rtt_ms:.2f}ms | "
                    f"deserialize_time={deserialize_time_ms:.2f}ms")
+        rx_in_kb = rx_profile_delta.get("rx_input_bytes", 0.0) / 1024.0
+        rx_out_kb = rx_profile_delta.get("rx_output_bytes", 0.0) / 1024.0
+        rx_ratio = (rx_in_kb / rx_out_kb) if rx_out_kb > 0 else 1.0
+        rx_act_nnz_ratio = _tensor_nnz_ratio(outputs[0]) if outputs else 0.0
+        logger.info(
+            f"[LOSSLESS_PROFILE] side=client dir=rx "
+            f"stage={self.span.start}:{self.span.end} step_id={step_id} "
+            f"batch={outputs[0].shape[0] if outputs else 0} "
+            f"deserialize_base={rx_profile_delta.get('rx_base_deserialize_ms', 0.0):.2f}ms "
+            f"unwrap={rx_profile_delta.get('rx_unwrap_ms', 0.0):.2f}ms "
+            f"decompress={rx_profile_delta.get('rx_decompress_ms', 0.0):.2f}ms "
+            f"wire={rx_in_kb:.2f}KB raw={rx_out_kb:.2f}KB ratio={rx_ratio:.4f} "
+            f"act_nnz_ratio={rx_act_nnz_ratio:.6f} "
+            f"deserialize_calls={int(rx_profile_delta.get('rx_deserialize_calls', 0.0))} "
+            f"decompress_calls={int(rx_profile_delta.get('rx_decompress_calls', 0.0))}"
+        )
         
         # [NETWORK_TIMING] Summary log
         total_time_ms = serialize_time_ms + network_rtt_ms + deserialize_time_ms
