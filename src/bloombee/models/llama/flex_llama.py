@@ -556,28 +556,71 @@ class FLEX_LlamaAttention(LlamaAttention):
             ((w_q, _), (w_k, _),  (w_v, _), (w_out, _), (input_layernorm, _), (rotary_emb_inv_freq, _)) = weight_read_buf.val
 
         
-        if i == 0:
+        # Route attention mode from actual KV-cache availability, not only from
+        # the first position id. In long-running decode sessions we can
+        # transiently observe position_ids starting at 0 while cache_read_buf
+        # already contains a non-empty prefix; forcing the prefill path in that
+        # case makes mha_llama produce [q_len, q_len] scores while the mask is
+        # already [q_len, prefix_len + q_len], leading to shape mismatches.
+        has_kv_cache = getattr(cache_read_buf, "val", None) is not None
+
+        if not has_kv_cache:
             # prefill
             # import pdb;pdb.set_trace()---------------------
             # log_mem(f"[FlexGen.Attn:{self.layer_id}] forward(start prefill) i={i} k={k}")
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-            h, new_k_cache, new_v_cache = self.compute.mha_llama(h, mask, w_q, w_k, w_v, w_out,
-                                       num_attention_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config, input_layernorm, rotary_emb_inv_freq, rotary_position_ids)
+            h, new_k_cache, new_v_cache = self.compute.mha_llama(
+                h,
+                mask,
+                w_q,
+                w_k,
+                w_v,
+                w_out,
+                num_attention_heads,
+                donate,
+                self.policy.compress_cache,
+                self.policy.comp_cache_config,
+                input_layernorm,
+                rotary_emb_inv_freq,
+                rotary_position_ids,
+            )
             cache_write_buf.store((new_k_cache, new_v_cache))
             # log_mem(f"[FlexGen.Attn:{self.layer_id}] forward(end prefill) i={i} k={k}")
         else:
             # decoding
             # log_mem(f"[FlexGen.Attn:{self.layer_id}] forward(start decode) i={i} k={k}")
+            if torch.is_tensor(i):
+                start_pos = int(i.item())
+            else:
+                start_pos = int(i)
+            if start_pos == 0:
+                logger.debug(
+                    "[FLEX_LLAMA] decode path selected from cache presence despite start_pos=0 "
+                    "(layer=%s, batch=%s)",
+                    self.layer_id,
+                    k,
+                )
+
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             k_cache, v_cache = cache_read_buf.pop()
             h, new_k_cache, new_v_cache = self.compute.mha_gen_llama(
-                h, mask, w_q,
-                w_k, w_v, w_out, num_attention_heads,
-                k_cache, v_cache, donate, self.policy.attn_sparsity,
-                self.policy.compress_cache, self.policy.comp_cache_config,
+                h,
+                mask,
+                w_q,
+                w_k,
+                w_v,
+                w_out,
+                num_attention_heads,
+                k_cache,
+                v_cache,
+                donate,
+                self.policy.attn_sparsity,
+                self.policy.compress_cache,
+                self.policy.comp_cache_config,
                 input_layernorm,
                 rotary_emb_inv_freq,
-                rotary_position_ids)
+                rotary_position_ids,
+            )
             cache_write_buf.store((new_k_cache, new_v_cache))
             # log_mem(f"[FlexGen.Attn:{self.layer_id}] forward(end decode) i={i} k={k}")
         hidden.val = h

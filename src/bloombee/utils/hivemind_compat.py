@@ -34,7 +34,15 @@ def _safe_cancel_task_if_running(task: asyncio.Task | None) -> None:
 
 
 def _patch_hivemind_cleanup() -> None:
-    if hivemind_asyncio.cancel_task_if_running is _safe_cancel_task_if_running:
+    current_asyncio_cancel = getattr(hivemind_asyncio, "cancel_task_if_running", None)
+    current_control_cancel = getattr(hivemind_p2p_control, "cancel_task_if_running", None)
+    current_daemon_cancel = getattr(hivemind_p2p_daemon, "cancel_task_if_running", None)
+
+    if (
+        current_asyncio_cancel is _safe_cancel_task_if_running
+        and current_control_cancel is _safe_cancel_task_if_running
+        and current_daemon_cancel is _safe_cancel_task_if_running
+    ):
         return
 
     hivemind_asyncio.cancel_task_if_running = _safe_cancel_task_if_running
