@@ -36,7 +36,7 @@ def main():
     parser.add_argument(
         "--early_terminate_steps",
         type=int,
-        default=256,
+        default=0,
         help="Early terminate after this many generated tokens; set <=0 to disable",
     )
     parser.add_argument(
