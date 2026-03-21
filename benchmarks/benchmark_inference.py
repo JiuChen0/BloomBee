@@ -181,6 +181,7 @@ def benchmark_inference(process_idx, args, result_pipe):
     
     step_times = []
     step_latencies = []  # Client-observed end-to-end per-step latencies
+    e2e_step_traces = []
     
     start_time = perf_counter()
     
@@ -205,6 +206,8 @@ def benchmark_inference(process_idx, args, result_pipe):
             step_end_time = perf_counter()
             step_latency_ms = (step_end_time - step_start_time) * 1000
             step_latencies.append(step_latency_ms)
+            if isinstance(getattr(sess, "last_step_trace", None), dict):
+                e2e_step_traces.append(dict(sess.last_step_trace))
             
             # Enhanced logging for cross-GPU analysis
             logger.info(f"[STEP_LATENCY] Process={process_idx} | Step={step} | "
@@ -258,6 +261,7 @@ def benchmark_inference(process_idx, args, result_pipe):
             p99_latency = np.percentile(warmup_latencies, 99)
             min_latency = np.min(warmup_latencies)
             max_latency = np.max(warmup_latencies)
+            warmup_e2e_traces = e2e_step_traces[args.warmup_steps:]
             
             logger.info(f"\n{'='*80}")
             logger.info(f"[PERFORMANCE_SUMMARY] Process={process_idx}")
@@ -271,9 +275,30 @@ def benchmark_inference(process_idx, args, result_pipe):
             logger.info(f"  P99:    {p99_latency:.2f}ms")
             logger.info(f"  Min:    {min_latency:.2f}ms")
             logger.info(f"  Max:    {max_latency:.2f}ms")
+            if warmup_e2e_traces:
+                def trace_mean(key: str) -> float:
+                    values = [float(trace.get(key, 0.0)) for trace in warmup_e2e_traces]
+                    return float(np.mean(values)) if values else 0.0
+
+                logger.info(f"\n[E2E_CRITICAL_PATH_SUMMARY]")
+                logger.info(f"  MeanClientTotal:            {trace_mean('client_total_ms'):.2f}ms")
+                logger.info(f"  MeanServerCriticalPath:     {trace_mean('server_critical_path_total_ms'):.2f}ms")
+                logger.info(f"  MeanServerCompute:          {trace_mean('server_compute_total_ms'):.2f}ms")
+                logger.info(f"  MeanSenderGPUtoCPU:         {trace_mean('server_sender_gpu2cpu_total_ms'):.2f}ms")
+                logger.info(f"  MeanSenderCPUtoNIC:         {trace_mean('server_sender_cpu2nic_total_ms'):.2f}ms")
+                logger.info(f"  MeanLinkNICtoNIC:           {trace_mean('server_link_nic2nic_total_ms'):.2f}ms")
+                logger.info(f"  MeanReceiverNICtoCPU:       {trace_mean('server_receiver_nic2cpu_total_ms'):.2f}ms")
+                logger.info(f"  MeanReceiverCPUtoGPU:       {trace_mean('server_receiver_cpu2gpu_total_ms'):.2f}ms")
+                logger.info(f"  MeanQueueWait:              {trace_mean('server_queue_wait_total_ms'):.2f}ms")
+                logger.info(f"  MeanClientResidual:         {trace_mean('client_residual_ms'):.2f}ms")
+                logger.info(f"  MeanComputeShare:           {trace_mean('compute_share_pct'):.2f}%")
+                logger.info(f"  MeanNonComputeShare:        {trace_mean('noncompute_share_pct'):.2f}%")
+                logger.info(f"  TraceSource:                {warmup_e2e_traces[-1].get('server_trace_source', 'unknown')}")
+                logger.info(f"  Coverage:                   {len(warmup_e2e_traces)}/{len(step_latencies[args.warmup_steps:])} steps")
             logger.info(f"\n[CLIENT_METRIC_NOTE]")
             logger.info("  The latency above is client-observed end-to-end step latency.")
             logger.info("  Use server [PAPER_TIMING_TABLE] / [PIPELINE_GPU2GPU] for per-stage transport breakdown.")
+            logger.info("  Use [E2E_CRITICAL_PATH_SUMMARY] for client-observed end-to-end critical-path decomposition.")
             
             logger.info(f"{'='*80}\n")
     

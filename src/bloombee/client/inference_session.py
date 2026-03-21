@@ -4,7 +4,7 @@ import asyncio
 import itertools
 import time
 import uuid
-from typing import AsyncIterator, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import torch
 from hivemind.moe.client.remote_expert_worker import RemoteExpertWorker
@@ -70,6 +70,7 @@ class _ServerInferenceSession:
         self._position = 0
         self.history = None  # Used in case of server failures to regenerate attention caches on new servers
         self.next_session = None
+        self.last_step_trace: Optional[Dict[str, Any]] = None
 
     @classmethod
     async def create(
@@ -291,6 +292,7 @@ class _ServerInferenceSession:
 
             network_end = time.perf_counter()
             network_rtt_ms = (network_end - network_start) * 1000
+            server_trace = self._parse_step_trace_metadata(outputs_serialized.metadata)
 
             # [NETWORK_TIMING] Measure deserialization time
             deserialize_start = time.perf_counter()
@@ -309,6 +311,20 @@ class _ServerInferenceSession:
         
         # [NETWORK_TIMING] Summary log
         total_time_ms = serialize_time_ms + network_rtt_ms + deserialize_time_ms
+        self.last_step_trace = {
+            "step_id": step_id,
+            "session_id": self.session_id,
+            "peer_id": str(self.span.peer_id),
+            "blocks": f"{self.span.start}:{self.span.end}",
+            "client_serialize_ms": serialize_time_ms,
+            "client_network_rtt_ms": network_rtt_ms,
+            "client_deserialize_ms": deserialize_time_ms,
+            "client_total_rpc_ms": total_time_ms,
+            "client_send_bytes": total_send_bytes,
+            "client_recv_bytes": total_recv_bytes,
+            "transport_phase": transport_phase,
+            "server_trace": server_trace,
+        }
         if client_inference_logs_enabled:
             logger.info(f"[NETWORK_TX] SUMMARY | step_id={step_id} | "
                        f"send={total_send_bytes/1024:.2f}KB | recv={total_recv_bytes/1024:.2f}KB | "
@@ -336,6 +352,61 @@ class _ServerInferenceSession:
         if client_inference_logs_enabled:
             logger.info(f"server inference session self._position: {self._position}")
         return outputs
+
+    @staticmethod
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return default
+
+    @classmethod
+    def _parse_step_trace_metadata(cls, response_metadata: bytes) -> Optional[Dict[str, Any]]:
+        if not response_metadata:
+            return None
+        try:
+            trace = MSGPackSerializer.loads(response_metadata)
+        except Exception:
+            return None
+        if not isinstance(trace, dict):
+            return None
+        if trace.get("trace_kind") != "rpc_inference_step_trace":
+            return None
+
+        normalized = dict(trace)
+        float_fields = (
+            "local_compute_ms",
+            "local_queue_wait_ms",
+            "local_step_total_ms",
+            "local_critical_path_exposed_ms",
+            "local_sender_gpu2cpu_exposed_ms",
+            "local_sender_cpu2nic_exposed_ms",
+            "local_link_nic2nic_exposed_ms",
+            "local_receiver_nic2cpu_exposed_ms",
+            "local_receiver_cpu2gpu_exposed_ms",
+            "local_sender_post_compute_gap_ms",
+            "local_receiver_dispatch_ms",
+            "server_e2e_compute_total_ms",
+            "server_e2e_queue_wait_total_ms",
+            "server_e2e_sender_gpu2cpu_total_ms",
+            "server_e2e_sender_cpu2nic_total_ms",
+            "server_e2e_link_nic2nic_total_ms",
+            "server_e2e_receiver_nic2cpu_total_ms",
+            "server_e2e_receiver_cpu2gpu_total_ms",
+            "server_e2e_sender_post_compute_gap_total_ms",
+            "server_e2e_receiver_dispatch_total_ms",
+            "server_e2e_transport_total_ms",
+            "server_e2e_noncompute_total_ms",
+            "server_e2e_exposed_total_ms",
+            "server_e2e_critical_path_exposed_total_ms",
+            "server_e2e_compute_share_pct",
+            "server_e2e_noncompute_share_pct",
+        )
+        for key in float_fields:
+            normalized[key] = cls._to_float(normalized.get(key), 0.0)
+        normalized["is_last_stage"] = int(bool(normalized.get("is_last_stage", 0)))
+        normalized["server_trace_ready"] = int(bool(normalized.get("server_trace_ready", 0)))
+        return normalized
 
     def _collect_next_servers(self) -> List[Tuple[str, str, int, int]]:
         next_servers = []
@@ -399,6 +470,7 @@ class InferenceSession:
         self.keep_indices = None
         self.prefill_length = 0
         self._step_count = 0  # Track step count for logging
+        self.last_step_trace: Optional[Dict[str, Any]] = None
         
         # [MBPIPE] Log micro-batch pipeline configuration at client session creation
         mbpipe_log_config(logger, context="InferenceSession.__init__")
@@ -453,6 +525,133 @@ class InferenceSession:
     def __enter__(self) -> "InferenceSession":
         assert not self._closed and not self._server_sessions
         return self
+
+    @staticmethod
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return default
+
+    def _summarize_e2e_trace(
+        self,
+        *,
+        step_id: str,
+        stage_traces: List[Dict[str, Any]],
+        client_total_ms: float,
+        batch_size: int,
+        token_increment: int,
+    ) -> Dict[str, Any]:
+        normalized_stage_traces = [trace for trace in stage_traces if isinstance(trace, dict)]
+        final_server_trace: Optional[Dict[str, Any]] = None
+        for trace in reversed(normalized_stage_traces):
+            server_trace = trace.get("server_trace")
+            if isinstance(server_trace, dict) and int(server_trace.get("is_last_stage", 0)):
+                final_server_trace = server_trace
+                break
+
+        if (
+            final_server_trace is not None
+            and str(final_server_trace.get("server_trace_source", "local_stage_only")) == "local_stage_only"
+            and len(normalized_stage_traces) > 1
+        ):
+            final_server_trace = None
+
+        if final_server_trace is not None:
+            server_trace_source = str(final_server_trace.get("server_trace_source", "final_stage_cumulative"))
+            compute_total_ms = self._to_float(final_server_trace.get("server_e2e_compute_total_ms"), 0.0)
+            queue_wait_total_ms = self._to_float(final_server_trace.get("server_e2e_queue_wait_total_ms"), 0.0)
+            sender_gpu2cpu_total_ms = self._to_float(final_server_trace.get("server_e2e_sender_gpu2cpu_total_ms"), 0.0)
+            sender_cpu2nic_total_ms = self._to_float(final_server_trace.get("server_e2e_sender_cpu2nic_total_ms"), 0.0)
+            link_nic2nic_total_ms = self._to_float(final_server_trace.get("server_e2e_link_nic2nic_total_ms"), 0.0)
+            receiver_nic2cpu_total_ms = self._to_float(final_server_trace.get("server_e2e_receiver_nic2cpu_total_ms"), 0.0)
+            receiver_cpu2gpu_total_ms = self._to_float(final_server_trace.get("server_e2e_receiver_cpu2gpu_total_ms"), 0.0)
+            sender_post_compute_gap_total_ms = self._to_float(
+                final_server_trace.get("server_e2e_sender_post_compute_gap_total_ms"),
+                0.0,
+            )
+            receiver_dispatch_total_ms = self._to_float(
+                final_server_trace.get("server_e2e_receiver_dispatch_total_ms"),
+                0.0,
+            )
+            server_critical_path_total_ms = self._to_float(
+                final_server_trace.get("server_e2e_critical_path_exposed_total_ms"),
+                0.0,
+            )
+        else:
+            server_trace_source = "summed_stage_locals"
+            compute_total_ms = 0.0
+            queue_wait_total_ms = 0.0
+            sender_gpu2cpu_total_ms = 0.0
+            sender_cpu2nic_total_ms = 0.0
+            link_nic2nic_total_ms = 0.0
+            receiver_nic2cpu_total_ms = 0.0
+            receiver_cpu2gpu_total_ms = 0.0
+            sender_post_compute_gap_total_ms = 0.0
+            receiver_dispatch_total_ms = 0.0
+            server_critical_path_total_ms = 0.0
+            for trace in normalized_stage_traces:
+                server_trace = trace.get("server_trace")
+                if not isinstance(server_trace, dict):
+                    continue
+                compute_total_ms += self._to_float(server_trace.get("local_compute_ms"), 0.0)
+                queue_wait_total_ms += self._to_float(server_trace.get("local_queue_wait_ms"), 0.0)
+                sender_gpu2cpu_total_ms += self._to_float(server_trace.get("local_sender_gpu2cpu_exposed_ms"), 0.0)
+                sender_cpu2nic_total_ms += self._to_float(server_trace.get("local_sender_cpu2nic_exposed_ms"), 0.0)
+                link_nic2nic_total_ms += self._to_float(server_trace.get("local_link_nic2nic_exposed_ms"), 0.0)
+                receiver_nic2cpu_total_ms += self._to_float(server_trace.get("local_receiver_nic2cpu_exposed_ms"), 0.0)
+                receiver_cpu2gpu_total_ms += self._to_float(server_trace.get("local_receiver_cpu2gpu_exposed_ms"), 0.0)
+                sender_post_compute_gap_total_ms += self._to_float(server_trace.get("local_sender_post_compute_gap_ms"), 0.0)
+                receiver_dispatch_total_ms += self._to_float(server_trace.get("local_receiver_dispatch_ms"), 0.0)
+                server_critical_path_total_ms += self._to_float(server_trace.get("local_critical_path_exposed_ms"), 0.0)
+
+        transport_total_ms = (
+            sender_gpu2cpu_total_ms
+            + sender_cpu2nic_total_ms
+            + link_nic2nic_total_ms
+            + receiver_nic2cpu_total_ms
+            + receiver_cpu2gpu_total_ms
+        )
+        noncompute_total_ms = (
+            transport_total_ms
+            + sender_post_compute_gap_total_ms
+            + receiver_dispatch_total_ms
+            + queue_wait_total_ms
+        )
+        client_residual_ms = max(0.0, client_total_ms - (compute_total_ms + noncompute_total_ms))
+        compute_share_pct = (
+            (compute_total_ms / client_total_ms) * 100.0 if client_total_ms > 0.0 else 0.0
+        )
+        noncompute_share_pct = (
+            ((noncompute_total_ms + client_residual_ms) / client_total_ms) * 100.0
+            if client_total_ms > 0.0
+            else 0.0
+        )
+
+        return {
+            "step_id": step_id,
+            "client_total_ms": client_total_ms,
+            "batch_size": int(batch_size),
+            "token_increment": int(token_increment),
+            "num_stage_traces": len(normalized_stage_traces),
+            "server_trace_source": server_trace_source,
+            "server_compute_total_ms": compute_total_ms,
+            "server_queue_wait_total_ms": queue_wait_total_ms,
+            "server_sender_gpu2cpu_total_ms": sender_gpu2cpu_total_ms,
+            "server_sender_cpu2nic_total_ms": sender_cpu2nic_total_ms,
+            "server_link_nic2nic_total_ms": link_nic2nic_total_ms,
+            "server_receiver_nic2cpu_total_ms": receiver_nic2cpu_total_ms,
+            "server_receiver_cpu2gpu_total_ms": receiver_cpu2gpu_total_ms,
+            "server_sender_post_compute_gap_total_ms": sender_post_compute_gap_total_ms,
+            "server_receiver_dispatch_total_ms": receiver_dispatch_total_ms,
+            "server_transport_total_ms": transport_total_ms,
+            "server_noncompute_total_ms": noncompute_total_ms,
+            "server_critical_path_total_ms": server_critical_path_total_ms,
+            "client_residual_ms": client_residual_ms,
+            "compute_share_pct": compute_share_pct,
+            "noncompute_share_pct": noncompute_share_pct,
+            "stage_traces": normalized_stage_traces,
+        }
 
     def step(   # 执行一次推理步骤，处理输入数据和相应的提示与假设 ID，同时在可能出现错误的情况下进行重试。
         self,
@@ -511,6 +710,7 @@ class InferenceSession:
 
         server_idx = 0
         block_idx = 0
+        stage_traces: List[Dict[str, Any]] = []
         inference_step_start = time.perf_counter()
         batch_size = inputs.shape[0] if inputs.ndim >= 1 else 1
         if prefill_length is not None:
@@ -559,6 +759,8 @@ class InferenceSession:
                         self.keep_indices = keep_indices
                     
                     need_pruning = False  # only need to prune on the first server
+                    if isinstance(server_session.last_step_trace, dict):
+                        stage_traces.append(dict(server_session.last_step_trace))
                     
                     # 🔍 CLIENT DEBUG: Log server span processing end
                     span_end_time = time.perf_counter()
@@ -628,9 +830,29 @@ class InferenceSession:
         # 🔍 CLIENT DEBUG: Log inference step end
         inference_step_end = time.perf_counter()
         inference_step_duration = (inference_step_end - inference_step_start) * 1000  # ms
+        self.last_step_trace = self._summarize_e2e_trace(
+            step_id=step_id,
+            stage_traces=stage_traces,
+            client_total_ms=inference_step_duration,
+            batch_size=batch_size,
+            token_increment=n_input_tokens,
+        )
         if is_log_channel_enabled("client_inference_logs"):
             logger.info(
                 f"[CLIENT_INFERENCE_END] Position={self._position} | Duration={inference_step_duration:.2f}ms | Servers={server_idx}"
+            )
+            logger.info(
+                f"[E2E_STEP_TRACE] step_id={step_id} "
+                f"client_total={self.last_step_trace['client_total_ms']:.2f}ms "
+                f"server_compute={self.last_step_trace['server_compute_total_ms']:.2f}ms "
+                f"server_sender_gpu2cpu={self.last_step_trace['server_sender_gpu2cpu_total_ms']:.2f}ms "
+                f"server_sender_cpu2nic={self.last_step_trace['server_sender_cpu2nic_total_ms']:.2f}ms "
+                f"server_link_nic2nic={self.last_step_trace['server_link_nic2nic_total_ms']:.2f}ms "
+                f"server_receiver_nic2cpu={self.last_step_trace['server_receiver_nic2cpu_total_ms']:.2f}ms "
+                f"server_receiver_cpu2gpu={self.last_step_trace['server_receiver_cpu2gpu_total_ms']:.2f}ms "
+                f"server_queue_wait={self.last_step_trace['server_queue_wait_total_ms']:.2f}ms "
+                f"client_residual={self.last_step_trace['client_residual_ms']:.2f}ms "
+                f"source={self.last_step_trace['server_trace_source']}"
             )
             logger.info("=" * 80)
         

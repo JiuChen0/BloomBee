@@ -502,6 +502,13 @@ class TransformerConnectionHandler(ConnectionHandler):
         except Exception:
             return default
 
+    @staticmethod
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return default
+
     def _get_clock_sync_estimate(self, peer_id: str) -> Optional[Dict[str, int]]:
         state = self._clock_sync_state.get(peer_id)
         if not state:
@@ -701,6 +708,166 @@ class TransformerConnectionHandler(ConnectionHandler):
         if not indices:
             return "unknown"
         return f"{min(indices)}:{max(indices) + 1}"
+
+    def _build_inference_response_metadata(
+        self,
+        requested_uids: Sequence[str],
+        step_metadata: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if not isinstance(step_metadata, dict):
+            return {}
+
+        blocks_desc = self._uids_to_block_span_label(requested_uids)
+        local_compute_ms = self._to_float(step_metadata.get("_compute_ms"), 0.0)
+        local_queue_wait_ms = self._to_float(step_metadata.get("_queue_wait_ms"), 0.0)
+        local_step_total_ms = self._to_float(step_metadata.get("_step_total_ms"), 0.0)
+        local_critical_path_exposed_ms = self._to_float(
+            step_metadata.get("_critical_path_exposed_ms"),
+            local_step_total_ms,
+        )
+        local_sender_gpu2cpu_exposed_ms = self._to_float(
+            step_metadata.get("_sender_gpu2cpu_exposed_ms", step_metadata.get("_s2s_sender_gpu2cpu_ms")),
+            0.0,
+        )
+        local_sender_cpu2nic_exposed_ms = self._to_float(
+            step_metadata.get("_sender_cpu2nic_exposed_ms", step_metadata.get("_s2s_sender_cpu2nic_ms")),
+            0.0,
+        )
+        local_link_nic2nic_exposed_ms = self._to_float(
+            step_metadata.get("_nic2nic_exposed_ms", step_metadata.get("_s2s_wire_ms")),
+            0.0,
+        )
+        local_receiver_nic2cpu_exposed_ms = self._to_float(
+            step_metadata.get("_receiver_nic2cpu_exposed_ms", step_metadata.get("_t_nic2cpu_ms")),
+            0.0,
+        )
+        local_receiver_cpu2gpu_exposed_ms = self._to_float(
+            step_metadata.get("_receiver_cpu2gpu_exposed_ms", step_metadata.get("_t_cpu2gpu_ms")),
+            0.0,
+        )
+        local_sender_post_compute_gap_ms = self._to_float(
+            step_metadata.get("_sender_post_compute_exposed_ms"),
+            0.0,
+        )
+        local_receiver_dispatch_ms = self._to_float(
+            step_metadata.get("_receiver_dispatch_exposed_ms"),
+            0.0,
+        )
+
+        incoming_compute_total_ms = self._to_float(step_metadata.get("_e2e_compute_total_ms"), 0.0)
+        incoming_queue_wait_total_ms = self._to_float(step_metadata.get("_e2e_queue_wait_total_ms"), 0.0)
+        incoming_sender_gpu2cpu_total_ms = self._to_float(step_metadata.get("_e2e_sender_gpu2cpu_total_ms"), 0.0)
+        incoming_sender_cpu2nic_total_ms = self._to_float(step_metadata.get("_e2e_sender_cpu2nic_total_ms"), 0.0)
+        incoming_link_nic2nic_total_ms = self._to_float(step_metadata.get("_e2e_link_nic2nic_total_ms"), 0.0)
+        incoming_receiver_nic2cpu_total_ms = self._to_float(
+            step_metadata.get("_e2e_receiver_nic2cpu_total_ms"),
+            0.0,
+        )
+        incoming_receiver_cpu2gpu_total_ms = self._to_float(
+            step_metadata.get("_e2e_receiver_cpu2gpu_total_ms"),
+            0.0,
+        )
+        incoming_sender_post_compute_gap_total_ms = self._to_float(
+            step_metadata.get("_e2e_sender_post_compute_gap_total_ms"),
+            0.0,
+        )
+        incoming_receiver_dispatch_total_ms = self._to_float(
+            step_metadata.get("_e2e_receiver_dispatch_total_ms"),
+            0.0,
+        )
+        incoming_critical_path_total_ms = self._to_float(
+            step_metadata.get("_e2e_critical_path_exposed_total_ms"),
+            0.0,
+        )
+
+        server_e2e_compute_total_ms = incoming_compute_total_ms + local_compute_ms
+        server_e2e_queue_wait_total_ms = incoming_queue_wait_total_ms + local_queue_wait_ms
+        server_e2e_sender_gpu2cpu_total_ms = incoming_sender_gpu2cpu_total_ms
+        server_e2e_sender_cpu2nic_total_ms = incoming_sender_cpu2nic_total_ms
+        server_e2e_link_nic2nic_total_ms = incoming_link_nic2nic_total_ms
+        server_e2e_receiver_nic2cpu_total_ms = incoming_receiver_nic2cpu_total_ms + local_receiver_nic2cpu_exposed_ms
+        server_e2e_receiver_cpu2gpu_total_ms = incoming_receiver_cpu2gpu_total_ms + local_receiver_cpu2gpu_exposed_ms
+        server_e2e_sender_post_compute_gap_total_ms = (
+            incoming_sender_post_compute_gap_total_ms + local_sender_post_compute_gap_ms
+        )
+        server_e2e_receiver_dispatch_total_ms = incoming_receiver_dispatch_total_ms + local_receiver_dispatch_ms
+        server_e2e_critical_path_exposed_total_ms = incoming_critical_path_total_ms + local_critical_path_exposed_ms
+        server_e2e_transport_total_ms = (
+            server_e2e_sender_gpu2cpu_total_ms
+            + server_e2e_sender_cpu2nic_total_ms
+            + server_e2e_link_nic2nic_total_ms
+            + server_e2e_receiver_nic2cpu_total_ms
+            + server_e2e_receiver_cpu2gpu_total_ms
+        )
+        server_e2e_noncompute_total_ms = (
+            server_e2e_transport_total_ms
+            + server_e2e_sender_post_compute_gap_total_ms
+            + server_e2e_receiver_dispatch_total_ms
+            + server_e2e_queue_wait_total_ms
+        )
+        server_e2e_exposed_total_ms = server_e2e_compute_total_ms + server_e2e_noncompute_total_ms
+        has_upstream_cumulative = any(
+            value > 0.0
+            for value in (
+                incoming_compute_total_ms,
+                incoming_queue_wait_total_ms,
+                incoming_sender_gpu2cpu_total_ms,
+                incoming_sender_cpu2nic_total_ms,
+                incoming_link_nic2nic_total_ms,
+                incoming_receiver_nic2cpu_total_ms,
+                incoming_receiver_cpu2gpu_total_ms,
+                incoming_sender_post_compute_gap_total_ms,
+                incoming_receiver_dispatch_total_ms,
+                incoming_critical_path_total_ms,
+            )
+        )
+        is_last_stage = int(not bool(step_metadata.get("next_servers")))
+        compute_share_pct = (
+            (server_e2e_compute_total_ms / server_e2e_exposed_total_ms) * 100.0
+            if server_e2e_exposed_total_ms > 0.0
+            else 0.0
+        )
+        noncompute_share_pct = (
+            (server_e2e_noncompute_total_ms / server_e2e_exposed_total_ms) * 100.0
+            if server_e2e_exposed_total_ms > 0.0
+            else 0.0
+        )
+
+        return {
+            "trace_kind": "rpc_inference_step_trace",
+            "session_id": str(step_metadata.get("session_id", "")),
+            "step_id": str(step_metadata.get("step_id", "unknown")),
+            "blocks": blocks_desc,
+            "is_last_stage": is_last_stage,
+            "server_trace_source": "cumulative_upstream_metadata" if has_upstream_cumulative else "local_stage_only",
+            "server_trace_ready": 1,
+            "local_compute_ms": local_compute_ms,
+            "local_queue_wait_ms": local_queue_wait_ms,
+            "local_step_total_ms": local_step_total_ms,
+            "local_critical_path_exposed_ms": local_critical_path_exposed_ms,
+            "local_sender_gpu2cpu_exposed_ms": local_sender_gpu2cpu_exposed_ms,
+            "local_sender_cpu2nic_exposed_ms": local_sender_cpu2nic_exposed_ms,
+            "local_link_nic2nic_exposed_ms": local_link_nic2nic_exposed_ms,
+            "local_receiver_nic2cpu_exposed_ms": local_receiver_nic2cpu_exposed_ms,
+            "local_receiver_cpu2gpu_exposed_ms": local_receiver_cpu2gpu_exposed_ms,
+            "local_sender_post_compute_gap_ms": local_sender_post_compute_gap_ms,
+            "local_receiver_dispatch_ms": local_receiver_dispatch_ms,
+            "server_e2e_compute_total_ms": server_e2e_compute_total_ms,
+            "server_e2e_queue_wait_total_ms": server_e2e_queue_wait_total_ms,
+            "server_e2e_sender_gpu2cpu_total_ms": server_e2e_sender_gpu2cpu_total_ms,
+            "server_e2e_sender_cpu2nic_total_ms": server_e2e_sender_cpu2nic_total_ms,
+            "server_e2e_link_nic2nic_total_ms": server_e2e_link_nic2nic_total_ms,
+            "server_e2e_receiver_nic2cpu_total_ms": server_e2e_receiver_nic2cpu_total_ms,
+            "server_e2e_receiver_cpu2gpu_total_ms": server_e2e_receiver_cpu2gpu_total_ms,
+            "server_e2e_sender_post_compute_gap_total_ms": server_e2e_sender_post_compute_gap_total_ms,
+            "server_e2e_receiver_dispatch_total_ms": server_e2e_receiver_dispatch_total_ms,
+            "server_e2e_transport_total_ms": server_e2e_transport_total_ms,
+            "server_e2e_noncompute_total_ms": server_e2e_noncompute_total_ms,
+            "server_e2e_exposed_total_ms": server_e2e_exposed_total_ms,
+            "server_e2e_critical_path_exposed_total_ms": server_e2e_critical_path_exposed_total_ms,
+            "server_e2e_compute_share_pct": compute_share_pct,
+            "server_e2e_noncompute_share_pct": noncompute_share_pct,
+        }
 
     def _record_s2s_network_sample(
         self,
@@ -1202,11 +1369,15 @@ class TransformerConnectionHandler(ConnectionHandler):
                                 )
                                 _track_background_task(task)
                         start_ExpertResponse_time=perf_counter() ###
+                        response_metadata = self._build_inference_response_metadata(requested_uids, step_metadata)
                         push_schedule_ms = (start_ExpertResponse_time - can_push_case_time) * 1000.0
                         push_time.append(push_schedule_ms) ###
                         # print('current step push outputs task prepare time ', start_ExpertResponse_time-can_push_case_time) ###
                         # print_time_now('')
-                        yield runtime_pb2.ExpertResponse(tensors=output_tensors)
+                        yield runtime_pb2.ExpertResponse(
+                            tensors=output_tensors,
+                            metadata=MSGPackSerializer.dumps(response_metadata) if response_metadata else b"",
+                        )
                         end_ExpertResponse_time=perf_counter() ###
                         response_emit_ms = (end_ExpertResponse_time - start_ExpertResponse_time) * 1000.0
                         handler_step_total_ms = (end_ExpertResponse_time - handler_step_start) * 1000.0
@@ -2009,6 +2180,18 @@ class TransformerConnectionHandler(ConnectionHandler):
             metadata["_s2s_sender_cpu2nic_ms"] = float(metadata.get("s2s_sender_cpu2nic_ms", 0.0))
             metadata["_s2s_wire_ms"] = float(wire_ms if wire_ms >= 0.0 else raw_transfer_ms if raw_transfer_ms >= 0.0 else 0.0)
             metadata["_s2s_payload_bytes"] = int(payload_bytes)
+            metadata["_e2e_sender_gpu2cpu_total_ms"] = (
+                self._to_float(metadata.get("_e2e_sender_gpu2cpu_total_ms"), 0.0)
+                + self._to_float(metadata.get("_s2s_sender_gpu2cpu_ms"), 0.0)
+            )
+            metadata["_e2e_sender_cpu2nic_total_ms"] = (
+                self._to_float(metadata.get("_e2e_sender_cpu2nic_total_ms"), 0.0)
+                + self._to_float(metadata.get("_s2s_sender_cpu2nic_ms"), 0.0)
+            )
+            metadata["_e2e_link_nic2nic_total_ms"] = (
+                self._to_float(metadata.get("_e2e_link_nic2nic_total_ms"), 0.0)
+                + self._to_float(metadata.get("_s2s_wire_ms"), 0.0)
+            )
             request.metadata = MSGPackSerializer.dumps(metadata)
         self._log_request("rpc_push", requested_uids, context, debug=f"session_id={session_id}")
         self._put_into_session_queue(session_id, request)
@@ -2160,6 +2343,18 @@ class TransformerConnectionHandler(ConnectionHandler):
         metadata["_s2s_sender_cpu2nic_ms"] = float(metadata.get("s2s_sender_cpu2nic_ms", sender_prep_ms if sender_prep_ms >= 0.0 else 0.0))
         metadata["_s2s_wire_ms"] = float(wire_ms if wire_ms >= 0.0 else raw_transfer_ms if raw_transfer_ms >= 0.0 else 0.0)
         metadata["_s2s_payload_bytes"] = int(payload_bytes)
+        metadata["_e2e_sender_gpu2cpu_total_ms"] = (
+            self._to_float(metadata.get("_e2e_sender_gpu2cpu_total_ms"), 0.0)
+            + self._to_float(metadata.get("_s2s_sender_gpu2cpu_ms"), 0.0)
+        )
+        metadata["_e2e_sender_cpu2nic_total_ms"] = (
+            self._to_float(metadata.get("_e2e_sender_cpu2nic_total_ms"), 0.0)
+            + self._to_float(metadata.get("_s2s_sender_cpu2nic_ms"), 0.0)
+        )
+        metadata["_e2e_link_nic2nic_total_ms"] = (
+            self._to_float(metadata.get("_e2e_link_nic2nic_total_ms"), 0.0)
+            + self._to_float(metadata.get("_s2s_wire_ms"), 0.0)
+        )
         
         # Initialize tracking for this (session, step) if not exists
         if mb_key not in self._mb_queues:
@@ -2385,6 +2580,34 @@ class TransformerConnectionHandler(ConnectionHandler):
             next_metadata["receiver_blocks"] = f"{next_start}:{next_end}"
             next_metadata["s2s_channel"] = "full_batch"
             next_metadata["s2s_sender_enqueue_us"] = int(self._now_us())
+            next_metadata["_e2e_compute_total_ms"] = (
+                self._to_float(metadata.get("_e2e_compute_total_ms"), 0.0)
+                + self._to_float(metadata.get("_compute_ms"), 0.0)
+            )
+            next_metadata["_e2e_queue_wait_total_ms"] = (
+                self._to_float(metadata.get("_e2e_queue_wait_total_ms"), 0.0)
+                + self._to_float(metadata.get("_queue_wait_ms"), 0.0)
+            )
+            next_metadata["_e2e_receiver_nic2cpu_total_ms"] = (
+                self._to_float(metadata.get("_e2e_receiver_nic2cpu_total_ms"), 0.0)
+                + self._to_float(metadata.get("_receiver_nic2cpu_exposed_ms", metadata.get("_t_nic2cpu_ms")), 0.0)
+            )
+            next_metadata["_e2e_receiver_cpu2gpu_total_ms"] = (
+                self._to_float(metadata.get("_e2e_receiver_cpu2gpu_total_ms"), 0.0)
+                + self._to_float(metadata.get("_receiver_cpu2gpu_exposed_ms", metadata.get("_t_cpu2gpu_ms")), 0.0)
+            )
+            next_metadata["_e2e_receiver_dispatch_total_ms"] = (
+                self._to_float(metadata.get("_e2e_receiver_dispatch_total_ms"), 0.0)
+                + self._to_float(metadata.get("_receiver_dispatch_exposed_ms"), 0.0)
+            )
+            next_metadata["_e2e_sender_post_compute_gap_total_ms"] = (
+                self._to_float(metadata.get("_e2e_sender_post_compute_gap_total_ms"), 0.0)
+                + self._to_float(metadata.get("_sender_post_compute_exposed_ms"), 0.0)
+            )
+            next_metadata["_e2e_critical_path_exposed_total_ms"] = (
+                self._to_float(metadata.get("_e2e_critical_path_exposed_total_ms"), 0.0)
+                + self._to_float(metadata.get("_critical_path_exposed_ms", metadata.get("_step_total_ms")), 0.0)
+            )
             clock_sync_estimate = self._get_clock_sync_estimate(next_peer_id_str)
             if clock_sync_estimate is not None:
                 next_metadata["sender_to_receiver_clock_offset_us"] = clock_sync_estimate["offset_us"]
