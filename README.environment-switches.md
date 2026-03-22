@@ -22,7 +22,6 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 |---|---|---|
 | `BLOOMBEE_ENABLE_MICROBATCH_PIPELINE` | `1` | Master switch for micro-batching. |
 | `BLOOMBEE_MICRO_BATCH_SIZE` | `2` | Micro-batch size used for overlap scheduling. |
-| `BLOOMBEE_MICRO_ENABLE_GPU_MULTIPLEXING` | parsed, but currently effectively `0` | Intended to shrink active GPU working slots. Right now BloomBee forces `overlap_only`, so this is effectively a no-op. |
 | `BLOOMBEE_ENABLE_CROSS_STAGE_PUSH` | `1` | Enables actual server-to-server micro-batch push. Set `0` for dry-run / fallback behavior. |
 | `BLOOMBEE_ENABLE_IMMEDIATE_MB_QUEUE` | `1` | Enables immediate in-memory micro-batch queuing on the downstream server. |
 | `BLOOMBEE_STORE_MB_FILES_IN_IMMEDIATE` | `0` | In immediate mode, also persist micro-batches to files for legacy compatibility. |

@@ -46,7 +46,6 @@ from bloombee.utils.packaging import unpack_args_kwargs
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
     get_micro_batch_size,
-    get_current_path,
     log_path_entry as mbpipe_log_path_entry,
     MBPIPE_LOG_PREFIX,
     AsyncOutputBuffer,
@@ -1114,13 +1113,12 @@ class TransformerConnectionHandler(ConnectionHandler):
                         )
                         batch_size = streaming_full_batch_size
                     # [MBPIPE_FIX] Keep the incoming request batch at micro-batch size for streaming.
-                    # The logical full batch is still passed separately to _allocate_cache(),
-                    # which decides how many GPU working slots to reserve.
+                    # The logical full batch is still passed separately to _allocate_cache().
                     elif is_microbatch_enabled() and streaming_full_batch_size > batch_size:
                         logger.info(
                             f"[MBPIPE_FIX] Micro-batch enabled: keeping request_batch={batch_size} "
                             f"(incoming micro-batch), while logical_full_batch={streaming_full_batch_size} "
-                            f"will drive working-slot allocation in _allocate_cache"
+                            f"will drive cache allocation in _allocate_cache"
                         )
                     elif streaming_full_batch_size > batch_size:
                         logger.info(f"{MBPIPE_LOG_PREFIX} [STREAMING_DECODE] Detected streaming micro-batch (LEGACY), "
@@ -1135,27 +1133,15 @@ class TransformerConnectionHandler(ConnectionHandler):
                         )
                         batch_size = metadata_full_batch_size
                     # Non-streaming RPC path keeps logical full batch size here.
-                    # Physical KV cache allocation is decided in _allocate_cache():
-                    # when micro-batching is enabled and batch_size > micro_batch_size,
-                    # we either keep full-batch KV (overlap-only) or allocate up to
-                    # (micro_batch_size * working_slots) in explicit multiplexing mode.
+                    # Physical KV cache allocation is decided in _allocate_cache().
+                    # Overlap-only micro-batching keeps full-batch KV allocation.
                     if is_microbatch_enabled():
-                        first_backend = requested_backends[0]
-                        offloading_policy = first_backend.cache_manager.offloading_policy
                         micro_batch_size = get_micro_batch_size()
-                        working_slots = max(1, int(getattr(offloading_policy, "num_gpu_batches", 1)))
-                        if get_current_path() == "multiplexing":
-                            logger.info(
-                                f"[MBPIPE_FIX] Non-streaming: logical batch_size={batch_size}, "
-                                f"physical alloc will use up to {micro_batch_size * working_slots} "
-                                f"(slot_batch={micro_batch_size}, working_slots={working_slots}) in _allocate_cache"
-                            )
-                        else:
-                            logger.info(
-                                f"[MBPIPE_FIX] Non-streaming overlap-only mode: logical batch_size={batch_size}, "
-                                f"KV allocation stays full-batch in _allocate_cache; "
-                                f"micro_batch_size={micro_batch_size}, working_slots={working_slots}"
-                            )
+                        logger.info(
+                            f"[MBPIPE_FIX] Non-streaming overlap-only mode: logical batch_size={batch_size}, "
+                            f"KV allocation stays full-batch in _allocate_cache; "
+                            f"micro_batch_size={micro_batch_size}"
+                        )
                     else:
                         logger.debug(f"[MB_DEBUG] NOT streaming decode, using original batch_size={batch_size}")
                 
@@ -1450,14 +1436,13 @@ class TransformerConnectionHandler(ConnectionHandler):
                     await _drain_background_tasks()
             
             finally:
-                # [MBPIPE_FIX] Clear offload state (CPU staging buffers) ONLY after the entire
-                # request is complete. This ensures history is preserved during streaming.
+                # Clear any request-local cache-manager bookkeeping after the request completes.
                 try:
                     if requested_backends:
                         cache_manager = requested_backends[0].cache_manager
                         if cache_manager is not None and hasattr(cache_manager, 'clear_offload_state'):
                             cache_manager.clear_offload_state()
-                            logger.info(f"[MBPIPE_FIX] Cleared offload state after request completion")
+                            logger.info(f"[MBPIPE_FIX] Cleared cache-manager request state after request completion")
                 except Exception as e:
                     logger.warning(f"[MBPIPE_FIX] Failed to clear offload state: {e}")
 
@@ -3337,23 +3322,17 @@ class TransformerConnectionHandler(ConnectionHandler):
         # Use KVCacheManager's offloading strategy
         cache_manager = backends[0].cache_manager
 
-        # Micro-batching supports two modes:
-        # - overlap-only (default): split execution but keep full logical KV cache
-        # - GPU multiplexing (opt-in): shrink active GPU KV capacity and reuse slots
         from bloombee.utils.microbatch_config import get_micro_batch_size, get_micro_batch_config
-        from bloombee.utils.memory_usage import log_mbpipe_memory, log_kv_cache_allocation, MemoryTracker
         
         mb_config = get_micro_batch_config()
         policy = cache_manager.offloading_policy
         max_supported_batch = policy.gpu_batch_size * max(1, int(getattr(policy, "num_gpu_batches", 1)))
         micro_batch_size = mb_config['micro_batch_size']
-        working_slots = max(1, int(getattr(policy, "num_gpu_batches", 1)))
         logical_batch_size = (
             int(logical_full_batch_size)
             if logical_full_batch_size is not None and int(logical_full_batch_size) > 0
             else int(batch_size)
         )
-        gpu_multiplexing_enabled = bool(mb_config.get('gpu_multiplexing', False))
         
         # [MBPIPE_DEBUG] Log the critical allocation decision
         logger.debug(f"[MBPIPE_ALLOC_DEBUG] ========================================")
@@ -3378,43 +3357,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                 f"{MBPIPE_LOG_PREFIX} KV alloc mode: SPEC_FULL "
                 f"(alloc_batch={alloc_batch_size}, request_batch={batch_size}, micro_batch={micro_batch_size})"
             )
-
-        elif mb_config['enabled'] and micro_batch_size < logical_batch_size and gpu_multiplexing_enabled:
-            # True GPU multiplexing:
-            # - Keep logical full batch for scheduling
-            # - Allocate a small number of GPU working slots
-            # - Offload/prefetch swaps inactive per-micro-batch snapshots between CPU and GPU
-            alloc_batch_size = min(logical_batch_size, micro_batch_size * working_slots)
-            
-            logger.debug(f"[MBPIPE_ALLOC_DEBUG] !!! MICRO-BATCHING ENABLED (GPU MULTIPLEXING) !!!")
-            logger.debug(
-                f"[MBPIPE_ALLOC_DEBUG] alloc_batch_size = {alloc_batch_size} "
-                f"(working_slots={working_slots}, slot_batch_size={micro_batch_size})"
-            )
-            logger.debug(
-                f"[MBPIPE_ALLOC_DEBUG] Full batch ({logical_batch_size}) will be processed in "
-                f"{(logical_batch_size + micro_batch_size - 1) // micro_batch_size} micro-batches"
-            )
-            logger.debug(
-                f"[MBPIPE_ALLOC_DEBUG] Micro-batches reuse {working_slots} GPU working slots; "
-                f"inactive KV state is preserved via CPU snapshots"
-            )
-            
-            # [MBPIPE_DEBUG] Calculate and log expected memory usage
-            try:
-                block_config = cache_manager.block_config
-                log_kv_cache_allocation(
-                    batch_size=logical_batch_size,
-                    micro_batch_size=micro_batch_size,
-                    max_length=max_length,
-                    num_blocks=len(backends),
-                    hidden_size=getattr(block_config, 'hidden_size', 4096),
-                    num_heads=getattr(block_config, 'num_attention_heads', 32),
-                    dtype_bytes=2  # fp16
-                )
-            except Exception as e:
-                logger.debug(f"[MBPIPE_ALLOC_DEBUG] log_kv_cache_allocation failed: {e}")
-            
         else:
             # Legacy or overlap-only mode: keep a full logical KV cache allocation.
             alloc_batch_size = logical_batch_size

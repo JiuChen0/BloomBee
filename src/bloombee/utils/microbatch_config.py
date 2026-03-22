@@ -4,9 +4,6 @@ Micro-batch Pipeline Configuration Module.
 The feature is controlled via environment variables:
 - BLOOMBEE_ENABLE_MICROBATCH_PIPELINE: "1" to enable (default), "0" to disable
 - BLOOMBEE_MICRO_BATCH_SIZE: positive integer micro-batch size
-- BLOOMBEE_MICRO_ENABLE_GPU_MULTIPLEXING: "1" to enable bounded GPU working-slot
-  reuse. Default is "0", which keeps micro-batching in overlap-only mode so
-  FlexGen cache offload remains available.
 
 Non-positive micro-batch sizes are treated as disabled to make local toggling safe.
 All logs from this feature use the prefix [MBPIPE].
@@ -30,7 +27,6 @@ def mbpipe_info_logs_enabled() -> bool:
 # Environment variable names
 ENV_ENABLE_MICROBATCH = "BLOOMBEE_ENABLE_MICROBATCH_PIPELINE"
 ENV_MICRO_BATCH_SIZE = "BLOOMBEE_MICRO_BATCH_SIZE"
-ENV_ENABLE_GPU_MULTIPLEXING = "BLOOMBEE_MICRO_ENABLE_GPU_MULTIPLEXING"
 
 # Default values
 # Micro-batch size for pipeline overlap. Each micro-batch writes to its own slice of the KV cache.
@@ -81,18 +77,6 @@ def is_microbatch_enabled() -> bool:
     return _is_microbatch_flag_enabled() and get_micro_batch_size() > 0
 
 
-def is_microbatch_gpu_multiplexing_enabled() -> bool:
-    """
-    Check whether micro-batching should also shrink active GPU KV capacity.
-
-    This is intentionally disabled by default. The default micro-batch behavior
-    is overlap-only: split execution for pipeline overlap while keeping a full
-    logical KV cache allocation, which preserves FlexGen static cache offload.
-    """
-    env_value = os.environ.get(ENV_ENABLE_GPU_MULTIPLEXING, "0")
-    return env_value == "1"
-
-
 def get_micro_batch_config() -> dict:
     """
     Get the complete micro-batch configuration as a dictionary.
@@ -101,21 +85,13 @@ def get_micro_batch_config() -> dict:
         A dictionary with:
         - 'enabled': bool - whether micro-batching is enabled
         - 'micro_batch_size': int - the configured micro-batch size
-        - 'gpu_multiplexing': bool - whether to shrink active GPU KV working set
-        - 'mode': str - one of "legacy", "overlap_only", or "multiplexing"
+        - 'mode': str - one of "legacy" or "overlap_only"
     """
     enabled = is_microbatch_enabled()
-    gpu_multiplexing = is_microbatch_gpu_multiplexing_enabled()
-    if not enabled:
-        mode = "legacy"
-    elif gpu_multiplexing:
-        mode = "multiplexing"
-    else:
-        mode = "overlap_only"
+    mode = "overlap_only" if enabled else "legacy"
     return {
         'enabled': enabled,
         'micro_batch_size': get_micro_batch_size(),
-        'gpu_multiplexing': gpu_multiplexing,
         'mode': mode,
     }
 
@@ -125,7 +101,7 @@ def get_current_path() -> str:
     Get the current execution path name.
     
     Returns:
-        One of: "legacy", "overlap_only", or "multiplexing".
+        One of: "legacy" or "overlap_only".
     """
     return get_micro_batch_config()["mode"]
 
@@ -144,8 +120,7 @@ def get_config_summary() -> str:
     return (
         f"enabled={enabled}, "
         f"micro_batch_size={micro_batch_size}, "
-        f"path={path}, "
-        f"gpu_multiplexing={path == 'multiplexing'}"
+        f"path={path}"
     )
 
 
@@ -166,8 +141,7 @@ def log_config(logger: logging.Logger, context: str = "") -> None:
     context_str = f" ({context})" if context else ""
     logger.info(
         f"{MBPIPE_LOG_PREFIX} Config{context_str}: "
-        f"enabled={enabled}, micro_batch_size={micro_batch_size}, "
-        f"path={path}, gpu_multiplexing={path == 'multiplexing'}"
+        f"enabled={enabled}, micro_batch_size={micro_batch_size}, path={path}"
     )
 
 
@@ -185,7 +159,6 @@ def log_memory_savings_diagnosis(logger: logging.Logger, batch_size: int = 8) ->
         return
     enabled = is_microbatch_enabled()
     micro_batch_size = get_micro_batch_size()
-    gpu_multiplexing = is_microbatch_gpu_multiplexing_enabled()
     
     logger.info(f"{MBPIPE_LOG_PREFIX} ===== MEMORY SAVINGS DIAGNOSIS =====")
     logger.info(f"{MBPIPE_LOG_PREFIX} Client batch_size: {batch_size}")
@@ -200,29 +173,14 @@ def log_memory_savings_diagnosis(logger: logging.Logger, batch_size: int = 8) ->
         logger.info(f"{MBPIPE_LOG_PREFIX} Result: NO memory savings (micro_batch_size >= batch_size)")
         return
 
-    if not gpu_multiplexing:
-        logger.info(f"{MBPIPE_LOG_PREFIX} ")
-        logger.info(f"{MBPIPE_LOG_PREFIX} Current behavior (overlap-only micro-batching):")
-        logger.info(f"{MBPIPE_LOG_PREFIX}   1. Requests are split into micro-batches for pipeline overlap")
-        logger.info(f"{MBPIPE_LOG_PREFIX}   2. KV cache is still allocated for the FULL logical batch")
-        logger.info(f"{MBPIPE_LOG_PREFIX}   3. FlexGen static cache offload remains available")
-        logger.info(f"{MBPIPE_LOG_PREFIX}   4. GPU KV memory is NOT reduced by micro_batch_size")
-        logger.info(f"{MBPIPE_LOG_PREFIX} ")
-        logger.info(f"{MBPIPE_LOG_PREFIX} Result: NO GPU memory savings (overlap-only mode)")
-        logger.info(f"{MBPIPE_LOG_PREFIX} ===== END DIAGNOSIS =====")
-        return
-    
     logger.info(f"{MBPIPE_LOG_PREFIX} ")
-    logger.info(f"{MBPIPE_LOG_PREFIX} Current behavior (GPU multiplexing):")
-    logger.info(f"{MBPIPE_LOG_PREFIX}   1. KV cache is allocated for MICRO batch ({micro_batch_size} items)")
-    logger.info(f"{MBPIPE_LOG_PREFIX}   2. Each micro-batch reuses the same GPU slots (offset=0)")
-    logger.info(f"{MBPIPE_LOG_PREFIX}   3. offload/prefetch swaps micro-batch KV state via CPU staging")
-    logger.info(f"{MBPIPE_LOG_PREFIX}   4. GPU KV memory is controlled by micro_batch_size")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Current behavior (overlap-only micro-batching):")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   1. Requests are split into micro-batches for pipeline overlap")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   2. KV cache is still allocated for the FULL logical batch")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   3. FlexGen static cache offload remains available")
+    logger.info(f"{MBPIPE_LOG_PREFIX}   4. GPU KV memory is NOT reduced by micro_batch_size")
     logger.info(f"{MBPIPE_LOG_PREFIX} ")
-    logger.info(f"{MBPIPE_LOG_PREFIX} Expected memory:")
-    logger.info(f"{MBPIPE_LOG_PREFIX}   - GPU cache for {micro_batch_size} items (micro-batch)")
-    logger.info(f"{MBPIPE_LOG_PREFIX}   - CPU staging for {batch_size} items (all micro-batches)")
-    logger.info(f"{MBPIPE_LOG_PREFIX}   - Savings: {(1 - micro_batch_size/batch_size)*100:.1f}% GPU memory reduction")
+    logger.info(f"{MBPIPE_LOG_PREFIX} Result: NO GPU memory savings (overlap-only mode)")
     logger.info(f"{MBPIPE_LOG_PREFIX} ===== END DIAGNOSIS =====")
 
 
@@ -268,7 +226,6 @@ def log_microbatch_runtime_info(
         return
     enabled = is_microbatch_enabled()
     micro_batch_size = get_micro_batch_size()
-    gpu_multiplexing = is_microbatch_gpu_multiplexing_enabled()
     
     context_str = f" ({context})" if context else ""
     
@@ -280,29 +237,10 @@ def log_microbatch_runtime_info(
     if enabled and micro_batch_size > 0 and micro_batch_size < batch_size:
         num_microbatches = (batch_size + micro_batch_size - 1) // micro_batch_size
         logger.info(f"{MBPIPE_LOG_PREFIX} Number of micro-batches: {num_microbatches}")
-        if not gpu_multiplexing:
-            logger.info(f"{MBPIPE_LOG_PREFIX} GPU memory mode: OVERLAP_ONLY (cache sized for full batch)")
-            logger.info(f"{MBPIPE_LOG_PREFIX} FlexGen static cache offload remains active")
-            logger.info(f"{MBPIPE_LOG_PREFIX} ===========================================")
-            return
-        logger.info(f"{MBPIPE_LOG_PREFIX} GPU memory mode: MULTIPLEXING (cache sized for {micro_batch_size})")
-        
-        # Estimate memory
-        # KV cache per block: 2 * seq_len * batch * heads * head_dim * dtype_size
-        # Assuming LLaMA-7B: hidden=4096, heads=32, head_dim=128, dtype=fp16 (2 bytes)
-        kv_per_block_full = 2 * seq_len * batch_size * 32 * 128 * 2 / (1024 * 1024)  # MB
-        kv_per_block_micro = 2 * seq_len * micro_batch_size * 32 * 128 * 2 / (1024 * 1024)  # MB
-        
-        total_kv_full = kv_per_block_full * num_blocks
-        total_kv_micro = kv_per_block_micro * num_blocks
-        savings = total_kv_full - total_kv_micro
-        savings_pct = (savings / total_kv_full * 100) if total_kv_full > 0 else 0
-        
-        logger.info(f"{MBPIPE_LOG_PREFIX} Estimated KV cache (full batch): {total_kv_full:.1f} MB")
-        logger.info(f"{MBPIPE_LOG_PREFIX} Estimated KV cache (micro-batch): {total_kv_micro:.1f} MB")
-        logger.info(f"{MBPIPE_LOG_PREFIX} Estimated savings: {savings:.1f} MB ({savings_pct:.1f}%)")
+        logger.info(f"{MBPIPE_LOG_PREFIX} GPU memory mode: OVERLAP_ONLY (cache sized for full batch)")
+        logger.info(f"{MBPIPE_LOG_PREFIX} FlexGen static cache offload remains active")
     else:
-        logger.info(f"{MBPIPE_LOG_PREFIX} GPU memory mode: LEGACY (no multiplexing)")
+        logger.info(f"{MBPIPE_LOG_PREFIX} GPU memory mode: LEGACY")
     
     logger.info(f"{MBPIPE_LOG_PREFIX} ===========================================")
 

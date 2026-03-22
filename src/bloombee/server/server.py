@@ -278,25 +278,11 @@ class Server:
         self.env = ExecutionEnv.create("~./flexgen_offload_dir", device_type=device.type) ##########
 
         # Policy: keep weights, KV cache, and activations on GPU by default.
-        #
-        # Micro-batching has two distinct modes:
-        # - overlap_only: split execution for overlap, but keep full logical KV capacity
-        # - multiplexing: shrink active GPU KV capacity down to micro_batch_size
-        #
-        # Only multiplexing should reduce policy.gpu_batch_size. Overlap-only must keep
-        # full-batch capacity, otherwise handler._allocate_cache() will reject normal
-        # client batch sizes before the overlap path even starts.
-        from bloombee.utils.microbatch_config import get_micro_batch_size, get_micro_batch_config
-        mb_config = get_micro_batch_config()
+        # Overlap-only micro-batching still keeps full logical KV capacity.
+        from bloombee.utils.microbatch_config import get_micro_batch_size, is_microbatch_enabled
         micro_batch_size = get_micro_batch_size()
 
-        if mb_config['enabled'] and mb_config.get('gpu_multiplexing', False):
-            gpu_batch_size = micro_batch_size
-            logger.info(
-                f"[POLICY_MB_MULTIPLEX] GPU batch_size={gpu_batch_size} (micro-batch level), "
-                f"client can request up to batch_size={batch_size} (handled via offload/prefetch)"
-            )
-        elif mb_config['enabled']:
+        if is_microbatch_enabled():
             gpu_batch_size = batch_size
             logger.info(
                 f"[POLICY_MB_OVERLAP] GPU batch_size={gpu_batch_size} (full logical batch), "
@@ -309,7 +295,7 @@ class Server:
         self.policy = Policy(
             gpu_batch_size, 1,        # gpu_batch_size controls GPU KV working capacity
             100, 0,                   # w_gpu_percent, w_cpu_percent
-            100, 0,                   # cache_gpu_percent, cache_cpu_percent (multiplexing uses CPU staging for KV offload)
+            100, 0,                   # cache_gpu_percent, cache_cpu_percent
             100, 0,                   # act_gpu_percent, act_cpu_percent (mixed activation offload is unsupported)
             overlap=True, sep_layer=True, pin_weight=True,
             cpu_cache_compute=False, attn_sparsity=1.0,
