@@ -2905,7 +2905,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                 "s2s_sender_serialize_end_us": int(serialize_end_us),
                 "s2s_sender_compute_to_serialize_start_ms": float(sender_compute_to_serialize_start_ms),
                 "s2s_sender_gpu2cpu_ms": float(t_gpu2cpu_ms),
-                "s2s_sender_cpu2nic_ms": float(t_cpu2nic_ms),
             }
 
             # [CLOCK_SYNC] Attach latest sender->receiver clock estimate for strict overlap correction
@@ -2963,13 +2962,14 @@ class TransformerConnectionHandler(ConnectionHandler):
             push_metadata["s2s_sender_sem_wait_ms"] = float(sem_wait_time)
             push_metadata["s2s_sender_enqueue_us"] = int(self._now_us())
             push_metadata["clock_sync_sender_send_us"] = int(push_metadata["s2s_sender_enqueue_us"])
+            t_cpu2nic_ms = max(0.0, (perf_counter() - serialize_end_perf) * 1000.0)
+            push_metadata["s2s_sender_cpu2nic_ms"] = float(t_cpu2nic_ms)
             serialized_push_metadata = MSGPackSerializer.dumps(push_metadata)
             rpc_request = runtime_pb2.ExpertRequest(
                 uid=next_uid,
                 tensors=[serialized_hidden, serialized_keep],
                 metadata=serialized_push_metadata,
             )
-            t_cpu2nic_ms = max(0.0, (perf_counter() - serialize_end_perf) * 1000.0)
             push_tensor_bytes = len(serialized_hidden.buffer) + len(serialized_keep.buffer)
             
             # Create task for background sending - don't await
