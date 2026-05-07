@@ -7,7 +7,6 @@ import os
 import threading
 import time
 from typing import Optional, Tuple, AsyncContextManager, Sequence
-from concurrent.futures import ThreadPoolExecutor
 
 from bloombee.server.memory_cache import MemoryCache, AdaptedKVCache, KVCacheMetadata, _is_paged_kv_enabled
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
@@ -54,7 +53,6 @@ class KVCacheManager:
         # mainline. The legacy _write_kvs slab write remains the source of
         # truth in both modes.
         self._paged_kv_enabled = _is_paged_kv_enabled()
-        self._reorder_executor = ThreadPoolExecutor(max_workers=1)
         
         # [KVCACHE_OFFLOAD] Micro-batch level memory reuse state
         # Since all blocks share one KVCacheManager, staging must be keyed by:
@@ -2018,9 +2016,11 @@ class KVCacheManager:
         micro_batch_size: int = 0,
     ) -> None:
         cache_manager = self
-        
-        self._reorder_executor.submit(
-            self._do_reorder_task,
+
+        # The next decode step may re-enter this block immediately and read the
+        # same cache tensors. Finish the write/compact before returning so the
+        # KV slab is never observed mid-reorder.
+        self._do_reorder_task(
             new_kvs,
             kv_cache_position_ids,
             cache_tensors,
@@ -2029,7 +2029,7 @@ class KVCacheManager:
             micro_batch_size,
             cache_manager,
         )
-        
+
     def _do_reorder_task(
         self,
         new_kvs: AdaptedKVCache,
@@ -2157,4 +2157,4 @@ class KVCacheManager:
 
         except Exception as e:
             import logging
-            logging.error(f"Async cache reorder failed: {e}")
+            logging.error(f"Cache reorder failed: {e}")
