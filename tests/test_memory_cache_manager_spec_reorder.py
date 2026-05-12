@@ -15,6 +15,7 @@ def test_spec_reorder_update_waits_for_reorder_completion(monkeypatch):
     started = threading.Event()
     finish_allowed = threading.Event()
     finished = threading.Event()
+    caller_errors = []
 
     def fake_reorder_task(*_args, **_kwargs):
         started.set()
@@ -23,14 +24,17 @@ def test_spec_reorder_update_waits_for_reorder_completion(monkeypatch):
 
     monkeypatch.setattr(manager, "_do_reorder_task", fake_reorder_task)
 
-    caller = threading.Thread(
-        target=manager.update_cache_and_async_reorder,
-        kwargs={
-            "new_kvs": None,
-            "kv_cache_position_ids": None,
-            "cache_tensors": (),
-        },
-    )
+    def call_update():
+        try:
+            manager.update_cache_and_async_reorder(
+                new_kvs=None,
+                kv_cache_position_ids=None,
+                cache_tensors=(),
+            )
+        except BaseException as exc:
+            caller_errors.append(exc)
+
+    caller = threading.Thread(target=call_update)
     caller.start()
 
     try:
@@ -42,6 +46,7 @@ def test_spec_reorder_update_waits_for_reorder_completion(monkeypatch):
 
         assert not caller.is_alive()
         assert finished.is_set()
+        assert not caller_errors
     finally:
         finish_allowed.set()
         manager._reorder_executor.shutdown(wait=True)
