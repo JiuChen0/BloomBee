@@ -7,7 +7,6 @@ import os
 import threading
 import time
 from typing import Optional, Tuple, AsyncContextManager, Sequence
-from concurrent.futures import ThreadPoolExecutor
 
 from bloombee.server.memory_cache import MemoryCache, AdaptedKVCache, KVCacheMetadata, _is_paged_kv_enabled
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
@@ -43,9 +42,8 @@ class KVCacheManager:
         self.max_alloc_timeout = max_alloc_timeout
         self._active_cache_tensors_stack = []
         # Phase 3: id(cache_tensors) -> tuple of handle ids currently aliased
-        # onto those TorchTensors. Lets async reorder tasks (run on a thread
-        # without access to the contextmanager) resolve the matching
-        # PagedKVTable via MemoryCache.paged_view(handle).
+        # onto those TorchTensors. Spec-dec cache reorders run before leaving
+        # the contextmanager, so the matching PagedKVTable can be resolved.
         self._cache_tensors_to_handles = {}
         # Gate all paged-KV side-channel bookkeeping on the env flag once at
         # init time. When the shim is off (default), the per-step track/
@@ -54,7 +52,6 @@ class KVCacheManager:
         # mainline. The legacy _write_kvs slab write remains the source of
         # truth in both modes.
         self._paged_kv_enabled = _is_paged_kv_enabled()
-        self._reorder_executor = ThreadPoolExecutor(max_workers=1)
         
         # [KVCACHE_OFFLOAD] Micro-batch level memory reuse state
         # Since all blocks share one KVCacheManager, staging must be keyed by:
@@ -2018,9 +2015,11 @@ class KVCacheManager:
         micro_batch_size: int = 0,
     ) -> None:
         cache_manager = self
-        
-        self._reorder_executor.submit(
-            self._do_reorder_task,
+
+        # The next spec-dec step reads and writes the same KV slab. Returning
+        # before compaction finishes lets it observe stale speculative tokens or
+        # race with the rewrite, corrupting the accepted prefix.
+        self._do_reorder_task(
             new_kvs,
             kv_cache_position_ids,
             cache_tensors,
