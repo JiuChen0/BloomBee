@@ -188,3 +188,21 @@ def test_external_full_attention_mask_is_only_lifted():
 
     assert merged.shape == (2, 1, 3, 5)
     assert torch.equal(merged, external_mask.unsqueeze(1))
+
+
+def test_external_bool_mask_is_converted_to_additive_scores():
+    external_mask = torch.tensor([[[True, False, True]]], dtype=torch.bool)
+
+    merged = _apply_layer_type_to_external_mask(
+        external_mask,
+        layer_type="full_attention",
+        sliding_window=None,
+        query_length=1,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+    assert merged.shape == (1, 1, 1, 3)
+    assert merged[0, 0, 0, 0].item() == 0.0
+    assert NEG_INF_OK(merged[0, 0, 0, 1].item())
+    assert merged[0, 0, 0, 2].item() == 0.0

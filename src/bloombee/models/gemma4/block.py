@@ -88,6 +88,16 @@ def _apply_layer_type_to_external_mask(
     device: torch.device,
 ) -> torch.Tensor:
     """Lift backend masks to 4D and enforce Gemma-4's per-layer mask rules."""
+    if attention_mask.is_floating_point():
+        attention_mask = attention_mask.to(device=device)
+    else:
+        mask_bool = attention_mask.to(device=device, dtype=torch.bool)
+        neg_inf = torch.finfo(dtype).min
+        attention_mask = torch.where(
+            mask_bool,
+            torch.zeros((), dtype=dtype, device=device),
+            torch.full((), neg_inf, dtype=dtype, device=device),
+        )
     if attention_mask.dim() == 3:
         attention_mask = attention_mask.unsqueeze(1)
     if (
