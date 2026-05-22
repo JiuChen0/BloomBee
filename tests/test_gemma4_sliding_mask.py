@@ -8,7 +8,7 @@ exercise the pure function so they don't need a checkpoint or GPU.
 import pytest
 import torch
 
-from bloombee.models.gemma4.block import _build_layer_type_mask
+from bloombee.models.gemma4.block import _apply_layer_type_to_external_mask, _build_layer_type_mask
 
 
 def _is_masked(mask, q, k):
@@ -146,3 +146,45 @@ def test_sliding_with_none_window_falls_back_to_plain_causal():
         device=torch.device("cpu"),
     )
     assert torch.equal(mask_none, mask_full)
+
+
+def test_external_backend_mask_is_lifted_and_sliding_capped():
+    """Backend masks are plain causal [B, S, K]; sliding layers must still
+    hide keys outside Gemma-4's local window after the 3D->4D lift."""
+    batch_size = 2
+    query_length = 2
+    past_length = 10
+    key_length = past_length + query_length
+    external_mask = torch.zeros(batch_size, query_length, key_length, dtype=torch.float32)
+
+    merged = _apply_layer_type_to_external_mask(
+        external_mask,
+        layer_type="sliding_attention",
+        sliding_window=4,
+        query_length=query_length,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+    assert merged.shape == (batch_size, 1, query_length, key_length)
+    for b in range(batch_size):
+        for k in range(7):
+            assert NEG_INF_OK(merged[b, 0, 0, k].item()), f"batch {b}, key {k} should be window-masked"
+        for k in range(7, 11):
+            assert merged[b, 0, 0, k].item() == 0.0, f"batch {b}, key {k} should remain visible"
+
+
+def test_external_full_attention_mask_is_only_lifted():
+    external_mask = torch.zeros(2, 3, 5, dtype=torch.float32)
+
+    merged = _apply_layer_type_to_external_mask(
+        external_mask,
+        layer_type="full_attention",
+        sliding_window=4,
+        query_length=3,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+    assert merged.shape == (2, 1, 3, 5)
+    assert torch.equal(merged, external_mask.unsqueeze(1))
