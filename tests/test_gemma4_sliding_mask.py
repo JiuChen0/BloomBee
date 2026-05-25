@@ -5,10 +5,9 @@ layers get the causal mask AND-ed with a sliding-window cap. These tests
 exercise the pure function so they don't need a checkpoint or GPU.
 """
 
-import pytest
 import torch
 
-from bloombee.models.gemma4.block import _build_layer_type_mask
+from bloombee.models.gemma4.block import _build_layer_type_mask, _prepare_layer_attention_mask
 
 
 def _is_masked(mask, q, k):
@@ -72,6 +71,29 @@ def test_sliding_layer_masks_beyond_window():
         assert NEG_INF_OK(mask[0, 0, 1, k].item()), f"sliding q=1 out-of-window k={k} should be masked"
     for k in range(8, 12):
         assert mask[0, 0, 1, k].item() == 0.0, f"sliding q=1 in-window k={k} should be visible"
+
+
+def test_sliding_layer_intersects_backend_supplied_mask():
+    """BloomBee's server passes a generic backend mask; sliding layers still
+    need to enforce the per-layer local window on top of it."""
+    backend_mask = torch.zeros((2, 1, 8), dtype=torch.float32)
+
+    mask = _prepare_layer_attention_mask(
+        backend_mask,
+        layer_type="sliding_attention",
+        sliding_window=4,
+        query_length=1,
+        past_length=7,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+    assert mask.shape == (2, 1, 1, 8)
+    for b in range(2):
+        for k in range(4):
+            assert NEG_INF_OK(mask[b, 0, 0, k].item()), f"batch={b} out-of-window key={k} should be masked"
+        for k in range(4, 8):
+            assert mask[b, 0, 0, k].item() == 0.0, f"batch={b} in-window key={k} should be visible"
 
 
 def test_sliding_layer_with_window_covering_full_context_equals_full_mask():

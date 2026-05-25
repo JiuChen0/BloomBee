@@ -78,6 +78,53 @@ def _build_layer_type_mask(
     return additive.unsqueeze(0).unsqueeze(0)
 
 
+def _prepare_layer_attention_mask(
+    attention_mask: Optional[torch.Tensor],
+    *,
+    layer_type: str,
+    sliding_window: Optional[int],
+    query_length: int,
+    past_length: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    layer_mask = _build_layer_type_mask(
+        layer_type=layer_type,
+        sliding_window=sliding_window,
+        query_length=query_length,
+        past_length=past_length,
+        dtype=dtype,
+        device=device,
+    )
+    if attention_mask is None:
+        return layer_mask
+
+    if attention_mask.dim() == 3:
+        # BloomBee's backend builds the mask as [B, S, K]; Gemma4 attention
+        # expects 4D [B, 1, S, K] so it broadcasts over the heads dim.
+        # Without this lift, bs>1 fails with "tensor a (num_heads) must match
+        # tensor b (B) at non-singleton dimension 1" (same root cause as the
+        # Qwen3 fix in 1be0a3e).
+        attention_mask = attention_mask.unsqueeze(1)
+
+    if attention_mask.dtype == torch.bool:
+        neg_inf = torch.finfo(dtype).min
+        attention_mask = torch.where(
+            attention_mask.to(device=device),
+            torch.tensor(0.0, dtype=dtype, device=device),
+            torch.tensor(neg_inf, dtype=dtype, device=device),
+        )
+    else:
+        attention_mask = attention_mask.to(device=device, dtype=dtype)
+
+    if layer_type == "sliding_attention" and sliding_window is not None and sliding_window > 0:
+        # The server passes a generic causal mask on the normal inference path.
+        # Sliding layers must additionally reject keys outside their local window.
+        attention_mask = torch.minimum(attention_mask, layer_mask)
+
+    return attention_mask
+
+
 class WrappedGemma4Block(_BaseDecoderLayer):
     def __init__(self, config: _BaseBlockConfig, layer_idx: int):
         super().__init__(config, layer_idx)
@@ -165,22 +212,15 @@ class WrappedGemma4Block(_BaseDecoderLayer):
         #     builds this as a dict `{full: ..., sliding: ...}` at the
         #     model level; BloomBee wraps bare layers so we do it here
         #     per-block, keyed on `self.layer_type`.
-        if attention_mask is None:
-            attention_mask = _build_layer_type_mask(
-                layer_type=self.layer_type,
-                sliding_window=self.sliding_window,
-                query_length=seq_length,
-                past_length=past_key_values_length,
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
-        elif attention_mask.dim() == 3:
-            # BloomBee's backend builds the mask as [B, S, K]; Gemma4 attention
-            # expects 4D [B, 1, S, K] so it broadcasts over the heads dim.
-            # Without this lift, bs>1 fails with "tensor a (num_heads) must match
-            # tensor b (B) at non-singleton dimension 1" (same root cause as the
-            # Qwen3 fix in 1be0a3e).
-            attention_mask = attention_mask.unsqueeze(1)
+        attention_mask = _prepare_layer_attention_mask(
+            attention_mask,
+            layer_type=self.layer_type,
+            sliding_window=self.sliding_window,
+            query_length=seq_length,
+            past_length=past_key_values_length,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
 
         position_ids = kwargs.pop("position_ids", None)
         if position_ids is None:
