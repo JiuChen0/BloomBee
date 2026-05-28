@@ -8,7 +8,7 @@ exercise the pure function so they don't need a checkpoint or GPU.
 import pytest
 import torch
 
-from bloombee.models.gemma4.block import _build_layer_type_mask
+from bloombee.models.gemma4.block import _build_layer_type_mask, _merge_layer_type_mask
 
 
 def _is_masked(mask, q, k):
@@ -146,3 +146,33 @@ def test_sliding_with_none_window_falls_back_to_plain_causal():
         device=torch.device("cpu"),
     )
     assert torch.equal(mask_none, mask_full)
+
+
+def test_backend_mask_is_lifted_and_merged_with_sliding_cap():
+    """Backend masks are [B, S, K], but sliding layers still need Gemma4's
+    local window cap instead of silently using the full causal context.
+    """
+    backend_mask = torch.zeros((2, 2, 12), dtype=torch.float32)
+    backend_mask[1, 0, 9] = torch.finfo(torch.float32).min
+
+    merged = _merge_layer_type_mask(
+        backend_mask,
+        layer_type="sliding_attention",
+        sliding_window=4,
+        query_length=2,
+        past_length=10,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+    assert merged.shape == (2, 1, 2, 12)
+    # First query is absolute position 10; only keys 7..10 are in-window.
+    for batch in range(2):
+        for key in range(7):
+            assert NEG_INF_OK(merged[batch, 0, 0, key].item())
+        assert merged[batch, 0, 0, 7].item() == 0.0
+        assert merged[batch, 0, 0, 10].item() == 0.0
+        assert NEG_INF_OK(merged[batch, 0, 0, 11].item())
+
+    # Existing backend constraints are preserved while adding the sliding cap.
+    assert NEG_INF_OK(merged[1, 0, 0, 9].item())
