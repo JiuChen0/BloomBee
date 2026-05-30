@@ -199,6 +199,14 @@ def _effective_token_increment(
     return int(kv_cache_position_ids[0].numel())
 
 
+def _raise_if_max_length_exceeded(prefix_length: int, token_increment: int, max_length: int) -> None:
+    if prefix_length + token_increment > max_length:
+        raise ValueError(
+            f"Maximum length exceeded: prefix {prefix_length} + current {token_increment}"
+            f" exceeds pre-allocated maximum {max_length}"
+        )
+
+
 def _unpack_inference_submit_result(result: Any) -> Tuple[torch.Tensor, Any, Optional[Dict[str, float]]]:
     """
     Backward-compatible unpack for inference_pool.submit_task():
@@ -933,6 +941,7 @@ async def iterate_rpc_inference(
             batch_size = mb_size
             length_increment = hidden_states.shape[1]
             token_increment = _effective_token_increment(hidden_states, kv_cache_position_ids, is_spec_dec)
+            _raise_if_max_length_exceeded(prefix_length, token_increment, max_length)
             
             # Cast to backend dtype
             hidden_states = hidden_states.to(requested_backends[0].dtype)
@@ -2073,11 +2082,7 @@ async def iterate_rpc_inference(
         if not (len(requested_backends) == len(prompts)):
             raise ValueError(f"Received {len(prompts)} prompts for {len(requested_backends)} backends")
 
-        if prefix_length + token_increment > max_length:
-            raise ValueError(
-                f"Maximum length exceeded: prefix {prefix_length} + current {token_increment}"
-                f" exceeds pre-allocated maximum {max_length}"
-            )
+        _raise_if_max_length_exceeded(prefix_length, token_increment, max_length)
 
         # Note: quant_type is always NONE (quantization CLI removed), so always use standard threshold
         merge_max_tokens = MAX_SHORT_INFERENCE_TOKENS

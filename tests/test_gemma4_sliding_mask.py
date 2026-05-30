@@ -5,10 +5,9 @@ layers get the causal mask AND-ed with a sliding-window cap. These tests
 exercise the pure function so they don't need a checkpoint or GPU.
 """
 
-import pytest
 import torch
 
-from bloombee.models.gemma4.block import _build_layer_type_mask
+from bloombee.models.gemma4.block import _build_layer_type_mask, _merge_with_layer_type_mask
 
 
 def _is_masked(mask, q, k):
@@ -146,3 +145,48 @@ def test_sliding_with_none_window_falls_back_to_plain_causal():
         device=torch.device("cpu"),
     )
     assert torch.equal(mask_none, mask_full)
+
+
+def test_backend_mask_is_lifted_and_merged_with_sliding_cap():
+    """Sliding layers must keep their window cap when BloomBee supplies a mask."""
+    backend_mask = torch.zeros((2, 1, 12), dtype=torch.float32)
+
+    merged = _merge_with_layer_type_mask(
+        backend_mask,
+        layer_type="sliding_attention",
+        sliding_window=4,
+        query_length=1,
+        past_length=11,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+    assert merged.shape == (2, 1, 1, 12)
+    for b in range(2):
+        for k in range(8):
+            assert NEG_INF_OK(merged[b, 0, 0, k].item()), f"batch={b} old key {k} should be masked"
+        for k in range(8, 12):
+            assert merged[b, 0, 0, k].item() == 0.0, f"batch={b} key {k} should remain visible"
+
+
+def test_external_bool_mask_merges_with_sliding_cap():
+    """Bool masks use BloomBee's True-visible convention before the sliding cap."""
+    visible_mask = torch.ones((1, 1, 6), dtype=torch.bool)
+    visible_mask[:, :, 5] = False
+
+    merged = _merge_with_layer_type_mask(
+        visible_mask,
+        layer_type="sliding_attention",
+        sliding_window=3,
+        query_length=1,
+        past_length=5,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+    assert merged.shape == (1, 1, 1, 6)
+    for k in range(3):
+        assert NEG_INF_OK(merged[0, 0, 0, k].item()), f"old key {k} should be masked"
+    assert merged[0, 0, 0, 3].item() == 0.0
+    assert merged[0, 0, 0, 4].item() == 0.0
+    assert NEG_INF_OK(merged[0, 0, 0, 5].item()), "external mask should still hide key 5"
