@@ -323,11 +323,12 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         attention_mask: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
         rotary_position_ids: Optional[torch.Tensor],
-    ) -> Optional[Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]]:
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """One transformer block forward pass on a (chunked) hidden-states slice.
 
-        Chunk-level seam. Returns (output_hidden_states_chunk, new_kvs) or None
-        on failure.
+        Chunk-level seam. Returns (output_hidden_states_chunk, new_kvs).
+        Forward failures must propagate to the caller; treating a failed block
+        as an identity transform silently corrupts distributed generation.
         """
         forward_result = self.module.forward(
             hidden_states_chunk,
@@ -338,8 +339,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             rotary_position_ids=rotary_position_ids,
         )
         if forward_result is None:
-            logger.info(" ERROR: module.forward returned None!")
-            return None
+            raise RuntimeError(f"{self.name} module.forward returned None")
         output_hidden_states_chunk, new_kvs = forward_result
         return output_hidden_states_chunk, new_kvs
 
@@ -681,19 +681,16 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         rotary_position_ids = None
                     
                     try:
-                        step_result = self._run_block_forward(
+                        output_hidden_states_chunk, new_kvs = self._run_block_forward(
                             hidden_states_chunk,
                             layer_past=layer_past,
                             attention_mask=attention_mask,
                             position_ids=position_ids,
                             rotary_position_ids=rotary_position_ids,
                         )
-                        if step_result is None:
-                            return (hidden_states, None)
-                        output_hidden_states_chunk, new_kvs = step_result
                     except Exception as e:
                         logger.exception("ERROR in module.forward: %s: %s", type(e).__name__, e)
-                        return (hidden_states, None)
+                        raise
 
                     if seq_len > max_chunk_length:
                         output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk
@@ -784,7 +781,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 inference_info.prefix_length if 'inference_info' in locals() else None,
                 e,
             )
-            return (hidden_states, None)  # Return original input as fallback
+            raise
 
     def _normalize_keep_indices(
         self,
