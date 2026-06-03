@@ -2,6 +2,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import MethodType
 
+import pytest
+
 from bloombee.server.memory_cache_manager import KVCacheManager
 
 
@@ -42,3 +44,23 @@ def test_spec_cache_reorder_update_blocks_until_reorder_finishes():
         release.set()
         manager._reorder_executor.shutdown(wait=True)
         caller.join(timeout=1.0)
+
+
+def test_spec_cache_reorder_update_propagates_write_failures():
+    manager = KVCacheManager.__new__(KVCacheManager)
+
+    def fail_write(self, *args, **kwargs):
+        raise RuntimeError("write failed")
+
+    manager._write_kvs = MethodType(fail_write, manager)
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        manager._do_reorder_task(
+            new_kvs=None,
+            kv_cache_position_ids=None,
+            cache_tensors=(),
+            batch_offset=0,
+            full_batch_size=0,
+            micro_batch_size=0,
+            cache_manager=manager,
+        )

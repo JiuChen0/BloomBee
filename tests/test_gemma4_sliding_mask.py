@@ -5,10 +5,9 @@ layers get the causal mask AND-ed with a sliding-window cap. These tests
 exercise the pure function so they don't need a checkpoint or GPU.
 """
 
-import pytest
 import torch
 
-from bloombee.models.gemma4.block import _build_layer_type_mask
+from bloombee.models.gemma4.block import _build_layer_type_mask, _prepare_attention_mask
 
 
 def _is_masked(mask, q, k):
@@ -146,3 +145,51 @@ def test_sliding_with_none_window_falls_back_to_plain_causal():
         device=torch.device("cpu"),
     )
     assert torch.equal(mask_none, mask_full)
+
+
+def test_external_backend_mask_is_merged_with_sliding_window():
+    """Backend masks are only causal/tree masks; sliding layers must add the
+    local-window cap even when a backend-provided score mask is present."""
+    backend_mask = torch.zeros(2, 1, 6, dtype=torch.float32)
+
+    prepared = _prepare_attention_mask(
+        backend_mask,
+        layer_type="sliding_attention",
+        sliding_window=3,
+        query_length=1,
+        past_length=5,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+    assert prepared.shape == (2, 1, 1, 6)
+    for batch_idx in range(2):
+        for key_idx in range(3):
+            assert NEG_INF_OK(prepared[batch_idx, 0, 0, key_idx].item())
+        for key_idx in range(3, 6):
+            assert prepared[batch_idx, 0, 0, key_idx].item() == 0.0
+
+
+def test_external_bool_mask_is_converted_before_sliding_merge():
+    """BloomBee bool masks use True=visible. Preserve those blocked positions
+    while also applying the Gemma4 sliding cap."""
+    backend_mask = torch.ones(1, 2, 6, dtype=torch.bool)
+    backend_mask[0, 1, 5] = False
+
+    prepared = _prepare_attention_mask(
+        backend_mask,
+        layer_type="sliding_attention",
+        sliding_window=3,
+        query_length=2,
+        past_length=4,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+    assert prepared.shape == (1, 1, 2, 6)
+    # First query absolute position 4: sliding window permits keys 2..4 only.
+    assert NEG_INF_OK(prepared[0, 0, 0, 0].item())
+    assert prepared[0, 0, 0, 2].item() == 0.0
+    assert prepared[0, 0, 0, 4].item() == 0.0
+    # Second query would permit key 5 by sliding, but the backend mask blocks it.
+    assert NEG_INF_OK(prepared[0, 0, 1, 5].item())

@@ -128,6 +128,26 @@ def test_zlib_wrapper_decompression_is_capped_to_declared_size():
         lt._decompress_with_algo(lt._ALGO_ZLIB, payload, 8)
 
 
+def test_lossless_wrapper_rejects_declared_size_above_limit(monkeypatch):
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_MAX_ORIGINAL_BYTES", "16")
+
+    with pytest.raises(ValueError, match="exceeds configured limit"):
+        lt._decompress_with_algo(lt._ALGO_ZLIB, zlib.compress(b"x"), 17)
+
+
+def test_zipnn_receive_rejects_huge_header_before_decompress(monkeypatch):
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_MAX_ORIGINAL_BYTES", "16")
+
+    class FailingZipNNDecompressor:
+        def decompress(self, payload):
+            raise AssertionError("ZipNN decompressor should not run for an oversized header")
+
+    monkeypatch.setattr(lt, "_get_zipnn_decompressor", lambda: FailingZipNNDecompressor())
+
+    with pytest.raises(ValueError, match="exceeds configured limit"):
+        lt._decompress_with_algo(lt._ALGO_ZIPNN, b"payload", 17)
+
+
 def test_zipnn_compare_candidate_fp16(monkeypatch):
     tensor = _make_split_friendly_fp16().contiguous()
     debug_context = {

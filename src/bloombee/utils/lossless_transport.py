@@ -55,6 +55,7 @@ _HEADER_STRUCT = struct.Struct("!4sBBQ")
 _HEADER_SIZE = _HEADER_STRUCT.size
 _BYTE_SPLIT_PAYLOAD_STRUCT = struct.Struct("!BI")
 _BYTE_SPLIT_PAYLOAD_SIZE = _BYTE_SPLIT_PAYLOAD_STRUCT.size
+_DEFAULT_LOSSLESS_MAX_ORIGINAL_BYTES = 256 * 1024 * 1024
 
 _MISSING_ZSTD_WARNING_EMITTED = False
 _MISSING_ZIPNN_WARNING_EMITTED = False
@@ -73,6 +74,7 @@ _WIRE_TRUNCATE_PHASES_ENV = "BLOOMBEE_WIRE_TRUNCATE_PHASES"
 _LOSSLESS_LAYOUT_ENV = "BLOOMBEE_LOSSLESS_LAYOUT"
 _LOSSLESS_SINGLE_PATH_ENV = "BLOOMBEE_LOSSLESS_SINGLE_PATH"
 _LOSSLESS_LAYOUT_TARGETS_ENV = "BLOOMBEE_LOSSLESS_LAYOUT_TARGETS"
+_LOSSLESS_MAX_ORIGINAL_BYTES_ENV = "BLOOMBEE_LOSSLESS_MAX_ORIGINAL_BYTES"
 _LOSSLESS_ZSTD_DICT_PATH_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH"
 _LOSSLESS_ZSTD_DICT_PATH_PREFILL_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_PREFILL"
 _LOSSLESS_ZSTD_DICT_PATH_DECODE_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_DECODE"
@@ -201,6 +203,27 @@ def _lossless_min_gain_bytes() -> int:
         return max(0, int(cfg_val))
     except Exception:
         return 32
+
+
+def _lossless_max_original_bytes() -> int:
+    cfg_val = _get_cfg("LOSSLESS_MAX_ORIGINAL_BYTES", _DEFAULT_LOSSLESS_MAX_ORIGINAL_BYTES)
+    if _allow_env_override() and _LOSSLESS_MAX_ORIGINAL_BYTES_ENV in os.environ:
+        cfg_val = _get_env_int(_LOSSLESS_MAX_ORIGINAL_BYTES_ENV, _DEFAULT_LOSSLESS_MAX_ORIGINAL_BYTES)
+    try:
+        max_bytes = int(cfg_val)
+    except Exception:
+        max_bytes = _DEFAULT_LOSSLESS_MAX_ORIGINAL_BYTES
+    return max(1, max_bytes)
+
+
+def _validate_lossless_original_size(original_size: int) -> None:
+    if original_size < 0:
+        raise ValueError(f"Invalid lossless wrapper original_size: {original_size}")
+    max_bytes = _lossless_max_original_bytes()
+    if original_size > max_bytes:
+        raise ValueError(
+            f"Lossless wrapper original_size {original_size} exceeds configured limit {max_bytes}"
+        )
 
 
 def comp_ratio_profile_enabled() -> bool:
@@ -1966,8 +1989,7 @@ def _build_zipnn_wrapper(raw: bytes, *, tensor: torch.Tensor) -> bytes:
 
 
 def _decompress_zlib_capped(payload: bytes, original_size: int) -> bytes:
-    if original_size < 0:
-        raise ValueError(f"Invalid lossless wrapper original_size: {original_size}")
+    _validate_lossless_original_size(original_size)
 
     decompressor = zlib.decompressobj()
     limit = original_size + 1
@@ -1982,6 +2004,7 @@ def _decompress_zlib_capped(payload: bytes, original_size: int) -> bytes:
 
 
 def _decompress_with_algo(algo_id: int, payload: bytes, original_size: int) -> bytes:
+    _validate_lossless_original_size(original_size)
     t0 = time.perf_counter()
     if algo_id == _ALGO_ZSTD:
         decompressor = _get_zstd_decompressor()
@@ -2101,6 +2124,7 @@ def _build_zstd_dict_byte_split_decode_wrapper(raw: bytes, *, elem_size: int) ->
 
 
 def _decode_zstd_dict_byte_split_phase_payload(payload: bytes, original_size: int, phase: str) -> bytes:
+    _validate_lossless_original_size(original_size)
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
         raise ValueError("zstd-dict-phase byte-split payload is truncated")
     elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
@@ -2136,6 +2160,7 @@ def _decode_zstd_dict_byte_split_phase_payload(payload: bytes, original_size: in
     return _reconstruct_high_byte_lane(bytes(extracted_raw), bytes(remaining_raw), elem_size, original_size)
 
 def _decode_zstd_byte_split_payload(payload: bytes, original_size: int) -> bytes:
+    _validate_lossless_original_size(original_size)
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
         raise ValueError("Byte-split payload is truncated")
     elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
@@ -2180,6 +2205,7 @@ def _build_zstd_byte_split_high_only_wrapper(raw: bytes, *, elem_size: int) -> b
 
 
 def _decode_zstd_byte_split_high_only_payload(payload: bytes, original_size: int) -> bytes:
+    _validate_lossless_original_size(original_size)
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
         raise ValueError("byte_split_high_only payload is truncated")
     elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
@@ -2206,6 +2232,7 @@ def _decode_zstd_byte_split_high_only_payload(payload: bytes, original_size: int
 
 
 def _decode_zstd_dict_byte_split_payload(payload: bytes, original_size: int) -> bytes:
+    _validate_lossless_original_size(original_size)
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
         raise ValueError("zstd-dict byte-split payload is truncated")
     elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
@@ -2519,6 +2546,7 @@ def unwrap_serialized_tensor(serialized_tensor: runtime_pb2.Tensor) -> runtime_p
             return serialized_tensor
 
         algo_id, original_size, payload = parsed
+        _validate_lossless_original_size(original_size)
         if algo_id == _ALGO_ZSTD_BYTE_SPLIT:
             raw_buffer = _decode_zstd_byte_split_payload(payload, original_size)
         elif algo_id == _ALGO_ZSTD_DICT_BYTE_SPLIT:

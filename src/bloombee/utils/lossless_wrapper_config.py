@@ -35,6 +35,9 @@ LOSSLESS_MIN_BYTES = 49152
 # Require at least this many bytes saved, otherwise keep original buffer
 LOSSLESS_MIN_GAIN_BYTES = 2048
 
+# Reject wrapped tensors that declare a larger decompressed buffer.
+LOSSLESS_MAX_ORIGINAL_BYTES = 256 * 1024 * 1024
+
 # 1 = environment variables can override this file
 # 0 = this file has full control
 ALLOW_ENV_OVERRIDE = 1
