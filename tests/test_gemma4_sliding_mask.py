@@ -5,10 +5,9 @@ layers get the causal mask AND-ed with a sliding-window cap. These tests
 exercise the pure function so they don't need a checkpoint or GPU.
 """
 
-import pytest
 import torch
 
-from bloombee.models.gemma4.block import _build_layer_type_mask
+from bloombee.models.gemma4.block import _build_layer_type_mask, _prepare_layer_type_attention_mask
 
 
 def _is_masked(mask, q, k):
@@ -146,3 +145,46 @@ def test_sliding_with_none_window_falls_back_to_plain_causal():
         device=torch.device("cpu"),
     )
     assert torch.equal(mask_none, mask_full)
+
+
+def test_external_backend_mask_is_merged_with_sliding_window():
+    """Server inference always supplies an additive mask; sliding layers must
+    still cap visibility to the configured window."""
+    backend_mask = torch.zeros(1, 2, 12, dtype=torch.float32)
+    merged = _prepare_layer_type_attention_mask(
+        backend_mask,
+        layer_type="sliding_attention",
+        sliding_window=4,
+        query_length=2,
+        past_length=10,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+    assert merged.shape == (1, 1, 2, 12)
+    assert NEG_INF_OK(merged[0, 0, 0, 6].item())
+    assert merged[0, 0, 0, 7].item() == 0.0
+    assert NEG_INF_OK(merged[0, 0, 1, 7].item())
+    assert merged[0, 0, 1, 8].item() == 0.0
+
+
+def test_external_bool_mask_is_converted_before_sliding_merge():
+    """Bool masks use True=visible; conversion must happen before applying
+    the sliding additive mask."""
+    backend_mask = torch.ones(1, 2, 12, dtype=torch.bool)
+    backend_mask[0, 1, 9] = False
+
+    merged = _prepare_layer_type_attention_mask(
+        backend_mask,
+        layer_type="sliding_attention",
+        sliding_window=4,
+        query_length=2,
+        past_length=10,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+    assert merged.shape == (1, 1, 2, 12)
+    assert NEG_INF_OK(merged[0, 0, 0, 6].item())
+    assert merged[0, 0, 0, 7].item() == 0.0
+    assert NEG_INF_OK(merged[0, 0, 1, 9].item())

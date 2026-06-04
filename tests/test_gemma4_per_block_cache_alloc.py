@@ -22,6 +22,7 @@ import torch
 from hivemind.utils import TensorDescriptor
 
 from bloombee.flexgen_utils.pytorch_backend import TorchDevice
+from bloombee.server.memory_cache_manager import KVCacheManager
 
 
 def _gemma4_ish_config():
@@ -125,3 +126,18 @@ def test_descriptor_vs_config_mismatch_uses_descriptor(device):
 
     k, v = device.init_cache_one_gpu_batch(cfg, task, policy, descriptor=descr)
     assert k.shape == (8, 4, 1024), f"descriptor should fully override, got {k.shape}"
+
+
+def test_gemma4_full_attention_kv_write_uses_global_kv_heads():
+    """Full-attention Gemma4 layers return num_global_key_value_heads rows.
+    The cache writer must not fall back to num_attention_heads for batch-1
+    decode, or the write path asserts before any token can be generated."""
+    cfg = _gemma4_ish_config()
+    cfg.num_key_value_heads = 16
+    cfg.num_global_key_value_heads = 4
+
+    manager = KVCacheManager.__new__(KVCacheManager)
+    manager.block_config = cfg
+
+    assert manager._source_heads_per_batch(32, 4) == 4
+    assert manager._source_heads_per_batch(32, 16) == 16

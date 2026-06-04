@@ -232,6 +232,21 @@ class KVCacheManager:
 
         if 0 < kv_heads <= attention_heads and source_bh % kv_heads == 0:
             return int(kv_heads)
+
+        global_kv_heads = getattr(self.block_config, "num_global_key_value_heads", None)
+        try:
+            global_kv_heads = int(global_kv_heads) if global_kv_heads is not None else None
+        except (TypeError, ValueError):
+            global_kv_heads = None
+        if (
+            global_kv_heads is not None
+            and 0 < global_kv_heads <= attention_heads
+            and source_bh % global_kv_heads == 0
+        ):
+            return int(global_kv_heads)
+
+        if 0 < source_bh < attention_heads:
+            return source_bh
         return attention_heads
 
     def _get_slot_state_key_for_mb(self, mb_index: int) -> Optional[Tuple[int, int]]:
@@ -2229,6 +2244,6 @@ class KVCacheManager:
                     l_acc_target=cache_len, cache_tensors=cache_tensors,
                 )
 
-        except Exception as e:
-            import logging
-            logging.error(f"Async cache reorder failed: {e}")
+        except Exception:
+            logger.exception("Speculative cache reorder failed")
+            raise
