@@ -128,6 +128,36 @@ def test_zlib_wrapper_decompression_is_capped_to_declared_size():
         lt._decompress_with_algo(lt._ALGO_ZLIB, payload, 8)
 
 
+@pytest.mark.parametrize(
+    "algo_id",
+    [
+        lt._ALGO_ZSTD_BYTE_SPLIT,
+        lt._ALGO_ZSTD_DICT_BYTE_SPLIT,
+        lt._ALGO_ZSTD_BYTE_SPLIT_HIGH_ONLY,
+        lt._ALGO_ZSTD_DICT_BYTE_SPLIT_PREFILL,
+        lt._ALGO_ZSTD_DICT_BYTE_SPLIT_DECODE,
+    ],
+)
+def test_byte_split_wrappers_reject_invalid_elem_size(algo_id):
+    serialized = runtime_pb2.Tensor()
+    serialized.buffer = (
+        lt._HEADER_STRUCT.pack(lt._MAGIC, lt._VERSION, algo_id, 8)
+        + lt._BYTE_SPLIT_PAYLOAD_STRUCT.pack(0, 0)
+    )
+
+    with pytest.raises(ValueError, match="Unsupported byte-split elem_size=0"):
+        lt.unwrap_serialized_tensor(serialized)
+
+
+def test_lossless_wrappers_reject_oversized_declared_size(monkeypatch):
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_MAX_ORIGINAL_BYTES", "16")
+    serialized = runtime_pb2.Tensor()
+    serialized.buffer = lt._HEADER_STRUCT.pack(lt._MAGIC, lt._VERSION, lt._ALGO_ZLIB, 17) + zlib.compress(b"")
+
+    with pytest.raises(ValueError, match="original_size=17 exceeds maximum 16"):
+        lt.unwrap_serialized_tensor(serialized)
+
+
 def test_zipnn_compare_candidate_fp16(monkeypatch):
     tensor = _make_split_friendly_fp16().contiguous()
     debug_context = {

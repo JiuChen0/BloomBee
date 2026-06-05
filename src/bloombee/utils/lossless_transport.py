@@ -77,6 +77,8 @@ _LOSSLESS_ZSTD_DICT_PATH_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH"
 _LOSSLESS_ZSTD_DICT_PATH_PREFILL_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_PREFILL"
 _LOSSLESS_ZSTD_DICT_PATH_DECODE_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_DECODE"
 _LOSSLESS_HYBRID_DICT_BLOCKS_ENV = "BLOOMBEE_LOSSLESS_HYBRID_DICT_BLOCKS"
+_LOSSLESS_MAX_ORIGINAL_BYTES_ENV = "BLOOMBEE_LOSSLESS_MAX_ORIGINAL_BYTES"
+_DEFAULT_LOSSLESS_MAX_ORIGINAL_BYTES = 256 * 1024 * 1024
 _TRANSPORT_PROFILE_CTX: contextvars.ContextVar[Optional[Dict[str, float]]] = contextvars.ContextVar(
     "bloombee_transport_profile", default=None
 )
@@ -201,6 +203,40 @@ def _lossless_min_gain_bytes() -> int:
         return max(0, int(cfg_val))
     except Exception:
         return 32
+
+
+def _lossless_max_original_bytes() -> int:
+    cfg_val = _get_cfg("LOSSLESS_MAX_ORIGINAL_BYTES", _DEFAULT_LOSSLESS_MAX_ORIGINAL_BYTES)
+    if _allow_env_override() and _LOSSLESS_MAX_ORIGINAL_BYTES_ENV in os.environ:
+        return max(0, _get_env_int(_LOSSLESS_MAX_ORIGINAL_BYTES_ENV, _DEFAULT_LOSSLESS_MAX_ORIGINAL_BYTES))
+    try:
+        return max(0, int(cfg_val))
+    except Exception:
+        return _DEFAULT_LOSSLESS_MAX_ORIGINAL_BYTES
+
+
+def _validate_lossless_original_size(original_size: int) -> int:
+    original_size = int(original_size)
+    if original_size < 0:
+        raise ValueError(f"Invalid lossless wrapper original_size: {original_size}")
+    max_original_size = _lossless_max_original_bytes()
+    if original_size > max_original_size:
+        raise ValueError(
+            f"Lossless wrapper original_size={original_size} exceeds maximum {max_original_size}"
+        )
+    return original_size
+
+
+def _byte_split_lane_sizes(elem_size: int, original_size: int) -> tuple[int, int]:
+    elem_size = int(elem_size)
+    if elem_size not in (2, 4):
+        raise ValueError(f"Unsupported byte-split elem_size={elem_size}")
+    original_size = _validate_lossless_original_size(original_size)
+    if original_size % elem_size != 0:
+        raise ValueError(f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}")
+    extracted_raw_size = original_size // elem_size
+    remaining_raw_size = original_size - extracted_raw_size
+    return extracted_raw_size, remaining_raw_size
 
 
 def comp_ratio_profile_enabled() -> bool:
@@ -1802,11 +1838,8 @@ def _split_high_byte_lane(raw: bytes, elem_size: int) -> tuple[bytes, bytes]:
 
 
 def _reconstruct_high_byte_lane(extracted: bytes, remaining: bytes, elem_size: int, original_size: int) -> bytes:
-    if elem_size <= 0 or original_size % elem_size != 0:
-        raise ValueError(f"Invalid byte-split original_size={original_size} elem_size={elem_size}")
-    numel = original_size // elem_size
-    extracted_size = numel
-    remaining_size = original_size - extracted_size
+    extracted_size, remaining_size = _byte_split_lane_sizes(elem_size, original_size)
+    original_size = extracted_size + remaining_size
     if len(extracted) != extracted_size:
         raise ValueError(f"Invalid extracted byte-split size: expected {extracted_size}, got {len(extracted)}")
     if len(remaining) != remaining_size:
@@ -1982,6 +2015,7 @@ def _decompress_zlib_capped(payload: bytes, original_size: int) -> bytes:
 
 
 def _decompress_with_algo(algo_id: int, payload: bytes, original_size: int) -> bytes:
+    original_size = _validate_lossless_original_size(original_size)
     t0 = time.perf_counter()
     if algo_id == _ALGO_ZSTD:
         decompressor = _get_zstd_decompressor()
@@ -2104,12 +2138,11 @@ def _decode_zstd_dict_byte_split_phase_payload(payload: bytes, original_size: in
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
         raise ValueError("zstd-dict-phase byte-split payload is truncated")
     elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
+    extracted_raw_size, remaining_raw_size = _byte_split_lane_sizes(elem_size, original_size)
     extracted_start = _BYTE_SPLIT_PAYLOAD_SIZE
     extracted_end = extracted_start + int(extracted_comp_size)
     if extracted_end > len(payload):
         raise ValueError("zstd-dict-phase byte-split payload extracted segment is truncated")
-    if original_size % max(1, elem_size) != 0:
-        raise ValueError(f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}")
 
     if phase == "prefill":
         decompressor = _get_zstd_dict_decompressor_prefill()
@@ -2122,8 +2155,6 @@ def _decode_zstd_dict_byte_split_phase_payload(payload: bytes, original_size: in
 
     extracted_comp = payload[extracted_start:extracted_end]
     remaining_comp = payload[extracted_end:]
-    extracted_raw_size = original_size // elem_size
-    remaining_raw_size = original_size - extracted_raw_size
 
     t0 = time.perf_counter()
     extracted_raw = decompressor.decompress(extracted_comp, max_output_size=extracted_raw_size)
@@ -2139,6 +2170,7 @@ def _decode_zstd_byte_split_payload(payload: bytes, original_size: int) -> bytes
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
         raise ValueError("Byte-split payload is truncated")
     elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
+    extracted_raw_size, remaining_raw_size = _byte_split_lane_sizes(elem_size, original_size)
     extracted_start = _BYTE_SPLIT_PAYLOAD_SIZE
     extracted_end = extracted_start + int(extracted_comp_size)
     if extracted_end > len(payload):
@@ -2146,11 +2178,7 @@ def _decode_zstd_byte_split_payload(payload: bytes, original_size: int) -> bytes
 
     extracted_comp = payload[extracted_start:extracted_end]
     remaining_comp = payload[extracted_end:]
-    if original_size % max(1, elem_size) != 0:
-        raise ValueError(f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}")
 
-    extracted_raw_size = original_size // elem_size
-    remaining_raw_size = original_size - extracted_raw_size
     extracted_raw = _decompress_with_algo(_ALGO_ZSTD, extracted_comp, extracted_raw_size)
     remaining_raw = _decompress_with_algo(_ALGO_ZSTD, remaining_comp, remaining_raw_size)
     return _reconstruct_high_byte_lane(extracted_raw, remaining_raw, elem_size, original_size)
@@ -2183,19 +2211,14 @@ def _decode_zstd_byte_split_high_only_payload(payload: bytes, original_size: int
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
         raise ValueError("byte_split_high_only payload is truncated")
     elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
+    extracted_raw_size, remaining_raw_size = _byte_split_lane_sizes(elem_size, original_size)
     start = _BYTE_SPLIT_PAYLOAD_SIZE
     end = start + int(extracted_comp_size)
     if end > len(payload):
         raise ValueError("byte_split_high_only extracted segment is truncated")
-    if original_size % max(1, elem_size) != 0:
-        raise ValueError(
-            f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}"
-        )
 
     extracted_comp = payload[start:end]
     remaining_raw = bytes(payload[end:])
-    extracted_raw_size = original_size // elem_size
-    remaining_raw_size = original_size - extracted_raw_size
     if len(remaining_raw) != remaining_raw_size:
         raise ValueError(
             f"byte_split_high_only low-lane size mismatch: expected {remaining_raw_size}, got {len(remaining_raw)}"
@@ -2209,12 +2232,11 @@ def _decode_zstd_dict_byte_split_payload(payload: bytes, original_size: int) -> 
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
         raise ValueError("zstd-dict byte-split payload is truncated")
     elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
+    extracted_raw_size, remaining_raw_size = _byte_split_lane_sizes(elem_size, original_size)
     extracted_start = _BYTE_SPLIT_PAYLOAD_SIZE
     extracted_end = extracted_start + int(extracted_comp_size)
     if extracted_end > len(payload):
         raise ValueError("zstd-dict byte-split payload extracted segment is truncated")
-    if original_size % max(1, elem_size) != 0:
-        raise ValueError(f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}")
 
     decompressor = _get_zstd_dict_decompressor()
     if decompressor is None:
@@ -2222,8 +2244,6 @@ def _decode_zstd_dict_byte_split_payload(payload: bytes, original_size: int) -> 
 
     extracted_comp = payload[extracted_start:extracted_end]
     remaining_comp = payload[extracted_end:]
-    extracted_raw_size = original_size // elem_size
-    remaining_raw_size = original_size - extracted_raw_size
 
     t0 = time.perf_counter()
     extracted_raw = decompressor.decompress(extracted_comp, max_output_size=extracted_raw_size)
