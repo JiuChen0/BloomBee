@@ -51,10 +51,56 @@ _ALGO_ZSTD_DICT_BYTE_SPLIT = 5
 _ALGO_ZSTD_BYTE_SPLIT_HIGH_ONLY = 6
 _ALGO_ZSTD_DICT_BYTE_SPLIT_PREFILL = 7
 _ALGO_ZSTD_DICT_BYTE_SPLIT_DECODE = 8
+_BYTE_SPLIT_ALGOS = {
+    _ALGO_ZSTD_BYTE_SPLIT,
+    _ALGO_ZSTD_DICT_BYTE_SPLIT,
+    _ALGO_ZSTD_BYTE_SPLIT_HIGH_ONLY,
+    _ALGO_ZSTD_DICT_BYTE_SPLIT_PREFILL,
+    _ALGO_ZSTD_DICT_BYTE_SPLIT_DECODE,
+}
 _HEADER_STRUCT = struct.Struct("!4sBBQ")
 _HEADER_SIZE = _HEADER_STRUCT.size
 _BYTE_SPLIT_PAYLOAD_STRUCT = struct.Struct("!BI")
 _BYTE_SPLIT_PAYLOAD_SIZE = _BYTE_SPLIT_PAYLOAD_STRUCT.size
+
+_DTYPE_ELEMENT_SIZES = {
+    "bool": 1,
+    "torch.bool": 1,
+    "uint8": 1,
+    "torch.uint8": 1,
+    "int8": 1,
+    "torch.int8": 1,
+    "int16": 2,
+    "torch.int16": 2,
+    "short": 2,
+    "torch.short": 2,
+    "float16": 2,
+    "torch.float16": 2,
+    "half": 2,
+    "torch.half": 2,
+    "bfloat16": 2,
+    "torch.bfloat16": 2,
+    "int32": 4,
+    "torch.int32": 4,
+    "int": 4,
+    "torch.int": 4,
+    "float32": 4,
+    "torch.float32": 4,
+    "float": 4,
+    "torch.float": 4,
+    "complex64": 8,
+    "torch.complex64": 8,
+    "int64": 8,
+    "torch.int64": 8,
+    "long": 8,
+    "torch.long": 8,
+    "float64": 8,
+    "torch.float64": 8,
+    "double": 8,
+    "torch.double": 8,
+    "complex128": 16,
+    "torch.complex128": 16,
+}
 
 _MISSING_ZSTD_WARNING_EMITTED = False
 _MISSING_ZIPNN_WARNING_EMITTED = False
@@ -77,6 +123,8 @@ _LOSSLESS_ZSTD_DICT_PATH_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH"
 _LOSSLESS_ZSTD_DICT_PATH_PREFILL_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_PREFILL"
 _LOSSLESS_ZSTD_DICT_PATH_DECODE_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_DECODE"
 _LOSSLESS_HYBRID_DICT_BLOCKS_ENV = "BLOOMBEE_LOSSLESS_HYBRID_DICT_BLOCKS"
+_LOSSLESS_MAX_ORIGINAL_BYTES_ENV = "BLOOMBEE_LOSSLESS_MAX_ORIGINAL_BYTES"
+_LOSSLESS_ZIPNN_TRANSPORT_ENV = "BLOOMBEE_LOSSLESS_ZIPNN_TRANSPORT"
 _TRANSPORT_PROFILE_CTX: contextvars.ContextVar[Optional[Dict[str, float]]] = contextvars.ContextVar(
     "bloombee_transport_profile", default=None
 )
@@ -201,6 +249,28 @@ def _lossless_min_gain_bytes() -> int:
         return max(0, int(cfg_val))
     except Exception:
         return 32
+
+
+def _lossless_max_original_bytes() -> int:
+    cfg_val = _get_cfg("LOSSLESS_MAX_ORIGINAL_BYTES", 256 * 1024 * 1024)
+    if _allow_env_override():
+        for env_name in (_LOSSLESS_MAX_ORIGINAL_BYTES_ENV, "LOSSLESS_MAX_ORIGINAL_BYTES"):
+            if env_name in os.environ:
+                return max(0, _get_env_int(env_name, 256 * 1024 * 1024))
+    try:
+        return max(0, int(cfg_val))
+    except Exception:
+        return 256 * 1024 * 1024
+
+
+def _zipnn_transport_enabled() -> bool:
+    cfg_val = _get_cfg("ENABLE_ZIPNN_TRANSPORT", 0)
+    if _allow_env_override() and _LOSSLESS_ZIPNN_TRANSPORT_ENV in os.environ:
+        return _get_env_bool(_LOSSLESS_ZIPNN_TRANSPORT_ENV, "0")
+    try:
+        return bool(int(cfg_val))
+    except Exception:
+        return bool(cfg_val)
 
 
 def comp_ratio_profile_enabled() -> bool:
@@ -1423,7 +1493,7 @@ def _supports_zipnn_transport(
     raw_size: int,
     debug_context: Optional[Dict[str, object]],
 ) -> bool:
-    return _supports_zipnn_compare(tensor, compression_type, raw_size, debug_context)
+    return _zipnn_transport_enabled() and _supports_zipnn_compare(tensor, compression_type, raw_size, debug_context)
 
 
 def _zipnn_skip_reason(
@@ -1432,6 +1502,8 @@ def _zipnn_skip_reason(
     raw_size: int,
     debug_context: Optional[Dict[str, object]],
 ) -> str:
+    if not _zipnn_transport_enabled():
+        return "zipnn_transport_disabled"
     if _ZipNN is None:
         _warn_missing_zipnn_once()
         return "zipnn_unavailable"
@@ -1829,6 +1901,25 @@ def _reconstruct_high_byte_lane(extracted: bytes, remaining: bytes, elem_size: i
     raise ValueError(f"Unsupported byte-split elem_size={elem_size}")
 
 
+def _validate_byte_split_elem_size(elem_size: int, original_size: int) -> None:
+    if elem_size not in (2, 4):
+        raise ValueError(f"Unsupported byte-split elem_size={elem_size}")
+    if original_size % elem_size != 0:
+        raise ValueError(f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}")
+
+
+def _validate_byte_split_payload_elem_size(payload: bytes, expected_elem_size: int) -> None:
+    if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
+        raise ValueError("Byte-split payload is truncated")
+    if expected_elem_size not in (2, 4):
+        raise ValueError(f"Unsupported byte-split tensor elem_size={expected_elem_size}")
+    elem_size, _ = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
+    if elem_size != expected_elem_size:
+        raise ValueError(
+            f"Byte-split elem_size mismatch: expected {expected_elem_size} from tensor metadata, got {elem_size}"
+        )
+
+
 @lru_cache(maxsize=16)
 def _get_zstd_compressor(level: int):
     if _zstd is None:
@@ -1991,6 +2082,8 @@ def _decompress_with_algo(algo_id: int, payload: bytes, original_size: int) -> b
     elif algo_id == _ALGO_ZLIB:
         raw = _decompress_zlib_capped(payload, original_size)
     elif algo_id == _ALGO_ZIPNN:
+        if not _zipnn_transport_enabled():
+            raise ValueError("ZipNN lossless transport requires BLOOMBEE_LOSSLESS_ZIPNN_TRANSPORT=1")
         decompressor = _get_zipnn_decompressor()
         if decompressor is None:
             raise RuntimeError("Received ZipNN-wrapped tensor, but 'zipnn' is not installed")
@@ -2108,8 +2201,7 @@ def _decode_zstd_dict_byte_split_phase_payload(payload: bytes, original_size: in
     extracted_end = extracted_start + int(extracted_comp_size)
     if extracted_end > len(payload):
         raise ValueError("zstd-dict-phase byte-split payload extracted segment is truncated")
-    if original_size % max(1, elem_size) != 0:
-        raise ValueError(f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}")
+    _validate_byte_split_elem_size(elem_size, original_size)
 
     if phase == "prefill":
         decompressor = _get_zstd_dict_decompressor_prefill()
@@ -2146,8 +2238,7 @@ def _decode_zstd_byte_split_payload(payload: bytes, original_size: int) -> bytes
 
     extracted_comp = payload[extracted_start:extracted_end]
     remaining_comp = payload[extracted_end:]
-    if original_size % max(1, elem_size) != 0:
-        raise ValueError(f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}")
+    _validate_byte_split_elem_size(elem_size, original_size)
 
     extracted_raw_size = original_size // elem_size
     remaining_raw_size = original_size - extracted_raw_size
@@ -2187,10 +2278,7 @@ def _decode_zstd_byte_split_high_only_payload(payload: bytes, original_size: int
     end = start + int(extracted_comp_size)
     if end > len(payload):
         raise ValueError("byte_split_high_only extracted segment is truncated")
-    if original_size % max(1, elem_size) != 0:
-        raise ValueError(
-            f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}"
-        )
+    _validate_byte_split_elem_size(elem_size, original_size)
 
     extracted_comp = payload[start:end]
     remaining_raw = bytes(payload[end:])
@@ -2213,8 +2301,7 @@ def _decode_zstd_dict_byte_split_payload(payload: bytes, original_size: int) -> 
     extracted_end = extracted_start + int(extracted_comp_size)
     if extracted_end > len(payload):
         raise ValueError("zstd-dict byte-split payload extracted segment is truncated")
-    if original_size % max(1, elem_size) != 0:
-        raise ValueError(f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}")
+    _validate_byte_split_elem_size(elem_size, original_size)
 
     decompressor = _get_zstd_dict_decompressor()
     if decompressor is None:
@@ -2252,6 +2339,57 @@ def _parse_wrapper(buffer: bytes, *, strict: bool = True):
 
     payload = buffer[_HEADER_SIZE:]
     return algo_id, original_size, payload
+
+
+def _serialized_tensor_dtype_element_size(serialized_tensor: runtime_pb2.Tensor) -> int:
+    dtype_name = str(getattr(serialized_tensor, "dtype", "")).strip()
+    elem_size = _DTYPE_ELEMENT_SIZES.get(dtype_name)
+    if elem_size is None and dtype_name.startswith("torch."):
+        elem_size = _DTYPE_ELEMENT_SIZES.get(dtype_name[len("torch."):])
+    if elem_size is None:
+        raise ValueError(f"Unsupported lossless wrapper tensor dtype: {dtype_name!r}")
+    return elem_size
+
+
+def _serialized_tensor_expected_raw_bytes(serialized_tensor: runtime_pb2.Tensor) -> tuple[int, int, str, int]:
+    compression = getattr(serialized_tensor, "compression", runtime_pb2.CompressionType.NONE)
+    if compression != runtime_pb2.CompressionType.NONE:
+        raise ValueError("Lossless wrapper cannot be used with Hivemind-compressed tensor payloads")
+
+    dtype_name = str(getattr(serialized_tensor, "dtype", "")).strip()
+    elem_size = _serialized_tensor_dtype_element_size(serialized_tensor)
+    numel = 1
+    for dim in getattr(serialized_tensor, "size", ()):
+        dim = int(dim)
+        if dim < 0:
+            raise ValueError(f"Invalid lossless wrapper tensor dimension: {dim}")
+        numel *= dim
+    return numel * elem_size, elem_size, dtype_name, numel
+
+
+def _validate_lossless_wrapper_metadata(
+    serialized_tensor: runtime_pb2.Tensor,
+    original_size: int,
+) -> tuple[int, int]:
+    if original_size < 0:
+        raise ValueError(f"Invalid lossless wrapper original_size: {original_size}")
+
+    expected_size, elem_size, dtype_name, numel = _serialized_tensor_expected_raw_bytes(serialized_tensor)
+    if original_size != expected_size:
+        if dtype_name in ("bfloat16", "torch.bfloat16") and original_size == numel * 4:
+            expected_size = original_size
+            elem_size = 4
+        else:
+            raise ValueError(
+                f"Lossless wrapper original_size mismatch: expected {expected_size} from tensor metadata, got {original_size}"
+            )
+
+    max_original_size = _lossless_max_original_bytes()
+    if max_original_size and original_size > max_original_size:
+        raise ValueError(
+            f"Lossless wrapper original_size {original_size} exceeds configured limit {max_original_size}"
+        )
+    return expected_size, elem_size
 
 
 
@@ -2519,6 +2657,10 @@ def unwrap_serialized_tensor(serialized_tensor: runtime_pb2.Tensor) -> runtime_p
             return serialized_tensor
 
         algo_id, original_size, payload = parsed
+        _, expected_elem_size = _validate_lossless_wrapper_metadata(serialized_tensor, original_size)
+        if algo_id in _BYTE_SPLIT_ALGOS:
+            _validate_byte_split_payload_elem_size(payload, expected_elem_size)
+
         if algo_id == _ALGO_ZSTD_BYTE_SPLIT:
             raw_buffer = _decode_zstd_byte_split_payload(payload, original_size)
         elif algo_id == _ALGO_ZSTD_DICT_BYTE_SPLIT:

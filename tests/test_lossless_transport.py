@@ -128,6 +128,43 @@ def test_zlib_wrapper_decompression_is_capped_to_declared_size():
         lt._decompress_with_algo(lt._ALGO_ZLIB, payload, 8)
 
 
+def test_lossless_wrapper_declared_size_must_match_tensor_metadata():
+    tensor = torch.arange(16, dtype=torch.float16).reshape(4, 4)
+    serialized = lt.serialize_torch_tensor(tensor, runtime_pb2.CompressionType.NONE)
+    raw = memoryview(tensor.numpy()).cast("B").tobytes()
+
+    forged = runtime_pb2.Tensor()
+    forged.CopyFrom(serialized)
+    forged.buffer = (
+        lt._HEADER_STRUCT.pack(lt._MAGIC, lt._VERSION, lt._ALGO_ZLIB, len(raw) + 2)
+        + zlib.compress(raw)
+    )
+
+    with pytest.raises(ValueError, match="original_size mismatch"):
+        lt.unwrap_serialized_tensor(forged)
+
+
+def test_byte_split_elem_size_must_match_tensor_dtype():
+    tensor = torch.arange(16, dtype=torch.float16).reshape(4, 4)
+    serialized = lt.serialize_torch_tensor(tensor, runtime_pb2.CompressionType.NONE)
+    raw = memoryview(tensor.numpy()).cast("B").tobytes()
+
+    forged = runtime_pb2.Tensor()
+    forged.CopyFrom(serialized)
+    forged.buffer = lt._build_zstd_byte_split_wrapper(raw, elem_size=4)
+
+    with pytest.raises(ValueError, match="elem_size mismatch"):
+        lt.unwrap_serialized_tensor(forged)
+
+
+def test_zipnn_receive_requires_explicit_transport_opt_in(monkeypatch):
+    monkeypatch.delenv("BLOOMBEE_LOSSLESS_ZIPNN_TRANSPORT", raising=False)
+    _clear_transport_caches()
+
+    with pytest.raises(ValueError, match="ZipNN lossless transport requires"):
+        lt._decompress_with_algo(lt._ALGO_ZIPNN, b"", 0)
+
+
 def test_zipnn_compare_candidate_fp16(monkeypatch):
     tensor = _make_split_friendly_fp16().contiguous()
     debug_context = {
@@ -180,6 +217,7 @@ def test_serialize_torch_tensor_zipnn_roundtrip(monkeypatch):
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_BYTES", "0")
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_GAIN_BYTES", "0")
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_LAYOUT_TARGETS", "*:*:hidden_states")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_ZIPNN_TRANSPORT", "1")
     _clear_transport_caches()
 
     serialized = lt.serialize_torch_tensor(
@@ -205,6 +243,7 @@ def test_adaptive_hybrid_routes_dict_only_for_first_prefill_stage(monkeypatch):
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_GAIN_BYTES", "0")
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_LAYOUT_TARGETS", "*:*:hidden_states")
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_HYBRID_DICT_BLOCKS", "0:20")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_ZIPNN_TRANSPORT", "1")
     _clear_transport_caches()
 
     raw_size = tensor.numel() * tensor.element_size()
