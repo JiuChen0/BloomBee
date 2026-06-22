@@ -22,6 +22,7 @@ import torch
 from hivemind.utils import TensorDescriptor
 
 from bloombee.flexgen_utils.pytorch_backend import TorchDevice
+from bloombee.server.memory_cache_manager import KVCacheManager
 
 
 def _gemma4_ish_config():
@@ -125,3 +126,40 @@ def test_descriptor_vs_config_mismatch_uses_descriptor(device):
 
     k, v = device.init_cache_one_gpu_batch(cfg, task, policy, descriptor=descr)
     assert k.shape == (8, 4, 1024), f"descriptor should fully override, got {k.shape}"
+
+
+def test_gemma4_full_attention_kv_write_uses_global_kv_heads():
+    """Full-attention Gemma-4 layers emit global KV heads, not sliding KV heads.
+
+    Legacy full-batch metadata does not pass the runtime batch size, so the
+    cache manager must use the emitted head_dim to distinguish full vs sliding
+    layer KV shapes.
+    """
+    manager = SimpleNamespace(
+        block_config=SimpleNamespace(
+            num_attention_heads=32,
+            num_key_value_heads=4,
+            num_global_key_value_heads=2,
+            head_dim=256,
+            global_head_dim=512,
+        )
+    )
+
+    assert KVCacheManager._source_heads_per_batch(
+        manager,
+        attention_heads=32,
+        source_bh=2,
+        source_head_dim=512,
+    ) == 2
+    assert KVCacheManager._source_heads_per_batch(
+        manager,
+        attention_heads=32,
+        source_bh=4,
+        source_head_dim=512,
+    ) == 2
+    assert KVCacheManager._source_heads_per_batch(
+        manager,
+        attention_heads=32,
+        source_bh=4,
+        source_head_dim=256,
+    ) == 4

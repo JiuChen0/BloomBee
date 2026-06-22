@@ -197,6 +197,7 @@ class KVCacheManager:
         source_bh: int,
         full_batch_size: int = 0,
         micro_batch_size: int = 0,
+        source_head_dim: int = 0,
     ) -> int:
         """Infer how many source KV rows belong to each batch item.
 
@@ -215,6 +216,34 @@ class KVCacheManager:
                 if 0 < heads <= attention_heads:
                     return int(heads)
 
+        try:
+            source_head_dim = int(source_head_dim)
+        except (TypeError, ValueError):
+            source_head_dim = 0
+
+        global_head_dim = getattr(self.block_config, "global_head_dim", None)
+        global_kv_heads = getattr(self.block_config, "num_global_key_value_heads", None)
+        config_head_dim = getattr(self.block_config, "head_dim", None)
+        try:
+            global_head_dim = int(global_head_dim) if global_head_dim is not None else None
+            global_kv_heads = int(global_kv_heads) if global_kv_heads is not None else None
+            config_head_dim = int(config_head_dim) if config_head_dim is not None else None
+        except (TypeError, ValueError):
+            global_head_dim = None
+            global_kv_heads = None
+            config_head_dim = None
+
+        if (
+            source_head_dim > 0
+            and global_head_dim is not None
+            and global_head_dim != config_head_dim
+            and source_head_dim == global_head_dim
+            and global_kv_heads is not None
+            and 0 < global_kv_heads <= attention_heads
+            and source_bh % global_kv_heads == 0
+        ):
+            return int(global_kv_heads)
+
         kv_heads = getattr(self.block_config, "num_key_value_heads", None)
         if kv_heads is None:
             groups = getattr(self.block_config, "num_key_value_groups", None)
@@ -232,6 +261,12 @@ class KVCacheManager:
 
         if 0 < kv_heads <= attention_heads and source_bh % kv_heads == 0:
             return int(kv_heads)
+        if (
+            global_kv_heads is not None
+            and 0 < global_kv_heads <= attention_heads
+            and source_bh % global_kv_heads == 0
+        ):
+            return int(global_kv_heads)
         return attention_heads
 
     def _get_slot_state_key_for_mb(self, mb_index: int) -> Optional[Tuple[int, int]]:
@@ -724,11 +759,9 @@ class KVCacheManager:
         if full_batch_size > 0 and micro_batch_size > 0:
             if gpu_multiplexing:
                 if hasattr(k_cache, "device") and getattr(getattr(k_cache, "device", None), "device_type", None) == DeviceType.MIXED:
-                    self._log_kv_once(
-                        ("kv_mixed_multiplex_unsupported", int(full_batch_size), int(micro_batch_size)),
-                        "[KVCACHE_OFFLOAD_UNSUPPORTED] MixedDevice cache + GPU multiplexing is not equivalent to per-microbatch KV staging. "
-                        "cache_gpu/cache_cpu splits one micro-batch across devices, but does not preserve separate KV snapshots for other micro-batches. "
-                        "This can change activation values and make wire-byte compression ratios look artificially better.",
+                    raise RuntimeError(
+                        "MixedDevice KV cache is incompatible with GPU multiplexing. "
+                        "Disable BLOOMBEE_MICRO_ENABLE_GPU_MULTIPLEXING or use a non-Mixed cache policy."
                     )
                 mb_index = self._compute_microbatch_index(batch_offset, micro_batch_size, full_batch_size)
                 working_slot, slot_batch_start, active_batch_size, _ = self._resolve_working_slot(
@@ -1437,6 +1470,11 @@ class KVCacheManager:
         # [MBPIPE_MULTIPLEX] Detect GPU multiplexing mode by actual cache capacity.
         # Multiplexing is active when allocated cache capacity is smaller than logical full batch.
         gpu_multiplexing = (full_batch_size > 0 and cache_batch_size < full_batch_size)
+        if gpu_multiplexing and hasattr(k_cache, "device") and getattr(getattr(k_cache, "device", None), "device_type", None) == DeviceType.MIXED:
+            raise RuntimeError(
+                "MixedDevice KV cache is incompatible with GPU multiplexing. "
+                "Disable BLOOMBEE_MICRO_ENABLE_GPU_MULTIPLEXING or use a non-Mixed cache policy."
+            )
         if micro_batch_size > 0 and gpu_multiplexing:
             policy_mb = max(1, int(getattr(self.offloading_policy, "gpu_batch_size", 1)))
             runtime_mb = int(micro_batch_size)
@@ -1525,7 +1563,13 @@ class KVCacheManager:
         BH_src, D_src, s_new = key_t.shape
         assert value_t.shape == (BH_src, s_new, D_src), f"value shape {value_t.shape} != (BH, s_new, D)"
         assert D_src == D_dst, f"D mismatch: src {D_src} vs dst {D_dst}"
-        source_heads = self._source_heads_per_batch(H, BH_src, full_batch_size, micro_batch_size)
+        source_heads = self._source_heads_per_batch(
+            H,
+            BH_src,
+            full_batch_size,
+            micro_batch_size,
+            source_head_dim=D_src,
+        )
         assert BH_src % source_heads == 0, (
             f"BH_src={BH_src} not divisible by source_heads={source_heads}"
         )

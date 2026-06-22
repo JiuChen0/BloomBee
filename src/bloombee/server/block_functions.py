@@ -1144,6 +1144,9 @@ async def iterate_rpc_inference(
                 asyncio.create_task(
                     cross_stage_push_fn(push_hidden, push_keep, push_metadata)
                 )
+                # This relay already sent each micro-batch downstream; prevent
+                # the handler from also pushing the merged full batch.
+                step_metadata["cross_stage_pushed"] = True
                 
                 if log_mb_detail:
                     logger.info(
