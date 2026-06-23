@@ -323,11 +323,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         attention_mask: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
         rotary_position_ids: Optional[torch.Tensor],
-    ) -> Optional[Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]]:
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """One transformer block forward pass on a (chunked) hidden-states slice.
 
-        Chunk-level seam. Returns (output_hidden_states_chunk, new_kvs) or None
-        on failure.
+        Chunk-level seam. Returns (output_hidden_states_chunk, new_kvs).
         """
         forward_result = self.module.forward(
             hidden_states_chunk,
@@ -338,8 +337,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             rotary_position_ids=rotary_position_ids,
         )
         if forward_result is None:
-            logger.info(" ERROR: module.forward returned None!")
-            return None
+            raise RuntimeError(f"module.forward returned None for block {self.name}")
         output_hidden_states_chunk, new_kvs = forward_result
         return output_hidden_states_chunk, new_kvs
 
@@ -669,31 +667,31 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     # Add offset to cached base tensor (avoids creating new tensor)
                     position_ids = self._position_ids_cache[cache_key] + (cache_len + offset)
                     if self._is_spec_decoding:
+                        spec_prefill_length = self._normalize_spec_prefill_length(
+                            inference_info.prefill_length,
+                            batch_size=batch_size,
+                            device=hidden_states.device,
+                        )
                         rotary_position_ids = self._create_tree_position_ids_with_invalid_cache(
                             width=1,
                             depth=4,
-                            prefill_length=inference_info.prefill_length - 1,
+                            prefill_length=spec_prefill_length,
                             kv_cache_position_ids=kv_cache_position_ids,
                             batch_offset=inference_info.batch_offset,
-                            device="cuda",
-                            target_seq_len=seq_len)
+                            device=hidden_states.device,
+                            target_seq_len=seq_len,
+                            batch_size=batch_size,
+                        )
                     else:
                         rotary_position_ids = None
                     
-                    try:
-                        step_result = self._run_block_forward(
-                            hidden_states_chunk,
-                            layer_past=layer_past,
-                            attention_mask=attention_mask,
-                            position_ids=position_ids,
-                            rotary_position_ids=rotary_position_ids,
-                        )
-                        if step_result is None:
-                            return (hidden_states, None)
-                        output_hidden_states_chunk, new_kvs = step_result
-                    except Exception as e:
-                        logger.exception("ERROR in module.forward: %s: %s", type(e).__name__, e)
-                        return (hidden_states, None)
+                    output_hidden_states_chunk, new_kvs = self._run_block_forward(
+                        hidden_states_chunk,
+                        layer_past=layer_past,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        rotary_position_ids=rotary_position_ids,
+                    )
 
                     if seq_len > max_chunk_length:
                         output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk
@@ -784,7 +782,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 inference_info.prefix_length if 'inference_info' in locals() else None,
                 e,
             )
-            return (hidden_states, None)  # Return original input as fallback
+            raise
 
     def _normalize_keep_indices(
         self,
@@ -847,6 +845,37 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         if not is_dummy(hypo_ids):
             for cache_tensor in cache_tensors:
                 cache_tensor[...] = cache_tensor[hypo_ids.to(cache_tensor.device)]  # in-place reorder cache by hypo ids
+
+    def _normalize_spec_prefill_length(
+        self,
+        prefill_length: Any,
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Speculative rotary IDs historically use prefill_length - 1. Normalize
+        that value to a per-batch tensor before the tree-position helper so
+        cross-stage scalar metadata cannot crash the block forward path.
+        """
+        if prefill_length is None:
+            lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
+        elif torch.is_tensor(prefill_length):
+            if is_dummy(prefill_length):
+                lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
+            else:
+                lengths = prefill_length.to(device)
+        else:
+            lengths = torch.as_tensor(prefill_length, device=device)
+
+        lengths = lengths - 1
+        max_len = int(torch.nan_to_num(lengths.float(), nan=0.0).max().item()) if lengths.numel() > 0 else 0
+        return self._normalize_kv_valid_lengths(
+            kv_valid_lengths=lengths,
+            batch_size=batch_size,
+            max_kv_len=max(0, max_len, 1_000_000),
+            device=device,
+        )
 
     def _create_tree_position_ids(
         self, 
@@ -946,11 +975,32 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         batch_offset,
         device: torch.device,
         target_seq_len: Optional[int] = None,  # target sequence length (length of hidden_states)
+        batch_size: Optional[int] = None,
     ) -> torch.Tensor:
-        B = prefill_length.shape[0]
-        
         if isinstance(device, str):
             device = torch.device(device)
+
+        if not torch.is_tensor(prefill_length):
+            prefill_length = torch.as_tensor(0 if prefill_length is None else prefill_length, device=device)
+        else:
+            prefill_length = prefill_length.to(device)
+
+        if batch_size is None:
+            if prefill_length.ndim >= 1 and prefill_length.shape[0] > 0:
+                batch_size = int(prefill_length.shape[0])
+            elif torch.is_tensor(kv_cache_position_ids) and kv_cache_position_ids.ndim >= 2:
+                batch_size = int(kv_cache_position_ids.shape[0])
+            else:
+                batch_size = 1
+
+        prefill_cap = int(torch.nan_to_num(prefill_length.float(), nan=0.0).max().item()) if prefill_length.numel() > 0 else 0
+        prefill_length = self._normalize_kv_valid_lengths(
+            kv_valid_lengths=prefill_length,
+            batch_size=int(batch_size),
+            max_kv_len=max(0, prefill_cap, 1_000_000),
+            device=device,
+        )
+        B = int(batch_size)
         
         # 1. Build the tree template
         tree_position_ids_list = []
@@ -965,8 +1015,6 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
         # 2. Decide whether this is the prefill phase
         is_prefill = (kv_cache_position_ids is None or kv_cache_position_ids.numel() == 0)
-
-        prefill_length = prefill_length.to(device)
 
         if is_prefill:
             # Prefill phase
