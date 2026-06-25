@@ -209,13 +209,6 @@ class KVCacheManager:
         attention_heads = max(1, int(attention_heads))
         source_bh = int(source_bh)
 
-        if full_batch_size > 0 and micro_batch_size > 0:
-            runtime_batch = int(micro_batch_size)
-            if runtime_batch > 0 and source_bh % runtime_batch == 0:
-                heads = source_bh // runtime_batch
-                if 0 < heads <= attention_heads:
-                    return int(heads)
-
         if source_head_dim is not None:
             try:
                 source_head_dim = int(source_head_dim)
@@ -256,6 +249,13 @@ class KVCacheManager:
                     and source_bh % global_kv_heads == 0
                 ):
                     return int(global_kv_heads)
+
+        if full_batch_size > 0 and micro_batch_size > 0:
+            runtime_batch = int(micro_batch_size)
+            if runtime_batch > 0 and source_bh % runtime_batch == 0:
+                heads = source_bh // runtime_batch
+                if 0 < heads <= attention_heads:
+                    return int(heads)
 
         kv_heads = getattr(self.block_config, "num_key_value_heads", None)
         if kv_heads is None:

@@ -159,6 +159,23 @@ def test_gemma4_full_attention_kv_write_uses_global_kv_heads():
     assert torch.count_nonzero(v_cache_data[row, 10:16, :]) == 0
 
 
+def test_gemma4_global_head_dim_overrides_runtime_batch_inference():
+    manager = _make_kv_cache_manager(max_tokens=1024)
+    manager.block_config.num_attention_heads = 8
+    manager.block_config.num_key_value_heads = 4
+    manager.block_config.num_global_key_value_heads = 2
+    manager.block_config.head_dim = 8
+    manager.block_config.global_head_dim = 16
+
+    assert manager._source_heads_per_batch(
+        attention_heads=8,
+        source_bh=2,
+        full_batch_size=3,
+        micro_batch_size=2,
+        source_head_dim=16,
+    ) == 2
+
+
 @pytest.mark.asyncio
 async def test_cache_timeout():
     manager = _make_kv_cache_manager(max_tokens=1024, max_alloc_timeout=0.5)
