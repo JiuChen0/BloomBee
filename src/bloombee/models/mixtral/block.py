@@ -57,9 +57,10 @@ class WrappedMixtralBlock(MixtralDecoderLayer):
         elif use_cache:
             past_key_value = make_empty_kv_cache(self.layer_idx)
 
-        # tf 5.x attention implementations handle causal masking internally when
-        # attention_mask=None. No need for the deprecated _prepare_4d_causal_* helpers.
-        attention_mask = None
+        if attention_mask is not None and attention_mask.dim() == 3:
+            # BloomBee's backend builds masks as [B, S, K]; Mixtral attention
+            # expects [B, 1, S, K] so it broadcasts across attention heads.
+            attention_mask = attention_mask.unsqueeze(1)
 
         position_ids = kwargs.pop("position_ids", None)
         if position_ids is None:

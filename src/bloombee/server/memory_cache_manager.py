@@ -197,6 +197,7 @@ class KVCacheManager:
         source_bh: int,
         full_batch_size: int = 0,
         micro_batch_size: int = 0,
+        source_head_dim: Optional[int] = None,
     ) -> int:
         """Infer how many source KV rows belong to each batch item.
 
@@ -214,6 +215,47 @@ class KVCacheManager:
                 heads = source_bh // runtime_batch
                 if 0 < heads <= attention_heads:
                     return int(heads)
+
+        if source_head_dim is not None:
+            try:
+                source_head_dim = int(source_head_dim)
+            except (TypeError, ValueError):
+                source_head_dim = None
+
+        if source_head_dim is not None:
+            # Gemma-4 has heterogeneous KV shapes: sliding layers emit
+            # num_key_value_heads x head_dim, while full-attention layers emit
+            # num_global_key_value_heads x global_head_dim.  The cache manager
+            # is shared across layers, so use the emitted head dimension to
+            # disambiguate full-attention writes before falling back to the
+            # global config's sliding KV head count.
+            default_head_dim = getattr(self.block_config, "head_dim", None)
+            global_head_dim = getattr(self.block_config, "global_head_dim", None)
+            try:
+                default_head_dim = int(default_head_dim) if default_head_dim is not None else None
+            except (TypeError, ValueError):
+                default_head_dim = None
+            try:
+                global_head_dim = int(global_head_dim) if global_head_dim is not None else None
+            except (TypeError, ValueError):
+                global_head_dim = None
+
+            if (
+                global_head_dim is not None
+                and global_head_dim != default_head_dim
+                and source_head_dim == global_head_dim
+            ):
+                global_kv_heads = getattr(self.block_config, "num_global_key_value_heads", None)
+                try:
+                    global_kv_heads = int(global_kv_heads) if global_kv_heads is not None else None
+                except (TypeError, ValueError):
+                    global_kv_heads = None
+                if (
+                    global_kv_heads is not None
+                    and 0 < global_kv_heads <= attention_heads
+                    and source_bh % global_kv_heads == 0
+                ):
+                    return int(global_kv_heads)
 
         kv_heads = getattr(self.block_config, "num_key_value_heads", None)
         if kv_heads is None:
@@ -546,7 +588,7 @@ class KVCacheManager:
                 return [], 0
             BH, _D, s_new = key_data.shape
             H = getattr(self.block_config, "num_attention_heads", 32) or 32
-            source_heads = self._source_heads_per_batch(H, BH)
+            source_heads = self._source_heads_per_batch(H, BH, source_head_dim=_D)
             if source_heads <= 0 or BH % source_heads != 0:
                 return [], 0
             B = BH // source_heads
@@ -1525,7 +1567,13 @@ class KVCacheManager:
         BH_src, D_src, s_new = key_t.shape
         assert value_t.shape == (BH_src, s_new, D_src), f"value shape {value_t.shape} != (BH, s_new, D)"
         assert D_src == D_dst, f"D mismatch: src {D_src} vs dst {D_dst}"
-        source_heads = self._source_heads_per_batch(H, BH_src, full_batch_size, micro_batch_size)
+        source_heads = self._source_heads_per_batch(
+            H,
+            BH_src,
+            full_batch_size,
+            micro_batch_size,
+            source_head_dim=D_src,
+        )
         assert BH_src % source_heads == 0, (
             f"BH_src={BH_src} not divisible by source_heads={source_heads}"
         )
@@ -2229,6 +2277,6 @@ class KVCacheManager:
                     l_acc_target=cache_len, cache_tensors=cache_tensors,
                 )
 
-        except Exception as e:
-            import logging
-            logging.error(f"Async cache reorder failed: {e}")
+        except Exception:
+            logger.exception("Speculative cache reorder failed")
+            raise

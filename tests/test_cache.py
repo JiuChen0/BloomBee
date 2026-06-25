@@ -107,6 +107,58 @@ def test_gqa_batched_kv_write_preserves_batch_head_stride():
     assert torch.count_nonzero(v_cache_data[row, 6:8, :]) == 0
 
 
+def test_gemma4_full_attention_kv_write_uses_global_kv_heads():
+    manager = _make_kv_cache_manager(max_tokens=1024)
+    manager.block_config.num_attention_heads = 8
+    manager.block_config.num_key_value_heads = 4
+    manager.block_config.num_global_key_value_heads = 2
+    manager.block_config.head_dim = 8
+    manager.block_config.global_head_dim = 16
+
+    batch_size = 2
+    num_attention_heads = manager.block_config.num_attention_heads
+    num_global_key_value_heads = manager.block_config.num_global_key_value_heads
+    head_dim = manager.block_config.global_head_dim
+    seq_len = 1
+    start_position = 0
+
+    k_cache_data = torch.zeros((2, batch_size * num_attention_heads, head_dim), dtype=torch.float32)
+    v_cache_data = torch.zeros_like(k_cache_data)
+    k_cache = TorchTensor.create_from_torch(k_cache_data, manager.attention_compute)
+    v_cache = TorchTensor.create_from_torch(v_cache_data, manager.attention_compute)
+
+    key = torch.arange(
+        1,
+        batch_size * num_global_key_value_heads * head_dim * seq_len + 1,
+        dtype=torch.float32,
+    ).reshape(batch_size * num_global_key_value_heads, head_dim, seq_len)
+    value = (100 + torch.arange(
+        1,
+        batch_size * num_global_key_value_heads * seq_len * head_dim + 1,
+        dtype=torch.float32,
+    )).reshape(batch_size * num_global_key_value_heads, seq_len, head_dim)
+
+    manager._write_kvs(
+        (key, value),
+        start_position=start_position,
+        batch_offset=0,
+        full_batch_size=0,
+        micro_batch_size=0,
+        cache_tensors=[(k_cache, v_cache)],
+    )
+
+    row = start_position
+    torch.testing.assert_close(k_cache_data[row, 0:2, :], key[0:2, :, 0])
+    torch.testing.assert_close(v_cache_data[row, 0:2, :], value[0:2, 0, :])
+    torch.testing.assert_close(k_cache_data[row, 8:10, :], key[2:4, :, 0])
+    torch.testing.assert_close(v_cache_data[row, 8:10, :], value[2:4, 0, :])
+
+    assert torch.count_nonzero(k_cache_data[row, 2:8, :]) == 0
+    assert torch.count_nonzero(v_cache_data[row, 2:8, :]) == 0
+    assert torch.count_nonzero(k_cache_data[row, 10:16, :]) == 0
+    assert torch.count_nonzero(v_cache_data[row, 10:16, :]) == 0
+
+
 @pytest.mark.asyncio
 async def test_cache_timeout():
     manager = _make_kv_cache_manager(max_tokens=1024, max_alloc_timeout=0.5)
