@@ -2210,7 +2210,7 @@ class KVCacheManager:
                 )
 
                 if k_pkv is None:
-                    return
+                    raise RuntimeError("select_cache returned no KV tensors during speculative cache reorder")
 
                 # Reorder and write back
                 cache_manager.reorder_and_write_cache(
@@ -2229,6 +2229,6 @@ class KVCacheManager:
                     l_acc_target=cache_len, cache_tensors=cache_tensors,
                 )
 
-        except Exception as e:
-            import logging
-            logging.error(f"Async cache reorder failed: {e}")
+        except Exception:
+            logger.exception("Speculative cache reorder failed")
+            raise

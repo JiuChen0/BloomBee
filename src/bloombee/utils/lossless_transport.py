@@ -77,6 +77,10 @@ _LOSSLESS_ZSTD_DICT_PATH_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH"
 _LOSSLESS_ZSTD_DICT_PATH_PREFILL_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_PREFILL"
 _LOSSLESS_ZSTD_DICT_PATH_DECODE_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_DECODE"
 _LOSSLESS_HYBRID_DICT_BLOCKS_ENV = "BLOOMBEE_LOSSLESS_HYBRID_DICT_BLOCKS"
+_LOSSLESS_MAX_ORIGINAL_BYTES_ENV = "BLOOMBEE_LOSSLESS_MAX_ORIGINAL_BYTES"
+_LOSSLESS_MAX_ORIGINAL_BYTES_LEGACY_ENV = "LOSSLESS_MAX_ORIGINAL_BYTES"
+_LOSSLESS_ZIPNN_TRANSPORT_ENV = "BLOOMBEE_LOSSLESS_ZIPNN_TRANSPORT"
+_DEFAULT_LOSSLESS_MAX_ORIGINAL_BYTES = 256 * 1024 * 1024
 _TRANSPORT_PROFILE_CTX: contextvars.ContextVar[Optional[Dict[str, float]]] = contextvars.ContextVar(
     "bloombee_transport_profile", default=None
 )
@@ -201,6 +205,49 @@ def _lossless_min_gain_bytes() -> int:
         return max(0, int(cfg_val))
     except Exception:
         return 32
+
+
+def _lossless_max_original_bytes() -> int:
+    cfg_val = _get_cfg("LOSSLESS_MAX_ORIGINAL_BYTES", _DEFAULT_LOSSLESS_MAX_ORIGINAL_BYTES)
+    if _allow_env_override():
+        env_val = os.environ.get(
+            _LOSSLESS_MAX_ORIGINAL_BYTES_ENV,
+            os.environ.get(_LOSSLESS_MAX_ORIGINAL_BYTES_LEGACY_ENV),
+        )
+        if env_val is not None:
+            try:
+                return max(1, int(env_val))
+            except Exception:
+                return _DEFAULT_LOSSLESS_MAX_ORIGINAL_BYTES
+    try:
+        return max(1, int(cfg_val))
+    except Exception:
+        return _DEFAULT_LOSSLESS_MAX_ORIGINAL_BYTES
+
+
+def _validate_lossless_original_size(original_size: int) -> None:
+    if original_size < 0:
+        raise ValueError(f"Invalid lossless wrapper original_size: {original_size}")
+    max_original_size = _lossless_max_original_bytes()
+    if original_size > max_original_size:
+        raise ValueError(
+            f"Lossless wrapper original_size {original_size} exceeds maximum {max_original_size}"
+        )
+
+
+def _validate_byte_split_elem_size(elem_size: int) -> None:
+    if elem_size not in (2, 4):
+        raise ValueError(f"Unsupported byte-split elem_size={elem_size}")
+
+
+def _zipnn_transport_enabled() -> bool:
+    cfg_val = _get_cfg("LOSSLESS_ZIPNN_TRANSPORT", 0)
+    if _allow_env_override() and _LOSSLESS_ZIPNN_TRANSPORT_ENV in os.environ:
+        return _get_env_bool(_LOSSLESS_ZIPNN_TRANSPORT_ENV, "0")
+    try:
+        return bool(int(cfg_val))
+    except Exception:
+        return bool(cfg_val)
 
 
 def comp_ratio_profile_enabled() -> bool:
@@ -1423,6 +1470,8 @@ def _supports_zipnn_transport(
     raw_size: int,
     debug_context: Optional[Dict[str, object]],
 ) -> bool:
+    if not _zipnn_transport_enabled():
+        return False
     return _supports_zipnn_compare(tensor, compression_type, raw_size, debug_context)
 
 
@@ -1446,6 +1495,8 @@ def _zipnn_skip_reason(
         return "zipnn_size_mismatch"
     if not _context_matches_lossless_layout_target(debug_context):
         return "zipnn_target_mismatch"
+    if not _zipnn_transport_enabled():
+        return "zipnn_transport_disabled"
     if not _zipnn_lossless_dtype_supported(dtype_name):
         return "zipnn_lossless_verification_failed"
     return "zipnn_unsupported"
@@ -1802,6 +1853,8 @@ def _split_high_byte_lane(raw: bytes, elem_size: int) -> tuple[bytes, bytes]:
 
 
 def _reconstruct_high_byte_lane(extracted: bytes, remaining: bytes, elem_size: int, original_size: int) -> bytes:
+    _validate_lossless_original_size(original_size)
+    _validate_byte_split_elem_size(elem_size)
     if elem_size <= 0 or original_size % elem_size != 0:
         raise ValueError(f"Invalid byte-split original_size={original_size} elem_size={elem_size}")
     numel = original_size // elem_size
@@ -1966,8 +2019,7 @@ def _build_zipnn_wrapper(raw: bytes, *, tensor: torch.Tensor) -> bytes:
 
 
 def _decompress_zlib_capped(payload: bytes, original_size: int) -> bytes:
-    if original_size < 0:
-        raise ValueError(f"Invalid lossless wrapper original_size: {original_size}")
+    _validate_lossless_original_size(original_size)
 
     decompressor = zlib.decompressobj()
     limit = original_size + 1
@@ -1982,6 +2034,7 @@ def _decompress_zlib_capped(payload: bytes, original_size: int) -> bytes:
 
 
 def _decompress_with_algo(algo_id: int, payload: bytes, original_size: int) -> bytes:
+    _validate_lossless_original_size(original_size)
     t0 = time.perf_counter()
     if algo_id == _ALGO_ZSTD:
         decompressor = _get_zstd_decompressor()
@@ -2101,9 +2154,11 @@ def _build_zstd_dict_byte_split_decode_wrapper(raw: bytes, *, elem_size: int) ->
 
 
 def _decode_zstd_dict_byte_split_phase_payload(payload: bytes, original_size: int, phase: str) -> bytes:
+    _validate_lossless_original_size(original_size)
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
         raise ValueError("zstd-dict-phase byte-split payload is truncated")
     elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
+    _validate_byte_split_elem_size(elem_size)
     extracted_start = _BYTE_SPLIT_PAYLOAD_SIZE
     extracted_end = extracted_start + int(extracted_comp_size)
     if extracted_end > len(payload):
@@ -2136,9 +2191,11 @@ def _decode_zstd_dict_byte_split_phase_payload(payload: bytes, original_size: in
     return _reconstruct_high_byte_lane(bytes(extracted_raw), bytes(remaining_raw), elem_size, original_size)
 
 def _decode_zstd_byte_split_payload(payload: bytes, original_size: int) -> bytes:
+    _validate_lossless_original_size(original_size)
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
         raise ValueError("Byte-split payload is truncated")
     elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
+    _validate_byte_split_elem_size(elem_size)
     extracted_start = _BYTE_SPLIT_PAYLOAD_SIZE
     extracted_end = extracted_start + int(extracted_comp_size)
     if extracted_end > len(payload):
@@ -2180,9 +2237,11 @@ def _build_zstd_byte_split_high_only_wrapper(raw: bytes, *, elem_size: int) -> b
 
 
 def _decode_zstd_byte_split_high_only_payload(payload: bytes, original_size: int) -> bytes:
+    _validate_lossless_original_size(original_size)
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
         raise ValueError("byte_split_high_only payload is truncated")
     elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
+    _validate_byte_split_elem_size(elem_size)
     start = _BYTE_SPLIT_PAYLOAD_SIZE
     end = start + int(extracted_comp_size)
     if end > len(payload):
@@ -2206,9 +2265,11 @@ def _decode_zstd_byte_split_high_only_payload(payload: bytes, original_size: int
 
 
 def _decode_zstd_dict_byte_split_payload(payload: bytes, original_size: int) -> bytes:
+    _validate_lossless_original_size(original_size)
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
         raise ValueError("zstd-dict byte-split payload is truncated")
     elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
+    _validate_byte_split_elem_size(elem_size)
     extracted_start = _BYTE_SPLIT_PAYLOAD_SIZE
     extracted_end = extracted_start + int(extracted_comp_size)
     if extracted_end > len(payload):
@@ -2248,6 +2309,13 @@ def _parse_wrapper(buffer: bytes, *, strict: bool = True):
     if version != _VERSION:
         if strict:
             raise ValueError(f"Unsupported lossless wrapper version: {version}")
+        return None
+
+    try:
+        _validate_lossless_original_size(original_size)
+    except ValueError:
+        if strict:
+            raise
         return None
 
     payload = buffer[_HEADER_SIZE:]
