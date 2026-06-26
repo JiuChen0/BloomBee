@@ -145,6 +145,16 @@ def test_byte_split_rejects_invalid_elem_size_before_decompression():
         lt._decode_zstd_byte_split_payload(payload, 16)
 
 
+def test_zipnn_wrapper_requires_transport_opt_in(monkeypatch):
+    monkeypatch.delenv("BLOOMBEE_LOSSLESS_ZIPNN_TRANSPORT", raising=False)
+    wrapped = runtime_pb2.Tensor(
+        buffer=lt._HEADER_STRUCT.pack(lt._MAGIC, lt._VERSION, lt._ALGO_ZIPNN, 0) + b""
+    )
+
+    with pytest.raises(ValueError, match="ZipNN lossless transport is disabled"):
+        lt.unwrap_serialized_tensor(wrapped)
+
+
 def test_zipnn_compare_candidate_fp16(monkeypatch):
     tensor = _make_split_friendly_fp16().contiguous()
     debug_context = {

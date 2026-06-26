@@ -2044,6 +2044,8 @@ def _decompress_with_algo(algo_id: int, payload: bytes, original_size: int) -> b
     elif algo_id == _ALGO_ZLIB:
         raw = _decompress_zlib_capped(payload, original_size)
     elif algo_id == _ALGO_ZIPNN:
+        if not _zipnn_transport_enabled():
+            raise ValueError("ZipNN lossless transport is disabled")
         decompressor = _get_zipnn_decompressor()
         if decompressor is None:
             raise RuntimeError("Received ZipNN-wrapped tensor, but 'zipnn' is not installed")
