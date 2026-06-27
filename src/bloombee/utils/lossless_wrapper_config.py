@@ -35,6 +35,14 @@ LOSSLESS_MIN_BYTES = 49152
 # Require at least this many bytes saved, otherwise keep original buffer
 LOSSLESS_MIN_GAIN_BYTES = 2048
 
+# Reject inbound wrapped tensors that declare a larger decompressed buffer.
+# This guards every receive path before decompression or byte-lane allocation.
+LOSSLESS_MAX_ORIGINAL_BYTES = 256 * 1024 * 1024
+
+# ZipNN transport receive is disabled unless explicitly enabled for trusted
+# peers; this code path has no bounded-output decompression API.
+LOSSLESS_ZIPNN_TRANSPORT = 0
+
 # 1 = environment variables can override this file
 # 0 = this file has full control
 ALLOW_ENV_OVERRIDE = 1

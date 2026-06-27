@@ -128,6 +128,32 @@ def test_zlib_wrapper_decompression_is_capped_to_declared_size():
         lt._decompress_with_algo(lt._ALGO_ZLIB, payload, 8)
 
 
+def test_lossless_wrapper_rejects_oversized_declared_output(monkeypatch):
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_MAX_ORIGINAL_BYTES", "64")
+    payload = zlib.compress(b"x" * 128)
+
+    with pytest.raises(ValueError, match="exceeds configured cap"):
+        lt._decompress_with_algo(lt._ALGO_ZLIB, payload, 128)
+
+    forged = lt._HEADER_STRUCT.pack(lt._MAGIC, lt._VERSION, lt._ALGO_ZLIB, 128) + payload
+    with pytest.raises(ValueError, match="exceeds configured cap"):
+        lt._parse_wrapper(forged, strict=True)
+
+
+def test_byte_split_rejects_invalid_wire_element_size():
+    payload = lt._BYTE_SPLIT_PAYLOAD_STRUCT.pack(1, 0)
+
+    with pytest.raises(ValueError, match="Invalid byte-split element size"):
+        lt._decode_zstd_byte_split_payload(payload, 8)
+
+
+def test_zipnn_transport_receive_requires_explicit_opt_in(monkeypatch):
+    monkeypatch.delenv("BLOOMBEE_LOSSLESS_ZIPNN_TRANSPORT", raising=False)
+
+    with pytest.raises(RuntimeError, match="ZipNN transport receive is disabled"):
+        lt._decompress_with_algo(lt._ALGO_ZIPNN, b"not-a-zipnn-payload", 8)
+
+
 def test_zipnn_compare_candidate_fp16(monkeypatch):
     tensor = _make_split_friendly_fp16().contiguous()
     debug_context = {
@@ -176,6 +202,7 @@ def test_serialize_torch_tensor_zipnn_roundtrip(monkeypatch):
 
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_WRAPPER", "1")
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_ALGO", "zipnn")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_ZIPNN_TRANSPORT", "1")
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_LAYOUT", "plain")
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_BYTES", "0")
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_GAIN_BYTES", "0")
