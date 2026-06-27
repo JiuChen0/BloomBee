@@ -458,7 +458,12 @@ class WrappedFalconBlock(OptimizedFalconDecoderLayer):
             # (e.g. Falcon-7b multi_query=True) only num_kv_heads per batch were written.
             # Slice to the actual KV heads before reshaping.
             B, H, S, D = key_states.shape
-            num_kv_heads = 1 if (not self.config.new_decoder_architecture and getattr(self.config, 'multi_query', False)) else H
+            if self.config.new_decoder_architecture:
+                num_kv_heads = int(self.config.num_kv_heads)
+            elif getattr(self.config, 'multi_query', False):
+                num_kv_heads = 1
+            else:
+                num_kv_heads = H
             key_states = key_states[:, :num_kv_heads, :, :].reshape(B * num_kv_heads, S, D)
             value_states = value_states[:, :num_kv_heads, :, :].reshape(B * num_kv_heads, S, D)
         else:
