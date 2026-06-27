@@ -47,6 +47,8 @@ class OptimizedBloomAttention(BloomAttention):
         batch_size, q_length, _ = hidden_states.shape
         fused_qkv = self.query_key_value(hidden_states)
         query_layer, key_layer, value_layer = self._reshape(fused_qkv)
+        present_key_layer = key_layer
+        present_value_layer = value_layer
 
         if layer_past is not None:
             past_key, past_value = layer_past
@@ -69,8 +71,13 @@ class OptimizedBloomAttention(BloomAttention):
         if use_cache:
             # BloomBee's memory_cache_manager expects kv in 3D layout:
             #   key=[B*H, D, S]  (i.e., head_dim before seq), value=[B*H, S, D].
-            # We hand it ``present`` in exactly that shape so _write_kvs' assertion passes.
-            present = (key_layer_bhd, value_layer_bhd)
+            # Only return the newly computed span. The cache manager appends it
+            # at ``cache_len`` and would duplicate/corrupt prior tokens if this
+            # included ``layer_past``.
+            present = (
+                present_key_layer.reshape(batch_size * self.num_heads, -1, self.head_dim).transpose(-1, -2),
+                present_value_layer.reshape(batch_size * self.num_heads, -1, self.head_dim),
+            )
 
         attention_scores = alibi.baddbmm(
             batch1=query_layer,
