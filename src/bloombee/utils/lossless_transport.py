@@ -1280,13 +1280,7 @@ def _new_zipnn_compare_info() -> Dict[str, object]:
 def _zipnn_dtype_name(tensor: Optional[torch.Tensor]) -> Optional[str]:
     if tensor is None or not torch.is_tensor(tensor):
         return None
-    if tensor.dtype == torch.float16:
-        return "float16"
-    if tensor.dtype == torch.bfloat16:
-        return "bfloat16"
-    if tensor.dtype == torch.float32:
-        return "float32"
-    return None
+    return _zipnn_dtype_name_from_dtype(tensor.dtype)
 
 
 def _zipnn_dtype_name_from_dtype(dtype: torch.dtype) -> Optional[str]:
@@ -1994,6 +1988,10 @@ def _decompress_with_algo(algo_id: int, payload: bytes, original_size: int) -> b
         decompressor = _get_zipnn_decompressor()
         if decompressor is None:
             raise RuntimeError("Received ZipNN-wrapped tensor, but 'zipnn' is not installed")
+        # ZipNN's API offers no max-output cap, so a hostile payload can still
+        # expand past original_size during this call; the caller-level
+        # BLOOMBEE_LOSSLESS_MAX_DECODED_BYTES check bounds the declared size and
+        # the length check below rejects any mismatch after the fact.
         raw = bytes(decompressor.decompress(payload))
     else:
         raise ValueError(f"Unknown lossless wrapper algorithm id: {algo_id}")
@@ -2035,11 +2033,7 @@ def _build_zstd_byte_split_wrapper(raw: bytes, *, elem_size: int) -> bytes:
     return _HEADER_STRUCT.pack(_MAGIC, _VERSION, _ALGO_ZSTD_BYTE_SPLIT, len(raw)) + payload
 
 
-def _build_zstd_dict_byte_split_wrapper(raw: bytes, *, elem_size: int) -> bytes:
-    compressor = _get_zstd_dict_compressor(_lossless_level())
-    if compressor is None:
-        raise RuntimeError("zstd_dict_byte_split requires BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH")
-
+def _build_dict_byte_split_wrapper_with(compressor, raw: bytes, *, elem_size: int, algo_id: int) -> bytes:
     extracted_raw, remaining_raw = _split_high_byte_lane(raw, elem_size)
     t0 = time.perf_counter()
     extracted_comp = bytes(compressor.compress(extracted_raw))
@@ -2049,76 +2043,51 @@ def _build_zstd_dict_byte_split_wrapper(raw: bytes, *, elem_size: int) -> bytes:
     _record_transport_profile("compress_ms", dt_ms)
     _record_transport_profile("compress_input_bytes", float(len(extracted_raw) + len(remaining_raw)))
     _record_transport_profile("compress_output_bytes", float(len(extracted_comp) + len(remaining_comp)))
-
     payload = (
         _BYTE_SPLIT_PAYLOAD_STRUCT.pack(elem_size, len(extracted_comp))
         + extracted_comp
         + remaining_comp
     )
-    return _HEADER_STRUCT.pack(_MAGIC, _VERSION, _ALGO_ZSTD_DICT_BYTE_SPLIT, len(raw)) + payload
+    return _HEADER_STRUCT.pack(_MAGIC, _VERSION, algo_id, len(raw)) + payload
+
+
+def _build_zstd_dict_byte_split_wrapper(raw: bytes, *, elem_size: int) -> bytes:
+    compressor = _get_zstd_dict_compressor(_lossless_level())
+    if compressor is None:
+        raise RuntimeError("zstd_dict_byte_split requires BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH")
+    return _build_dict_byte_split_wrapper_with(
+        compressor, raw, elem_size=elem_size, algo_id=_ALGO_ZSTD_DICT_BYTE_SPLIT
+    )
 
 
 def _build_zstd_dict_byte_split_prefill_wrapper(raw: bytes, *, elem_size: int) -> bytes:
     compressor = _get_zstd_dict_compressor_prefill(_lossless_level())
     if compressor is None:
         raise RuntimeError("zstd_dict_byte_split_prefill requires BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_PREFILL or BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH")
-    extracted_raw, remaining_raw = _split_high_byte_lane(raw, elem_size)
-    t0 = time.perf_counter()
-    extracted_comp = bytes(compressor.compress(extracted_raw))
-    remaining_comp = bytes(compressor.compress(remaining_raw))
-    dt_ms = (time.perf_counter() - t0) * 1000.0
-    _record_transport_profile("compress_calls", 2.0)
-    _record_transport_profile("compress_ms", dt_ms)
-    _record_transport_profile("compress_input_bytes", float(len(extracted_raw) + len(remaining_raw)))
-    _record_transport_profile("compress_output_bytes", float(len(extracted_comp) + len(remaining_comp)))
-    payload = (
-        _BYTE_SPLIT_PAYLOAD_STRUCT.pack(elem_size, len(extracted_comp))
-        + extracted_comp
-        + remaining_comp
+    return _build_dict_byte_split_wrapper_with(
+        compressor, raw, elem_size=elem_size, algo_id=_ALGO_ZSTD_DICT_BYTE_SPLIT_PREFILL
     )
-    return _HEADER_STRUCT.pack(_MAGIC, _VERSION, _ALGO_ZSTD_DICT_BYTE_SPLIT_PREFILL, len(raw)) + payload
 
 
 def _build_zstd_dict_byte_split_decode_wrapper(raw: bytes, *, elem_size: int) -> bytes:
     compressor = _get_zstd_dict_compressor_decode(_lossless_level())
     if compressor is None:
         raise RuntimeError("zstd_dict_byte_split_decode requires BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_DECODE or BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH")
-    extracted_raw, remaining_raw = _split_high_byte_lane(raw, elem_size)
-    t0 = time.perf_counter()
-    extracted_comp = bytes(compressor.compress(extracted_raw))
-    remaining_comp = bytes(compressor.compress(remaining_raw))
-    dt_ms = (time.perf_counter() - t0) * 1000.0
-    _record_transport_profile("compress_calls", 2.0)
-    _record_transport_profile("compress_ms", dt_ms)
-    _record_transport_profile("compress_input_bytes", float(len(extracted_raw) + len(remaining_raw)))
-    _record_transport_profile("compress_output_bytes", float(len(extracted_comp) + len(remaining_comp)))
-    payload = (
-        _BYTE_SPLIT_PAYLOAD_STRUCT.pack(elem_size, len(extracted_comp))
-        + extracted_comp
-        + remaining_comp
+    return _build_dict_byte_split_wrapper_with(
+        compressor, raw, elem_size=elem_size, algo_id=_ALGO_ZSTD_DICT_BYTE_SPLIT_DECODE
     )
-    return _HEADER_STRUCT.pack(_MAGIC, _VERSION, _ALGO_ZSTD_DICT_BYTE_SPLIT_DECODE, len(raw)) + payload
 
 
-def _decode_zstd_dict_byte_split_phase_payload(payload: bytes, original_size: int, phase: str) -> bytes:
+def _decode_dict_byte_split_with(decompressor, payload: bytes, original_size: int, *, label: str) -> bytes:
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
-        raise ValueError("zstd-dict-phase byte-split payload is truncated")
+        raise ValueError(f"{label} byte-split payload is truncated")
     elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
     extracted_start = _BYTE_SPLIT_PAYLOAD_SIZE
     extracted_end = extracted_start + int(extracted_comp_size)
     if extracted_end > len(payload):
-        raise ValueError("zstd-dict-phase byte-split payload extracted segment is truncated")
+        raise ValueError(f"{label} byte-split payload extracted segment is truncated")
     if original_size % max(1, elem_size) != 0:
         raise ValueError(f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}")
-
-    if phase == "prefill":
-        decompressor = _get_zstd_dict_decompressor_prefill()
-    elif phase == "decode":
-        decompressor = _get_zstd_dict_decompressor_decode()
-    else:
-        raise ValueError(f"unknown phase: {phase}")
-    if decompressor is None:
-        raise RuntimeError(f"zstd_dict_byte_split_{phase} requires its dict env to be set")
 
     extracted_comp = payload[extracted_start:extracted_end]
     remaining_comp = payload[extracted_end:]
@@ -2134,6 +2103,18 @@ def _decode_zstd_dict_byte_split_phase_payload(payload: bytes, original_size: in
     _record_transport_profile("decompress_input_bytes", float(len(extracted_comp) + len(remaining_comp)))
     _record_transport_profile("decompress_output_bytes", float(len(extracted_raw) + len(remaining_raw)))
     return _reconstruct_high_byte_lane(bytes(extracted_raw), bytes(remaining_raw), elem_size, original_size)
+
+
+def _decode_zstd_dict_byte_split_phase_payload(payload: bytes, original_size: int, phase: str) -> bytes:
+    if phase == "prefill":
+        decompressor = _get_zstd_dict_decompressor_prefill()
+    elif phase == "decode":
+        decompressor = _get_zstd_dict_decompressor_decode()
+    else:
+        raise ValueError(f"unknown phase: {phase}")
+    if decompressor is None:
+        raise RuntimeError(f"zstd_dict_byte_split_{phase} requires its dict env to be set")
+    return _decode_dict_byte_split_with(decompressor, payload, original_size, label=f"zstd-dict-{phase}")
 
 def _decode_zstd_byte_split_payload(payload: bytes, original_size: int) -> bytes:
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
@@ -2162,7 +2143,8 @@ def _build_zstd_byte_split_high_only_wrapper(raw: bytes, *, elem_size: int) -> b
     For fp16/bf16/fp32 LLM activations the low byte lane is dominated by
     mantissa bits and is nearly incompressible. Running zstd on it costs ~50%
     of the byte_split wrapper time for a fraction of a percent of ratio.
-    Adopted as the default at "mediocre bandwidth" (~250 Mbps).
+    Opt-in via BLOOMBEE_LOSSLESS_LAYOUT=byte_split_high_only; intended for
+    "mediocre bandwidth" (~250 Mbps) links where compress time matters.
     """
     extracted_raw, remaining_raw = _split_high_byte_lane(raw, elem_size)
     extracted_algo, extracted_comp = _compress_with_algo(extracted_raw, algo="zstd", level=_lossless_level())
@@ -2206,34 +2188,20 @@ def _decode_zstd_byte_split_high_only_payload(payload: bytes, original_size: int
 
 
 def _decode_zstd_dict_byte_split_payload(payload: bytes, original_size: int) -> bytes:
-    if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
-        raise ValueError("zstd-dict byte-split payload is truncated")
-    elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
-    extracted_start = _BYTE_SPLIT_PAYLOAD_SIZE
-    extracted_end = extracted_start + int(extracted_comp_size)
-    if extracted_end > len(payload):
-        raise ValueError("zstd-dict byte-split payload extracted segment is truncated")
-    if original_size % max(1, elem_size) != 0:
-        raise ValueError(f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}")
-
     decompressor = _get_zstd_dict_decompressor()
     if decompressor is None:
         raise RuntimeError("zstd_dict_byte_split requires BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH")
+    return _decode_dict_byte_split_with(decompressor, payload, original_size, label="zstd-dict")
 
-    extracted_comp = payload[extracted_start:extracted_end]
-    remaining_comp = payload[extracted_end:]
-    extracted_raw_size = original_size // elem_size
-    remaining_raw_size = original_size - extracted_raw_size
 
-    t0 = time.perf_counter()
-    extracted_raw = decompressor.decompress(extracted_comp, max_output_size=extracted_raw_size)
-    remaining_raw = decompressor.decompress(remaining_comp, max_output_size=remaining_raw_size)
-    dt_ms = (time.perf_counter() - t0) * 1000.0
-    _record_transport_profile("decompress_calls", 2.0)
-    _record_transport_profile("decompress_ms", dt_ms)
-    _record_transport_profile("decompress_input_bytes", float(len(extracted_comp) + len(remaining_comp)))
-    _record_transport_profile("decompress_output_bytes", float(len(extracted_raw) + len(remaining_raw)))
-    return _reconstruct_high_byte_lane(bytes(extracted_raw), bytes(remaining_raw), elem_size, original_size)
+def _max_decoded_bytes() -> int:
+    """Hard upper bound for any wrapper-declared decompressed size.
+
+    The wrapper header's original_size is attacker-controlled in an open
+    swarm; without a bound a malicious peer could declare a multi-GB size
+    and trigger huge allocations (zstd) or unbounded decompression (zipnn).
+    """
+    return max(1, _get_env_int("BLOOMBEE_LOSSLESS_MAX_DECODED_BYTES", 1 << 30))
 
 
 def _parse_wrapper(buffer: bytes, *, strict: bool = True):
@@ -2425,10 +2393,23 @@ def _wrap_serialized_tensor_impl(
                 return serialized_tensor, info
         else:
             supports_byte_split = _supports_byte_split_layout(tensor, compression_type, len(raw), debug_context)
+            high_only = _lossless_layout() == "byte_split_high_only"
+            if high_only:
+                split_builder, split_label, split_algo_id = (
+                    _build_zstd_byte_split_high_only_wrapper,
+                    "byte_split_high_only",
+                    _ALGO_ZSTD_BYTE_SPLIT_HIGH_ONLY,
+                )
+            else:
+                split_builder, split_label, split_algo_id = (
+                    _build_zstd_byte_split_wrapper,
+                    "byte_split",
+                    _ALGO_ZSTD_BYTE_SPLIT,
+                )
             if _lossless_single_path_enabled() and selected_algo == "zstd" and supports_byte_split:
                 try:
-                    split_wrapped = _build_zstd_byte_split_wrapper(raw, elem_size=int(tensor.element_size()))
-                    candidates.append(("byte_split", _ALGO_ZSTD_BYTE_SPLIT, split_wrapped))
+                    split_wrapped = split_builder(raw, elem_size=int(tensor.element_size()))
+                    candidates.append((split_label, split_algo_id, split_wrapped))
                     info["byte_split_wrapped_bytes"] = int(len(split_wrapped))
                 except Exception:
                     info["byte_split_wrapped_bytes"] = 0
@@ -2444,8 +2425,8 @@ def _wrap_serialized_tensor_impl(
 
                 if supports_byte_split:
                     try:
-                        split_wrapped = _build_zstd_byte_split_wrapper(raw, elem_size=int(tensor.element_size()))
-                        candidates.append(("byte_split", _ALGO_ZSTD_BYTE_SPLIT, split_wrapped))
+                        split_wrapped = split_builder(raw, elem_size=int(tensor.element_size()))
+                        candidates.append((split_label, split_algo_id, split_wrapped))
                         info["byte_split_wrapped_bytes"] = int(len(split_wrapped))
                     except Exception:
                         info["byte_split_wrapped_bytes"] = 0
@@ -2462,6 +2443,8 @@ def _wrap_serialized_tensor_impl(
         info["compressed_bytes"] = int(max(0, len(wrapped_buffer) - _HEADER_SIZE))
         if algo_id == _ALGO_ZSTD_BYTE_SPLIT:
             info["algo_name"] = "zstd_byte_split"
+        elif algo_id == _ALGO_ZSTD_BYTE_SPLIT_HIGH_ONLY:
+            info["algo_name"] = "zstd_byte_split_high_only"
         elif algo_id == _ALGO_ZSTD_DICT_BYTE_SPLIT:
             info["algo_name"] = "zstd_dict_byte_split"
             info["layout"] = "byte_split"
@@ -2519,6 +2502,11 @@ def unwrap_serialized_tensor(serialized_tensor: runtime_pb2.Tensor) -> runtime_p
             return serialized_tensor
 
         algo_id, original_size, payload = parsed
+        if original_size > _max_decoded_bytes():
+            raise ValueError(
+                f"Lossless wrapper declares original_size={original_size} above the "
+                f"BLOOMBEE_LOSSLESS_MAX_DECODED_BYTES limit ({_max_decoded_bytes()}); rejecting"
+            )
         if algo_id == _ALGO_ZSTD_BYTE_SPLIT:
             raw_buffer = _decode_zstd_byte_split_payload(payload, original_size)
         elif algo_id == _ALGO_ZSTD_DICT_BYTE_SPLIT:

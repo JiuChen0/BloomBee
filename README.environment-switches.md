@@ -25,8 +25,6 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 | `BLOOMBEE_MICRO_BATCH_SIZE` | `0` | Micro-batch size used for overlap scheduling. `0` (default) means disabled even if the master switch is `1`. Set both this and `BLOOMBEE_ENABLE_MICROBATCH_PIPELINE` to enable. |
 | `BLOOMBEE_MICRO_ENABLE_GPU_MULTIPLEXING` | parsed, but currently effectively `0` | Intended to shrink active GPU working slots. Right now BloomBee forces `overlap_only`, so this is effectively a no-op. |
 | `BLOOMBEE_ENABLE_CROSS_STAGE_PUSH` | `1` | Enables actual server-to-server micro-batch push. Set `0` for dry-run / fallback behavior. |
-| `BLOOMBEE_ENABLE_IMMEDIATE_MB_QUEUE` | `1` | Enables immediate in-memory micro-batch queuing on the downstream server. |
-| `BLOOMBEE_STORE_MB_FILES_IN_IMMEDIATE` | `0` | In immediate mode, also persist micro-batches to files for legacy compatibility. |
 | `BLOOMBEE_MB0_SEMAPHORE_BYPASS` | `1` | Lets MB0 bypass the push limiter to reduce pipeline startup bubble. |
 | `BLOOMBEE_MBPIPE_VERBOSE` | `0` | Emits full per-micro-batch logs on every step. |
 | `BLOOMBEE_MBPIPE_LOG_EVERY_STEPS` | `16` | Sampling interval for detailed micro-batch logs when verbose mode is off. |
@@ -61,7 +59,7 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 |---|---|---|
 | `BLOOMBEE_LOSSLESS_WRAPPER` | `0` | Enables the lossless transport wrapper around serialized tensors. |
 | `BLOOMBEE_LOSSLESS_ALGO` | `zstd` | Lossless wrapper algorithm: `zstd`, `zlib`, `zipnn`, or `none`. |
-| `BLOOMBEE_LOSSLESS_LEVEL` | `3` | Compression level for the selected lossless wrapper. |
+| `BLOOMBEE_LOSSLESS_LEVEL` | `1` | Compression level for the selected lossless wrapper (file default in `lossless_wrapper_config.py`). |
 | `BLOOMBEE_LOSSLESS_LAYOUT` | `byte_split` | Wrapper layout: `plain` or `byte_split`. |
 | `BLOOMBEE_LOSSLESS_SINGLE_PATH` | `1` | Choose one lossless layout up front instead of compressing both plain and byte-split candidates. |
 | `BLOOMBEE_LOSSLESS_LAYOUT_TARGETS` | `*:*:hidden_states` | `source:channel:tensor_name` selectors for `byte_split` layout. |
@@ -114,6 +112,8 @@ BloomBee has a lot of runtime switches behind `BLOOMBEE_*` environment variables
 | `BLOOMBEE_CLIENT_INFERENCE_LOGS` | follows the inference debug group | Controls client inference transport logs such as `[NETWORK_TX]` and `[CLIENT_INFERENCE_END]`. |
 | `BLOOMBEE_CROSS_GPU_TRANSFER_LOGS` | follows the micro-batch debug group | Controls cross-GPU transfer logs. |
 | `BLOOMBEE_KV_SOURCE_PROBE_LOGS` | follows the KV debug group | Controls `[KV_SOURCE_PROBE]` logs. |
+| `BLOOMBEE_S2S_WIRE_LOGS` | follows the micro-batch debug group | Controls per-push wire telemetry (`[S2S_WIRE]`, `[S2S_NET]`, `[COMM_BREAKDOWN]`, `[COMM_BREAKDOWN_MB]`, `[NETWORK_RX]`, `[NETWORK_S2S]`, `[ACTIVATION_XFER_CHECK]`, `[S2S_PUSH_BREAKDOWN]`). Off by default; set to `1` for experiment runs that parse these tags. |
+| `BLOOMBEE_LOSSLESS_MAX_DECODED_BYTES` | `1073741824` | Hard cap for the decompressed size a lossless wrapper header may declare; oversized headers are rejected. |
 | `BLOOMBEE_STEP_PROFILE` | `0` | Enables `[STEP_PROFILE]` per-step server-side profiling logs from `backend.py`. |
 | `BLOOMBEE_STEP_PROFILE_INTERVAL` | `32` | Sampling interval for `[STEP_PROFILE]` logs when `BLOOMBEE_STEP_PROFILE=1`. |
 
