@@ -18,6 +18,7 @@ from typing import Deque, Optional
 from bloombee.utils.microbatch_config import MBPIPE_LOG_PREFIX
 
 
+@dataclass
 class S2SLinkTelemetry:
     """
     Rolling transport telemetry for one server-to-server link.
@@ -67,6 +68,7 @@ class S2SLinkTelemetry:
         self.jitter_ms_window.append(float(jitter_ms))
         self.raw_latency_ms_window.append(float(raw_latency_ms))
         return jitter_ms
+
 
 class AdaptivePushConcurrency:
     """
@@ -157,7 +159,11 @@ class AdaptivePushConcurrency:
                     reason = "send_failures"
                 # If local wait is non-trivial while network send remains moderate,
                 # increase concurrency to reduce sender-side queue pressure.
-                elif self._ewma_wait_ms > 8.0 and self._ewma_send_ms < 220.0 and self._in_flight >= max(1, self._limit - 1):
+                elif (
+                    self._ewma_wait_ms > 8.0
+                    and self._ewma_send_ms < 220.0
+                    and self._in_flight >= max(1, self._limit - 1)
+                ):
                     self._limit = min(self._max_limit, self._limit + 1)
                     reason = "queue_pressure"
                 # If network send slows down a lot, decrease concurrency to avoid congestion collapse.
@@ -184,5 +190,3 @@ class AdaptivePushConcurrency:
                 f"{old_limit}->{new_limit} reason={reason} "
                 f"ewma_wait={ewma_wait_ms:.1f}ms ewma_send={ewma_send_ms:.1f}ms in_flight={in_flight}"
             )
-
-
