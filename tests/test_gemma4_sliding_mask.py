@@ -8,7 +8,7 @@ exercise the pure function so they don't need a checkpoint or GPU.
 import pytest
 import torch
 
-from bloombee.models.gemma4.block import _build_layer_type_mask
+from bloombee.models.gemma4.block import _build_layer_type_mask, _merge_with_layer_type_mask
 
 
 def _is_masked(mask, q, k):
@@ -146,3 +146,57 @@ def test_sliding_with_none_window_falls_back_to_plain_causal():
         device=torch.device("cpu"),
     )
     assert torch.equal(mask_none, mask_full)
+
+
+def test_backend_additive_mask_is_merged_with_sliding_window():
+    """Normal BloomBee inference supplies [B, S, K] additive scores.
+
+    Sliding Gemma4 layers must keep those backend constraints and add their
+    own sliding-window cap, otherwise long-context decode attends too far back.
+    """
+    layer_mask = _build_layer_type_mask(
+        layer_type="sliding_attention",
+        sliding_window=4,
+        query_length=1,
+        past_length=10,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    backend_mask = torch.zeros((2, 1, 11), dtype=torch.float32)
+    merged = _merge_with_layer_type_mask(
+        backend_mask,
+        layer_mask,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+    assert merged.shape == (2, 1, 1, 11)
+    for batch in range(2):
+        for key in range(7):
+            assert NEG_INF_OK(merged[batch, 0, 0, key].item())
+        for key in range(7, 11):
+            assert merged[batch, 0, 0, key].item() == 0.0
+
+
+def test_backend_bool_mask_is_converted_before_sliding_merge():
+    layer_mask = _build_layer_type_mask(
+        layer_type="sliding_attention",
+        sliding_window=4,
+        query_length=1,
+        past_length=10,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    backend_mask = torch.ones((1, 1, 11), dtype=torch.bool)
+    backend_mask[0, 0, 9] = False
+    merged = _merge_with_layer_type_mask(
+        backend_mask,
+        layer_mask,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+    assert NEG_INF_OK(merged[0, 0, 0, 0].item())
+    assert merged[0, 0, 0, 8].item() == 0.0
+    assert NEG_INF_OK(merged[0, 0, 0, 9].item())
+    assert merged[0, 0, 0, 10].item() == 0.0
