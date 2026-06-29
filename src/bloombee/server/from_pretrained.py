@@ -72,7 +72,7 @@ def load_pretrained_block(
     tensor_parallel_devices: Optional[Sequence[torch.device]] = None,
 ) -> nn.Module:
     if config is None:
-        config = AutoDistributedConfig.from_pretrained(model_name, use_auth_token=token)
+        config = AutoDistributedConfig.from_pretrained(model_name, use_auth_token=token, revision=revision)
     if cache_dir is None:
         cache_dir = DEFAULT_CACHE_DIR
 
@@ -123,8 +123,15 @@ def load_pretrained_block(
         # For HF-based models: create block normally (weights on CPU) then load state dict
         block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_index)
         block = _load_hf_block_weights(
-            block, model_name, block_index, config,
-            token=token, cache_dir=cache_dir, max_disk_space=max_disk_space, torch_dtype=torch_dtype,
+            block,
+            model_name,
+            block_index,
+            config,
+            revision=revision,
+            token=token,
+            cache_dir=cache_dir,
+            max_disk_space=max_disk_space,
+            torch_dtype=torch_dtype,
         )
     else:
         # For FlexGen-based models (Llama): weights are managed by FlexGen at runtime.
@@ -151,6 +158,7 @@ def _load_hf_block_weights(
     block_index: int,
     config: PretrainedConfig,
     *,
+    revision: Optional[str],
     token: Optional[Union[str, bool]],
     cache_dir: str,
     max_disk_space: Optional[int],
@@ -162,6 +170,7 @@ def _load_hf_block_weights(
     state_dict = _load_state_dict_from_repo(
         model_name,
         block_prefix,
+        revision=revision,
         token=token,
         cache_dir=cache_dir,
         max_disk_space=max_disk_space,
@@ -188,7 +197,13 @@ def _load_state_dict_from_repo(
 
     index_file = _find_index_file(model_name, revision=revision, token=token, cache_dir=cache_dir)
     if index_file.endswith(".index.json"):  # Sharded model
-        path = get_file_from_repo(model_name, filename=index_file, use_auth_token=token, cache_dir=cache_dir)
+        path = get_file_from_repo(
+            model_name,
+            filename=index_file,
+            revision=revision,
+            use_auth_token=token,
+            cache_dir=cache_dir,
+        )
         if path is None:
             # _find_index_file() told that a file exists but we can't get it (e.g., it just disappeared)
             raise ValueError(f"Failed to get file {index_file}")
