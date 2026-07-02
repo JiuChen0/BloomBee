@@ -16,6 +16,7 @@ def _load_s2s_flow(monkeypatch):
     spec = importlib.util.spec_from_file_location("_s2s_flow_under_test", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
+    monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
     return module
 
