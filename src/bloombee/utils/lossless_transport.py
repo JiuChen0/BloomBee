@@ -73,6 +73,7 @@ _WIRE_TRUNCATE_PHASES_ENV = "BLOOMBEE_WIRE_TRUNCATE_PHASES"
 _LOSSLESS_LAYOUT_ENV = "BLOOMBEE_LOSSLESS_LAYOUT"
 _LOSSLESS_SINGLE_PATH_ENV = "BLOOMBEE_LOSSLESS_SINGLE_PATH"
 _LOSSLESS_LAYOUT_TARGETS_ENV = "BLOOMBEE_LOSSLESS_LAYOUT_TARGETS"
+_LOSSLESS_ZIPNN_TRANSPORT_ENV = "BLOOMBEE_LOSSLESS_ZIPNN_TRANSPORT"
 _LOSSLESS_ZSTD_DICT_PATH_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH"
 _LOSSLESS_ZSTD_DICT_PATH_PREFILL_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_PREFILL"
 _LOSSLESS_ZSTD_DICT_PATH_DECODE_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_DECODE"
@@ -295,6 +296,20 @@ def comp_zipnn_profile_enabled() -> bool:
     return get_env_bool_with_debug_fallback(
         _COMP_ZIPNN_PROFILE_ENV,
         default=(default == "1"),
+        groups=("compression",),
+    )
+
+
+def _zipnn_transport_enabled() -> bool:
+    """
+    Enable ZipNN as an RPC transport codec.
+
+    ZipNN does not expose a bounded-output decompression API, so leave it out of
+    untrusted wire formats unless an operator explicitly opts in.
+    """
+    return get_env_bool_with_debug_fallback(
+        _LOSSLESS_ZIPNN_TRANSPORT_ENV,
+        default=False,
         groups=("compression",),
     )
 
@@ -1417,7 +1432,7 @@ def _supports_zipnn_transport(
     raw_size: int,
     debug_context: Optional[Dict[str, object]],
 ) -> bool:
-    return _supports_zipnn_compare(tensor, compression_type, raw_size, debug_context)
+    return _zipnn_transport_enabled() and _supports_zipnn_compare(tensor, compression_type, raw_size, debug_context)
 
 
 def _zipnn_skip_reason(
@@ -1985,13 +2000,14 @@ def _decompress_with_algo(algo_id: int, payload: bytes, original_size: int) -> b
     elif algo_id == _ALGO_ZLIB:
         raw = _decompress_zlib_capped(payload, original_size)
     elif algo_id == _ALGO_ZIPNN:
+        if not _zipnn_transport_enabled():
+            raise ValueError(
+                f"Received ZipNN-wrapped tensor, but {_LOSSLESS_ZIPNN_TRANSPORT_ENV}=1 is required "
+                "because ZipNN decompression cannot be bounded by declared output size"
+            )
         decompressor = _get_zipnn_decompressor()
         if decompressor is None:
             raise RuntimeError("Received ZipNN-wrapped tensor, but 'zipnn' is not installed")
-        # ZipNN's API offers no max-output cap, so a hostile payload can still
-        # expand past original_size during this call; the caller-level
-        # BLOOMBEE_LOSSLESS_MAX_DECODED_BYTES check bounds the declared size and
-        # the length check below rejects any mismatch after the fact.
         raw = bytes(decompressor.decompress(payload))
     else:
         raise ValueError(f"Unknown lossless wrapper algorithm id: {algo_id}")

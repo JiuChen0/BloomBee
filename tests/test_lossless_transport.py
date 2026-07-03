@@ -176,6 +176,7 @@ def test_serialize_torch_tensor_zipnn_roundtrip(monkeypatch):
 
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_WRAPPER", "1")
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_ALGO", "zipnn")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_ZIPNN_TRANSPORT", "1")
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_LAYOUT", "plain")
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_BYTES", "0")
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_GAIN_BYTES", "0")
