@@ -33,7 +33,12 @@ def test_backend_forward_none_fails_instead_of_identity_passthrough():
 def test_zipnn_transport_is_opt_in_before_send_or_receive():
     source = _source("src/bloombee/utils/lossless_transport.py")
     send_block = source[source.index("def _supports_zipnn_transport") : source.index("def _zipnn_skip_reason")]
-    recv_block = source[source.index("elif algo_id == _ALGO_ZIPNN:") : source.index("decompressor = _get_zipnn_decompressor()")]
+    decompress_block = source[source.index("def _decompress_with_algo") : source.index("def _decompress_buffer")]
+    recv_block = decompress_block[
+        decompress_block.index("elif algo_id == _ALGO_ZIPNN:") : decompress_block.index(
+            "decompressor = _get_zipnn_decompressor()"
+        )
+    ]
 
     assert "_LOSSLESS_ZIPNN_TRANSPORT_ENV" in source
     assert "default=False" in source[source.index("def _zipnn_transport_enabled") : source.index("@lru_cache(maxsize=1)")]
