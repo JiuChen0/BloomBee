@@ -1823,6 +1823,13 @@ def _reconstruct_high_byte_lane(extracted: bytes, remaining: bytes, elem_size: i
     raise ValueError(f"Unsupported byte-split elem_size={elem_size}")
 
 
+def _validate_byte_split_elem_size(elem_size: int) -> int:
+    elem_size = int(elem_size)
+    if elem_size not in (2, 4):
+        raise ValueError(f"Unsupported byte-split elem_size={elem_size}")
+    return elem_size
+
+
 @lru_cache(maxsize=16)
 def _get_zstd_compressor(level: int):
     if _zstd is None:
@@ -2086,6 +2093,7 @@ def _decode_dict_byte_split_with(decompressor, payload: bytes, original_size: in
     extracted_end = extracted_start + int(extracted_comp_size)
     if extracted_end > len(payload):
         raise ValueError(f"{label} byte-split payload extracted segment is truncated")
+    elem_size = _validate_byte_split_elem_size(elem_size)
     if original_size % max(1, elem_size) != 0:
         raise ValueError(f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}")
 
@@ -2124,6 +2132,7 @@ def _decode_zstd_byte_split_payload(payload: bytes, original_size: int) -> bytes
     extracted_end = extracted_start + int(extracted_comp_size)
     if extracted_end > len(payload):
         raise ValueError("Byte-split payload extracted segment is truncated")
+    elem_size = _validate_byte_split_elem_size(elem_size)
 
     extracted_comp = payload[extracted_start:extracted_end]
     remaining_comp = payload[extracted_end:]
@@ -2169,6 +2178,7 @@ def _decode_zstd_byte_split_high_only_payload(payload: bytes, original_size: int
     end = start + int(extracted_comp_size)
     if end > len(payload):
         raise ValueError("byte_split_high_only extracted segment is truncated")
+    elem_size = _validate_byte_split_elem_size(elem_size)
     if original_size % max(1, elem_size) != 0:
         raise ValueError(
             f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}"

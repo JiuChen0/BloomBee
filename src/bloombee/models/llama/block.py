@@ -954,8 +954,12 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
         self, key_value: Tuple[torch.Tensor], batch_size: int, seq_length: int
     ) -> Tuple[torch.Tensor]:
         key_states, value_states = key_value
-        # If already in [B, H, S, D], return as-is
+        # BloomBee cache slabs are strided by attention heads; under GQA only
+        # the first num_key_value_heads slots per batch contain real KV rows.
         if key_states.dim() == 4 and value_states.dim() == 4:
+            nkv = self._num_key_value_heads()
+            key_states = key_states[:, :nkv, :, :]
+            value_states = value_states[:, :nkv, :, :]
             return key_states, value_states
         # Otherwise, expect Bloom-style packed heads: key [B*H, D, S] or [B*H, S, D], value [B*H, S, D] or [B*H, D, S]
         if key_states.dim() == 3:

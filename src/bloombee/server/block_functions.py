@@ -1264,7 +1264,8 @@ async def iterate_rpc_inference(
                 sorted_indices = sorted(accum['results'].keys())
                 expected_indices = list(range(int(accum.get('expected', len(sorted_indices)))))
                 if sorted_indices != expected_indices:
-                    logger.warning(
+                    _drop_mb_step_state(mb_accum_key, accum=True)
+                    raise ValueError(
                         f"{MBPIPE_LOG_PREFIX} Non-contiguous micro-batch indices for step_id={step_id}: "
                         f"got={sorted_indices}, expected={expected_indices}"
                     )
@@ -1291,7 +1292,8 @@ async def iterate_rpc_inference(
                 if layout_issues:
                     preview = "; ".join(layout_issues[:3])
                     suffix = " ..." if len(layout_issues) > 3 else ""
-                    logger.warning(
+                    _drop_mb_step_state(mb_accum_key, accum=True)
+                    raise ValueError(
                         f"{MBPIPE_LOG_PREFIX} Micro-batch merge layout check failed for step_id={step_id}: "
                         f"{preview}{suffix}"
                     )

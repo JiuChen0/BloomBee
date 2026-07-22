@@ -197,6 +197,7 @@ class KVCacheManager:
         source_bh: int,
         full_batch_size: int = 0,
         micro_batch_size: int = 0,
+        source_head_dim: Optional[int] = None,
     ) -> int:
         """Infer how many source KV rows belong to each batch item.
 
@@ -215,6 +216,13 @@ class KVCacheManager:
                 if 0 < heads <= attention_heads:
                     return int(heads)
 
+        def _as_positive_int(value):
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                return None
+            return value if value > 0 else None
+
         kv_heads = getattr(self.block_config, "num_key_value_heads", None)
         if kv_heads is None:
             groups = getattr(self.block_config, "num_key_value_groups", None)
@@ -225,10 +233,20 @@ class KVCacheManager:
             if groups > 1 and attention_heads % groups == 0:
                 kv_heads = attention_heads // groups
 
-        try:
-            kv_heads = int(kv_heads) if kv_heads is not None else attention_heads
-        except (TypeError, ValueError):
-            kv_heads = attention_heads
+        global_heads = _as_positive_int(getattr(self.block_config, "num_global_key_value_heads", None))
+        global_head_dim = _as_positive_int(getattr(self.block_config, "global_head_dim", None))
+        source_head_dim = _as_positive_int(source_head_dim)
+        if (
+            global_heads is not None
+            and 0 < global_heads <= attention_heads
+            and source_bh % global_heads == 0
+            and source_head_dim is not None
+            and global_head_dim is not None
+            and source_head_dim == global_head_dim
+        ):
+            return int(global_heads)
+
+        kv_heads = _as_positive_int(kv_heads) or attention_heads
 
         if 0 < kv_heads <= attention_heads and source_bh % kv_heads == 0:
             return int(kv_heads)
@@ -546,7 +564,7 @@ class KVCacheManager:
                 return [], 0
             BH, _D, s_new = key_data.shape
             H = getattr(self.block_config, "num_attention_heads", 32) or 32
-            source_heads = self._source_heads_per_batch(H, BH)
+            source_heads = self._source_heads_per_batch(H, BH, source_head_dim=_D)
             if source_heads <= 0 or BH % source_heads != 0:
                 return [], 0
             B = BH // source_heads
@@ -1525,7 +1543,7 @@ class KVCacheManager:
         BH_src, D_src, s_new = key_t.shape
         assert value_t.shape == (BH_src, s_new, D_src), f"value shape {value_t.shape} != (BH, s_new, D)"
         assert D_src == D_dst, f"D mismatch: src {D_src} vs dst {D_dst}"
-        source_heads = self._source_heads_per_batch(H, BH_src, full_batch_size, micro_batch_size)
+        source_heads = self._source_heads_per_batch(H, BH_src, full_batch_size, micro_batch_size, source_head_dim=D_src)
         assert BH_src % source_heads == 0, (
             f"BH_src={BH_src} not divisible by source_heads={source_heads}"
         )
@@ -2231,4 +2249,5 @@ class KVCacheManager:
 
         except Exception as e:
             import logging
-            logging.error(f"Async cache reorder failed: {e}")
+            logging.exception(f"Async cache reorder failed: {e}")
+            raise
