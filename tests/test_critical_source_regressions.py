@@ -96,3 +96,11 @@ def test_cross_stage_push_limiter_releases_setup_failure_slot():
     assert "release_slot_handed_off = acquired_slot" in push_source
     assert "if acquired_slot and not release_slot_handed_off:" in push_source
     assert "await self._push_limiter.release(send_time_ms=0.0, success=False)" in push_source
+
+
+def test_s2s_link_telemetry_is_dataclass_constructible():
+    source = _read("src/bloombee/server/s2s_flow.py")
+    class_start = source.index("class S2SLinkTelemetry:")
+    prefix = source[max(0, class_start - 40) : class_start]
+
+    assert "@dataclass" in prefix
