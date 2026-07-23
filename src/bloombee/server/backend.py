@@ -323,11 +323,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         attention_mask: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
         rotary_position_ids: Optional[torch.Tensor],
-    ) -> Optional[Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]]:
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """One transformer block forward pass on a (chunked) hidden-states slice.
 
-        Chunk-level seam. Returns (output_hidden_states_chunk, new_kvs) or None
-        on failure.
+        Chunk-level seam. Returns (output_hidden_states_chunk, new_kvs).
         """
         forward_result = self.module.forward(
             hidden_states_chunk,
@@ -338,8 +337,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             rotary_position_ids=rotary_position_ids,
         )
         if forward_result is None:
-            logger.info(" ERROR: module.forward returned None!")
-            return None
+            raise RuntimeError(f"{self.name}: module.forward returned None during inference")
         output_hidden_states_chunk, new_kvs = forward_result
         return output_hidden_states_chunk, new_kvs
 
@@ -688,8 +686,6 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             position_ids=position_ids,
                             rotary_position_ids=rotary_position_ids,
                         )
-                        if step_result is None:
-                            return (hidden_states, None)
                         output_hidden_states_chunk, new_kvs = step_result
                     except Exception as e:
                         logger.exception("ERROR in module.forward: %s: %s", type(e).__name__, e)
