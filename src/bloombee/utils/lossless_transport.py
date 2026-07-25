@@ -1985,14 +1985,10 @@ def _decompress_with_algo(algo_id: int, payload: bytes, original_size: int) -> b
     elif algo_id == _ALGO_ZLIB:
         raw = _decompress_zlib_capped(payload, original_size)
     elif algo_id == _ALGO_ZIPNN:
-        decompressor = _get_zipnn_decompressor()
-        if decompressor is None:
-            raise RuntimeError("Received ZipNN-wrapped tensor, but 'zipnn' is not installed")
-        # ZipNN's API offers no max-output cap, so a hostile payload can still
-        # expand past original_size during this call; the caller-level
-        # BLOOMBEE_LOSSLESS_MAX_DECODED_BYTES check bounds the declared size and
-        # the length check below rejects any mismatch after the fact.
-        raw = bytes(decompressor.decompress(payload))
+        raise ValueError(
+            "ZipNN lossless transport receive is disabled: the decoder API does not "
+            "provide a bounded-output decompression limit"
+        )
     else:
         raise ValueError(f"Unknown lossless wrapper algorithm id: {algo_id}")
 

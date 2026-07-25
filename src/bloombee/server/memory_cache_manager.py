@@ -215,6 +215,9 @@ class KVCacheManager:
                 if 0 < heads <= attention_heads:
                     return int(heads)
 
+        if source_bh % attention_heads == 0:
+            return attention_heads
+
         kv_heads = getattr(self.block_config, "num_key_value_heads", None)
         if kv_heads is None:
             groups = getattr(self.block_config, "num_key_value_groups", None)
