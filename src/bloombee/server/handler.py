@@ -2062,6 +2062,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                     release_slot=acquired_slot,
                 )
             )
+            # From here the background task owns releasing the limiter slot.
+            acquired_slot = False
             if is_log_channel_enabled("s2s_wire_logs"):
                 logger.info(
                     f"[S2S_PUSH_BREAKDOWN] step_id={metadata.get('step_id', 'unknown')} "
@@ -2083,6 +2085,8 @@ class TransformerConnectionHandler(ConnectionHandler):
             logger.debug(f"{MBPIPE_LOG_PREFIX} Micro-batch push queued in {queue_time:.1f}ms (sending in background)")
             
         except Exception as e:
+            if locals().get("acquired_slot", False):
+                await self._push_limiter.release(send_time_ms=0.0, success=False)
             logger.warning(
                 f"{MBPIPE_LOG_PREFIX} Failed to push micro-batch: {e}",
                 exc_info=True

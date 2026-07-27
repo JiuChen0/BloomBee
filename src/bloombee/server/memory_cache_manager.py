@@ -2229,6 +2229,7 @@ class KVCacheManager:
                     l_acc_target=cache_len, cache_tensors=cache_tensors,
                 )
 
-        except Exception as e:
+        except Exception:
             import logging
-            logging.error(f"Async cache reorder failed: {e}")
+            logging.exception("Async cache reorder failed")
+            raise
