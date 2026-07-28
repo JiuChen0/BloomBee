@@ -215,6 +215,13 @@ class KVCacheManager:
                 if 0 < heads <= attention_heads:
                     return int(heads)
 
+        # Some block implementations (notably the FlexGen LLaMA GQA path) expand
+        # emitted KV rows to attention-head layout before handing them to the
+        # backend. In non-microbatched mode there is no runtime batch metadata, so
+        # recognize that layout before falling back to config num_key_value_heads.
+        if source_bh > 0 and source_bh % attention_heads == 0:
+            return attention_heads
+
         kv_heads = getattr(self.block_config, "num_key_value_heads", None)
         if kv_heads is None:
             groups = getattr(self.block_config, "num_key_value_groups", None)

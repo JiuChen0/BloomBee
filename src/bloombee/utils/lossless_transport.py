@@ -77,6 +77,8 @@ _LOSSLESS_ZSTD_DICT_PATH_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH"
 _LOSSLESS_ZSTD_DICT_PATH_PREFILL_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_PREFILL"
 _LOSSLESS_ZSTD_DICT_PATH_DECODE_ENV = "BLOOMBEE_LOSSLESS_ZSTD_DICT_PATH_DECODE"
 _LOSSLESS_HYBRID_DICT_BLOCKS_ENV = "BLOOMBEE_LOSSLESS_HYBRID_DICT_BLOCKS"
+_LOSSLESS_ZIPNN_TRANSPORT_ENV = "BLOOMBEE_LOSSLESS_ZIPNN_TRANSPORT"
+_LOSSLESS_MAX_ORIGINAL_BYTES_ENV = "BLOOMBEE_LOSSLESS_MAX_ORIGINAL_BYTES"
 _TRANSPORT_PROFILE_CTX: contextvars.ContextVar[Optional[Dict[str, float]]] = contextvars.ContextVar(
     "bloombee_transport_profile", default=None
 )
@@ -1411,13 +1413,20 @@ def _supports_zipnn_compare(
     return _zipnn_lossless_dtype_supported(dtype_name)
 
 
+def _zipnn_transport_enabled() -> bool:
+    # ZipNN currently has no bounded-output decompression API. Keep it available
+    # for diagnostics, but require an explicit trust boundary decision for live
+    # transport so untrusted peers cannot force unbounded expansion.
+    return _get_env_bool(_LOSSLESS_ZIPNN_TRANSPORT_ENV, "0")
+
+
 def _supports_zipnn_transport(
     tensor: Optional[torch.Tensor],
     compression_type: runtime_pb2.CompressionType,
     raw_size: int,
     debug_context: Optional[Dict[str, object]],
 ) -> bool:
-    return _supports_zipnn_compare(tensor, compression_type, raw_size, debug_context)
+    return _zipnn_transport_enabled() and _supports_zipnn_compare(tensor, compression_type, raw_size, debug_context)
 
 
 def _zipnn_skip_reason(
@@ -1429,6 +1438,8 @@ def _zipnn_skip_reason(
     if _ZipNN is None:
         _warn_missing_zipnn_once()
         return "zipnn_unavailable"
+    if not _zipnn_transport_enabled():
+        return "zipnn_transport_disabled"
     if compression_type != runtime_pb2.CompressionType.NONE:
         return "zipnn_hivemind_compressed"
     if tensor is None or not torch.is_tensor(tensor):
@@ -1985,6 +1996,10 @@ def _decompress_with_algo(algo_id: int, payload: bytes, original_size: int) -> b
     elif algo_id == _ALGO_ZLIB:
         raw = _decompress_zlib_capped(payload, original_size)
     elif algo_id == _ALGO_ZIPNN:
+        if not _zipnn_transport_enabled():
+            raise ValueError(
+                f"Received ZipNN-wrapped tensor while {_LOSSLESS_ZIPNN_TRANSPORT_ENV}=0; rejecting"
+            )
         decompressor = _get_zipnn_decompressor()
         if decompressor is None:
             raise RuntimeError("Received ZipNN-wrapped tensor, but 'zipnn' is not installed")
@@ -2201,7 +2216,9 @@ def _max_decoded_bytes() -> int:
     swarm; without a bound a malicious peer could declare a multi-GB size
     and trigger huge allocations (zstd) or unbounded decompression (zipnn).
     """
-    return max(1, _get_env_int("BLOOMBEE_LOSSLESS_MAX_DECODED_BYTES", 1 << 30))
+    if _LOSSLESS_MAX_ORIGINAL_BYTES_ENV in os.environ:
+        return max(1, _get_env_int(_LOSSLESS_MAX_ORIGINAL_BYTES_ENV, 1 << 28))
+    return max(1, _get_env_int("BLOOMBEE_LOSSLESS_MAX_DECODED_BYTES", 1 << 28))
 
 
 def _parse_wrapper(buffer: bytes, *, strict: bool = True):
@@ -2505,7 +2522,7 @@ def unwrap_serialized_tensor(serialized_tensor: runtime_pb2.Tensor) -> runtime_p
         if original_size > _max_decoded_bytes():
             raise ValueError(
                 f"Lossless wrapper declares original_size={original_size} above the "
-                f"BLOOMBEE_LOSSLESS_MAX_DECODED_BYTES limit ({_max_decoded_bytes()}); rejecting"
+                f"{_LOSSLESS_MAX_ORIGINAL_BYTES_ENV} limit ({_max_decoded_bytes()}); rejecting"
             )
         if algo_id == _ALGO_ZSTD_BYTE_SPLIT:
             raw_buffer = _decode_zstd_byte_split_payload(payload, original_size)

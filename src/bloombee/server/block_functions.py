@@ -1263,10 +1263,10 @@ async def iterate_rpc_inference(
                 # Sort by mb_idx and merge
                 sorted_indices = sorted(accum['results'].keys())
                 expected_indices = list(range(int(accum.get('expected', len(sorted_indices)))))
+                merge_issues = []
                 if sorted_indices != expected_indices:
-                    logger.warning(
-                        f"{MBPIPE_LOG_PREFIX} Non-contiguous micro-batch indices for step_id={step_id}: "
-                        f"got={sorted_indices}, expected={expected_indices}"
+                    merge_issues.append(
+                        f"non-contiguous indices got={sorted_indices}, expected={expected_indices}"
                     )
 
                 # Validate merged layout coverage (offset continuity + full-batch size coverage)
@@ -1288,12 +1288,18 @@ async def iterate_rpc_inference(
                     layout_issues.append(
                         f"observed_total={observed_total}, full_batch_expected={full_batch_expected}"
                     )
-                if layout_issues:
-                    preview = "; ".join(layout_issues[:3])
-                    suffix = " ..." if len(layout_issues) > 3 else ""
-                    logger.warning(
+                merge_issues.extend(layout_issues)
+                if merge_issues:
+                    preview = "; ".join(merge_issues[:3])
+                    suffix = " ..." if len(merge_issues) > 3 else ""
+                    logger.error(
                         f"{MBPIPE_LOG_PREFIX} Micro-batch merge layout check failed for step_id={step_id}: "
                         f"{preview}{suffix}"
+                    )
+                    _drop_mb_step_state(mb_accum_key, accum=True)
+                    _drop_mb_step_state(overlap_tracking_key, overlap=True)
+                    raise ValueError(
+                        f"Invalid micro-batch merge layout for step_id={step_id}: {preview}{suffix}"
                     )
                 elif log_mb_detail:
                     logger.info(
