@@ -55,6 +55,23 @@ def test_full_batch_source_head_inference_prefers_attention_layout():
     assert block.index(attention_layout) < block.index(kv_heads)
 
 
+def test_gemma4_external_masks_are_merged_with_sliding_mask():
+    source = read_source("src/bloombee/models/gemma4/block.py")
+
+    assert "def _normalize_external_attention_mask" in source
+    assert "attention_mask = torch.minimum(attention_mask, layer_type_mask)" in source
+    assert "attention_mask = attention_mask.unsqueeze(1)" in source
+
+
+def test_mixtral_preserves_backend_attention_masks():
+    source = read_source("src/bloombee/models/mixtral/block.py")
+
+    assert "def _build_causal_attention_mask" in source
+    assert "def _normalize_attention_mask" in source
+    assert "attention_mask = _normalize_attention_mask(attention_mask, hidden_states.dtype)" in source
+    assert "attention_mask = None\n\n        position_ids" not in source
+
+
 def test_zipnn_transport_is_explicit_opt_in():
     source = read_source("src/bloombee/utils/lossless_transport.py")
     assert "_LOSSLESS_ZIPNN_TRANSPORT_ENV = \"BLOOMBEE_LOSSLESS_ZIPNN_TRANSPORT\"" in source
