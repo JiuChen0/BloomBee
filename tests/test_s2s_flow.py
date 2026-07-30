@@ -1,7 +1,26 @@
-from bloombee.server.s2s_flow import S2SLinkTelemetry
+import importlib.util
+import sys
+import types
+from pathlib import Path
+
+
+def _load_s2s_flow_module():
+    sys.modules.setdefault("bloombee", types.ModuleType("bloombee"))
+    sys.modules.setdefault("bloombee.utils", types.ModuleType("bloombee.utils"))
+    microbatch_config = types.ModuleType("bloombee.utils.microbatch_config")
+    microbatch_config.MBPIPE_LOG_PREFIX = "[MBPIPE]"
+    sys.modules["bloombee.utils.microbatch_config"] = microbatch_config
+
+    module_path = Path(__file__).resolve().parents[1] / "src" / "bloombee" / "server" / "s2s_flow.py"
+    spec = importlib.util.spec_from_file_location("bloombee.server.s2s_flow", module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_s2s_link_telemetry_initializes_and_records_windowed_samples():
+    S2SLinkTelemetry = _load_s2s_flow_module().S2SLinkTelemetry
     telemetry = S2SLinkTelemetry(label="rpc_push_microbatch:0:1->1:2", window_size=2)
 
     first_jitter = telemetry.record(
