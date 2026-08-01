@@ -176,6 +176,7 @@ def test_serialize_torch_tensor_zipnn_roundtrip(monkeypatch):
 
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_WRAPPER", "1")
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_ALGO", "zipnn")
+    monkeypatch.setenv("BLOOMBEE_LOSSLESS_ZIPNN_TRANSPORT", "1")
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_LAYOUT", "plain")
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_BYTES", "0")
     monkeypatch.setenv("BLOOMBEE_LOSSLESS_MIN_GAIN_BYTES", "0")
@@ -284,3 +285,19 @@ def test_unwrap_rejects_oversized_declared_size(monkeypatch):
     serialized = runtime_pb2.Tensor(buffer=fake_buffer)
     with pytest.raises(ValueError, match="MAX_DECODED_BYTES"):
         lt.unwrap_serialized_tensor(serialized)
+
+
+def test_unwrap_rejects_zipnn_transport_without_opt_in(monkeypatch):
+    monkeypatch.delenv("BLOOMBEE_LOSSLESS_ZIPNN_TRANSPORT", raising=False)
+    fake_buffer = lt._HEADER_STRUCT.pack(lt._MAGIC, lt._VERSION, lt._ALGO_ZIPNN, 0)
+    serialized = runtime_pb2.Tensor(buffer=fake_buffer)
+
+    with pytest.raises(ValueError, match="ZipNN lossless transport is disabled"):
+        lt.unwrap_serialized_tensor(serialized)
+
+
+def test_byte_split_decode_rejects_unsupported_elem_size():
+    payload = lt._BYTE_SPLIT_PAYLOAD_STRUCT.pack(1, 0)
+
+    with pytest.raises(ValueError, match="Unsupported byte-split elem_size=1"):
+        lt._decode_zstd_byte_split_payload(payload, 4)

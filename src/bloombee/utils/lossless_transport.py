@@ -1417,6 +1417,8 @@ def _supports_zipnn_transport(
     raw_size: int,
     debug_context: Optional[Dict[str, object]],
 ) -> bool:
+    if not _lossless_zipnn_transport_enabled():
+        return False
     return _supports_zipnn_compare(tensor, compression_type, raw_size, debug_context)
 
 
@@ -1426,6 +1428,8 @@ def _zipnn_skip_reason(
     raw_size: int,
     debug_context: Optional[Dict[str, object]],
 ) -> str:
+    if not _lossless_zipnn_transport_enabled():
+        return "zipnn_transport_disabled"
     if _ZipNN is None:
         _warn_missing_zipnn_once()
         return "zipnn_unavailable"
@@ -2010,6 +2014,15 @@ def _decompress_buffer(algo_id: int, payload: bytes, original_size: int) -> byte
     return _decompress_with_algo(algo_id, payload, original_size)
 
 
+def _lossless_zipnn_transport_enabled() -> bool:
+    return os.environ.get("BLOOMBEE_LOSSLESS_ZIPNN_TRANSPORT", "0") == "1"
+
+
+def _validate_byte_split_elem_size(elem_size: int) -> None:
+    if int(elem_size) not in (2, 4):
+        raise ValueError(f"Unsupported byte-split elem_size={elem_size}")
+
+
 def _build_plain_wrapper(raw: bytes) -> tuple[int, bytes]:
     algo_id, compressed = _compress_buffer(raw)
     if algo_id == 0:
@@ -2082,11 +2095,12 @@ def _decode_dict_byte_split_with(decompressor, payload: bytes, original_size: in
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
         raise ValueError(f"{label} byte-split payload is truncated")
     elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
+    _validate_byte_split_elem_size(elem_size)
     extracted_start = _BYTE_SPLIT_PAYLOAD_SIZE
     extracted_end = extracted_start + int(extracted_comp_size)
     if extracted_end > len(payload):
         raise ValueError(f"{label} byte-split payload extracted segment is truncated")
-    if original_size % max(1, elem_size) != 0:
+    if original_size % elem_size != 0:
         raise ValueError(f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}")
 
     extracted_comp = payload[extracted_start:extracted_end]
@@ -2120,6 +2134,7 @@ def _decode_zstd_byte_split_payload(payload: bytes, original_size: int) -> bytes
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
         raise ValueError("Byte-split payload is truncated")
     elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
+    _validate_byte_split_elem_size(elem_size)
     extracted_start = _BYTE_SPLIT_PAYLOAD_SIZE
     extracted_end = extracted_start + int(extracted_comp_size)
     if extracted_end > len(payload):
@@ -2127,7 +2142,7 @@ def _decode_zstd_byte_split_payload(payload: bytes, original_size: int) -> bytes
 
     extracted_comp = payload[extracted_start:extracted_end]
     remaining_comp = payload[extracted_end:]
-    if original_size % max(1, elem_size) != 0:
+    if original_size % elem_size != 0:
         raise ValueError(f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}")
 
     extracted_raw_size = original_size // elem_size
@@ -2165,11 +2180,12 @@ def _decode_zstd_byte_split_high_only_payload(payload: bytes, original_size: int
     if len(payload) < _BYTE_SPLIT_PAYLOAD_SIZE:
         raise ValueError("byte_split_high_only payload is truncated")
     elem_size, extracted_comp_size = _BYTE_SPLIT_PAYLOAD_STRUCT.unpack_from(payload, 0)
+    _validate_byte_split_elem_size(elem_size)
     start = _BYTE_SPLIT_PAYLOAD_SIZE
     end = start + int(extracted_comp_size)
     if end > len(payload):
         raise ValueError("byte_split_high_only extracted segment is truncated")
-    if original_size % max(1, elem_size) != 0:
+    if original_size % elem_size != 0:
         raise ValueError(
             f"Invalid byte-split size/original_size combination: {elem_size}, {original_size}"
         )
@@ -2201,7 +2217,21 @@ def _max_decoded_bytes() -> int:
     swarm; without a bound a malicious peer could declare a multi-GB size
     and trigger huge allocations (zstd) or unbounded decompression (zipnn).
     """
-    return max(1, _get_env_int("BLOOMBEE_LOSSLESS_MAX_DECODED_BYTES", 1 << 30))
+    if "BLOOMBEE_LOSSLESS_MAX_ORIGINAL_BYTES" in os.environ:
+        return max(1, _get_env_int("BLOOMBEE_LOSSLESS_MAX_ORIGINAL_BYTES", 256 << 20))
+    return max(1, _get_env_int("BLOOMBEE_LOSSLESS_MAX_DECODED_BYTES", 256 << 20))
+
+
+def _validate_lossless_original_size(original_size: int) -> None:
+    if original_size < 0:
+        raise ValueError(f"Invalid lossless wrapper original_size: {original_size}")
+    max_original = _max_decoded_bytes()
+    if original_size > max_original:
+        raise ValueError(
+            f"Lossless wrapper declares original_size={original_size} above the "
+            f"BLOOMBEE_LOSSLESS_MAX_ORIGINAL_BYTES/BLOOMBEE_LOSSLESS_MAX_DECODED_BYTES "
+            f"limit ({max_original}); rejecting"
+        )
 
 
 def _parse_wrapper(buffer: bytes, *, strict: bool = True):
@@ -2502,11 +2532,9 @@ def unwrap_serialized_tensor(serialized_tensor: runtime_pb2.Tensor) -> runtime_p
             return serialized_tensor
 
         algo_id, original_size, payload = parsed
-        if original_size > _max_decoded_bytes():
-            raise ValueError(
-                f"Lossless wrapper declares original_size={original_size} above the "
-                f"BLOOMBEE_LOSSLESS_MAX_DECODED_BYTES limit ({_max_decoded_bytes()}); rejecting"
-            )
+        _validate_lossless_original_size(original_size)
+        if algo_id == _ALGO_ZIPNN and not _lossless_zipnn_transport_enabled():
+            raise ValueError("ZipNN lossless transport is disabled; set BLOOMBEE_LOSSLESS_ZIPNN_TRANSPORT=1 to opt in")
         if algo_id == _ALGO_ZSTD_BYTE_SPLIT:
             raw_buffer = _decode_zstd_byte_split_payload(payload, original_size)
         elif algo_id == _ALGO_ZSTD_DICT_BYTE_SPLIT:

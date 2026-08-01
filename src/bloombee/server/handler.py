@@ -1782,6 +1782,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         
         push_start_time = perf_counter()
         
+        acquired_slot = False
+        release_slot_handed_off = False
         try:
             next_servers = metadata.get("next_servers")
             if not next_servers:
@@ -2015,7 +2017,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             # Prioritize MB0 delivery to reduce per-step startup bubble on downstream stage.
             mb0_bypass_enabled = os.environ.get("BLOOMBEE_MB0_SEMAPHORE_BYPASS", "1") == "1"
             bypass_limiter = mb0_bypass_enabled and int(mb_idx) == 0
-            acquired_slot = False
             sem_wait_time = 0.0
             if not bypass_limiter:
                 sem_wait_time = await self._push_limiter.acquire()
@@ -2062,6 +2063,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                     release_slot=acquired_slot,
                 )
             )
+            release_slot_handed_off = acquired_slot
             if is_log_channel_enabled("s2s_wire_logs"):
                 logger.info(
                     f"[S2S_PUSH_BREAKDOWN] step_id={metadata.get('step_id', 'unknown')} "
@@ -2087,6 +2089,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                 f"{MBPIPE_LOG_PREFIX} Failed to push micro-batch: {e}",
                 exc_info=True
             )
+            if acquired_slot and not release_slot_handed_off and hasattr(self, "_push_limiter"):
+                await self._push_limiter.release(send_time_ms=0.0, success=False)
 
     async def _do_rpc_push_async(
         self,
