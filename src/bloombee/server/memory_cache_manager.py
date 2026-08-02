@@ -215,6 +215,14 @@ class KVCacheManager:
                 if 0 < heads <= attention_heads:
                     return int(heads)
 
+        # Some model wrappers (notably FlexGen Llama GQA) expand compact KV
+        # heads to attention-head layout before returning present K/V. In that
+        # case BH is exactly batch * attention_heads and must be copied as-is;
+        # falling through to config.num_key_value_heads would split one batch's
+        # expanded heads across multiple fake batches and corrupt the cache.
+        if source_bh % attention_heads == 0:
+            return attention_heads
+
         kv_heads = getattr(self.block_config, "num_key_value_heads", None)
         if kv_heads is None:
             groups = getattr(self.block_config, "num_key_value_groups", None)
