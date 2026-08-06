@@ -18,6 +18,8 @@ def test_spec_cache_reorder_update_blocks_until_reorder_finishes():
         completed.set()
 
     manager._do_reorder_task = MethodType(fake_reorder_task, manager)
+    manager._pending_reorder_lock = threading.Lock()
+    manager._pending_reorder = None
 
     # Present only to make this test fail against the old implementation,
     # which submitted the reorder work to a background executor and returned.
