@@ -1311,16 +1311,18 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
         if is_prefill:
             # Prefill phase
-            # Use target_seq_len as the total length when provided, otherwise max_prefill_len + tree_len
-            max_prefill_len = prefill_length.max().item()
+            # Use target_seq_len as the total length when provided, otherwise max_prefill_len + tree_len.
+            # The tree suffix starts after the real prompt prefix, not after the
+            # fixed width/depth template. EAGLE can emit larger dynamic trees.
+            max_prefill_len = int(prefill_length.max().item())
 
             if target_seq_len is not None:
-                total_len = target_seq_len
-                # Derive the prompt-part length from target_seq_len
-                prompt_part_len = target_seq_len - tree_len
+                total_len = int(target_seq_len)
+                prompt_part_len = min(max_prefill_len, total_len)
             else:
                 total_len = max_prefill_len + tree_len
                 prompt_part_len = max_prefill_len
+            actual_tree_len = max(0, total_len - prompt_part_len)
 
             full_position_ids = torch.zeros(B, total_len, dtype=torch.long, device=device)
 
@@ -1331,8 +1333,42 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
             # Tree-segment position ids
             # tree_base is the per-batch prompt-end position
-            tree_base = prefill_length.unsqueeze(1)
-            full_position_ids[:, prompt_part_len:] = tree_base + tree_position_ids.unsqueeze(0)
+            if actual_tree_len > 0:
+                tree_base = prefill_length.unsqueeze(1)
+                tree_offsets = None
+                if tree_attention_mask is not None:
+                    mask = tree_attention_mask.to(device)
+                    if mask.ndim == 2:
+                        mask = mask.unsqueeze(0)
+                    if mask.ndim >= 3 and mask.shape[0] != B:
+                        mask = self._slice_batch_aligned(
+                            mask,
+                            batch_offset,
+                            batch_offset + B,
+                            mask.shape[0],
+                        )
+                    if mask.ndim >= 3 and mask.shape[0] == 1 and B > 1:
+                        mask = mask.expand(B, -1, -1)
+                    if (
+                        mask.ndim >= 3
+                        and mask.shape[0] == B
+                        and mask.shape[-2] >= total_len
+                        and mask.shape[-1] >= total_len
+                    ):
+                        local_tree_mask = mask[:, prompt_part_len:total_len, prompt_part_len:total_len]
+                        if local_tree_mask.shape[1] == actual_tree_len:
+                            tree_offsets = local_tree_mask.to(torch.long).sum(dim=-1).sub_(1).clamp_min_(0)
+
+                if tree_offsets is None:
+                    if actual_tree_len > tree_len:
+                        tree_offsets = torch.zeros(actual_tree_len, dtype=torch.long, device=device)
+                        tree_offsets[:tree_len] = tree_position_ids
+                        if tree_len > 0:
+                            tree_offsets[tree_len:] = tree_position_ids[-1]
+                    else:
+                        tree_offsets = tree_position_ids[:actual_tree_len]
+                    tree_offsets = tree_offsets.unsqueeze(0).expand(B, -1)
+                full_position_ids[:, prompt_part_len:] = tree_base + tree_offsets
 
             return full_position_ids
 
