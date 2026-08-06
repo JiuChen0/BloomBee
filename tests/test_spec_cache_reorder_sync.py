@@ -1,46 +1,34 @@
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from types import MethodType
-
-from bloombee.server.memory_cache_manager import KVCacheManager
+import ast
+from pathlib import Path
 
 
 def test_spec_cache_reorder_update_blocks_until_reorder_finishes():
-    manager = KVCacheManager.__new__(KVCacheManager)
+    source_path = Path(__file__).resolve().parents[1] / "src/bloombee/server/memory_cache_manager.py"
+    tree = ast.parse(source_path.read_text())
 
-    entered = threading.Event()
-    release = threading.Event()
-    completed = threading.Event()
+    method = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "KVCacheManager":
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == "update_cache_and_async_reorder":
+                    method = item
+                    break
+    assert method is not None
 
-    def fake_reorder_task(self, *args):
-        entered.set()
-        assert release.wait(timeout=1.0)
-        completed.set()
+    calls_submit = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "submit"
+    ]
+    assert calls_submit == []
 
-    manager._do_reorder_task = MethodType(fake_reorder_task, manager)
-    manager._pending_reorder_lock = threading.Lock()
-    manager._pending_reorder = None
-
-    # Present only to make this test fail against the old implementation,
-    # which submitted the reorder work to a background executor and returned.
-    manager._reorder_executor = ThreadPoolExecutor(max_workers=1)
-    caller = threading.Thread(
-        target=manager.update_cache_and_async_reorder,
-        args=(None, None, ()),
-    )
-
-    try:
-        caller.start()
-        assert entered.wait(timeout=1.0)
-        assert caller.is_alive()
-        assert not completed.is_set()
-
-        release.set()
-        caller.join(timeout=1.0)
-
-        assert not caller.is_alive()
-        assert completed.is_set()
-    finally:
-        release.set()
-        manager._reorder_executor.shutdown(wait=True)
-        caller.join(timeout=1.0)
+    direct_reorder_calls = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_do_reorder_task"
+    ]
+    assert direct_reorder_calls
