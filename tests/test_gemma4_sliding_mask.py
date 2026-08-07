@@ -8,7 +8,7 @@ exercise the pure function so they don't need a checkpoint or GPU.
 import pytest
 import torch
 
-from bloombee.models.gemma4.block import _build_layer_type_mask
+from bloombee.models.gemma4.block import _build_layer_type_mask, _compose_layer_attention_mask
 
 
 def _is_masked(mask, q, k):
@@ -146,3 +146,25 @@ def test_sliding_with_none_window_falls_back_to_plain_causal():
         device=torch.device("cpu"),
     )
     assert torch.equal(mask_none, mask_full)
+
+
+def test_backend_mask_is_merged_with_sliding_window():
+    external = torch.zeros((2, 2, 7), dtype=torch.float32)
+    external[1, 0, 4] = torch.finfo(torch.float32).min
+
+    mask = _compose_layer_attention_mask(
+        external,
+        layer_type="sliding_attention",
+        sliding_window=3,
+        query_length=2,
+        past_length=5,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+    assert mask.shape == (2, 1, 2, 7)
+    # Query 0 is absolute position 5; sliding window 3 allows keys 3..5 only.
+    assert NEG_INF_OK(mask[0, 0, 0, 2].item())
+    assert mask[0, 0, 0, 3].item() == 0.0
+    # The backend mask must still win for otherwise-visible positions.
+    assert NEG_INF_OK(mask[1, 0, 0, 4].item())
