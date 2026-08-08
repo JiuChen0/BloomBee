@@ -680,13 +680,18 @@ class KVCacheManager:
         k_data = k_cache.data if hasattr(k_cache, "data") else k_cache
         v_data = v_cache.data if hasattr(v_cache, "data") else v_cache
         S_total, BH_full, _D = k_data.shape
-        H = getattr(self.block_config, "num_attention_heads", 1)
+        H = int(getattr(self.block_config, "num_attention_heads", 1))
+        if H <= 0 or BH_full % H != 0:
+            raise RuntimeError(f"[ROW_COMPACT] invalid cache head layout: BH={BH_full}, H={H}")
         B_cache = BH_full // H
         perm = perm.to(device=k_data.device, dtype=torch.long)
         n = perm.numel()
-        assert 0 < n <= B_cache, (
-            f"[ROW_COMPACT] perm has {n} entries but cache holds {B_cache} rows"
-        )
+        if not 0 < n <= B_cache:
+            raise ValueError(f"[ROW_COMPACT] perm has {n} entries but cache holds {B_cache} rows")
+        if bool(((perm < 0) | (perm >= B_cache)).any().item()):
+            raise ValueError(f"[ROW_COMPACT] perm contains out-of-range row indices for cache size {B_cache}")
+        if int(perm.unique().numel()) != int(n):
+            raise ValueError("[ROW_COMPACT] perm contains duplicate row indices")
         # Expand batch indices to BH indices: bh_perm[i*H + h] = perm[i]*H + h.
         # Advanced indexing materializes the RHS before assignment, so the
         # in-place front-gather is safe even when src/dst overlap.
