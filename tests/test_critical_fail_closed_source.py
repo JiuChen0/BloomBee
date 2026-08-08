@@ -61,3 +61,17 @@ def test_local_spec_mask_mismatch_fails_closed():
     assert "falling back to all-prefix-valid cache mask" not in source
     assert "raise RuntimeError" in source
     assert "refusing to expose all cache columns" in source
+
+
+def test_server_session_history_uses_active_row_gather():
+    source = _function_source(
+        "src/bloombee/client/inference_session.py",
+        "_ServerInferenceSession",
+        "step",
+    )
+
+    assert "self.history = self.history[: inputs.shape[0]]" not in source
+    assert "row_perm = hypo_ids.to(device=self.history.device, dtype=torch.long)" in source
+    assert "self.history = self.history.index_select(0, row_perm)" in source
+    assert "history batch mismatch without a valid active-row gather" in source
+    assert "duplicate indices" in source

@@ -204,11 +204,30 @@ class _ServerInferenceSession:
             self.history = inputs # assign the current inputs to the history log
         elif self.history.shape[1] == self._position: # if the length of the history equals the current position
             if self.history.shape[0] != inputs.shape[0]:
-                # Active-row compaction: the step batch shrank (or was permuted)
-                # mid-session. The full history is only replayed on the first
-                # (un-stepped) request; past that point only the width matters,
-                # so keep the leading compacted rows.
-                self.history = self.history[: inputs.shape[0]]
+                # Active-row compaction: mirror the server KV row gather on the
+                # replay buffer. A later session retry replays this history to
+                # rebuild remote KV, so truncating leading rows would replay the
+                # wrong original sequences after a non-prefix gather.
+                if (
+                    hypo_ids is None
+                    or is_dummy(hypo_ids)
+                    or not torch.is_tensor(hypo_ids)
+                    or hypo_ids.ndim != 1
+                    or int(hypo_ids.numel()) != int(inputs.shape[0])
+                ):
+                    raise RuntimeError(
+                        "Server session history batch mismatch without a valid active-row gather: "
+                        f"history_rows={self.history.shape[0]}, input_rows={inputs.shape[0]}"
+                    )
+                row_perm = hypo_ids.to(device=self.history.device, dtype=torch.long)
+                if bool(((row_perm < 0) | (row_perm >= self.history.shape[0])).any().item()):
+                    raise ValueError(
+                        "Active-row gather for server session history contains out-of-range indices: "
+                        f"history_rows={self.history.shape[0]}"
+                    )
+                if int(row_perm.unique().numel()) != int(row_perm.numel()):
+                    raise ValueError("Active-row gather for server session history contains duplicate indices")
+                self.history = self.history.index_select(0, row_perm)
             self.history = torch.cat([self.history, inputs[:, -n_input_tokens:]], dim=1) # append the last n_input_tokens of the current input to history
         # history can cat input if it's spec decoding and pruning happened, need fall  back
         # assert self.history.shape[1] == self._position + n_input_tokens,
