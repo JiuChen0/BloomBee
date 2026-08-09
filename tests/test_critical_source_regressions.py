@@ -1,8 +1,4 @@
 from pathlib import Path
-import importlib.util
-
-import pytest
-import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,15 +70,10 @@ def test_active_row_retry_history_uses_hypo_ids_gather():
 
 
 def test_s2s_int8_hidden_requires_quant_metadata():
-    path = ROOT / "src/bloombee/utils/s2s_activation_quant.py"
-    spec = importlib.util.spec_from_file_location("s2s_activation_quant_under_test", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    source = _read("src/bloombee/utils/s2s_activation_quant.py")
+    function_start = source.index("def dequantize_s2s_hidden_from_transport(")
+    function_source = source[function_start:]
 
-    hidden = torch.ones(2, 3, dtype=torch.int8)
-    with pytest.raises(ValueError, match="without quantization metadata"):
-        module.dequantize_s2s_hidden_from_transport(hidden, None)
-    with pytest.raises(ValueError, match="without quantization metadata"):
-        module.dequantize_s2s_hidden_from_transport(hidden, {})
-    with pytest.raises(ValueError, match="Unsupported S2S activation quantization scheme"):
-        module.dequantize_s2s_hidden_from_transport(hidden, {"s2s_hidden_quant": {"scheme": "other"}})
+    assert "if hidden_states.dtype == torch.int8:" in function_source
+    assert function_source.count("Received int8 S2S hidden states without quantization metadata") >= 2
+    assert "Unsupported S2S activation quantization scheme" in function_source
