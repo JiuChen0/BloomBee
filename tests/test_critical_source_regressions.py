@@ -1,4 +1,8 @@
 from pathlib import Path
+import importlib.util
+
+import pytest
+import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,3 +59,30 @@ def test_mixed_device_gpu_multiplexing_fails_fast():
     message = "MixedDevice cache + GPU micro-batch multiplexing is unsupported"
     assert source.count(message) >= 2
     assert "raise RuntimeError(" in source[source.index(message) - 100: source.index(message) + 200]
+
+
+def test_active_row_retry_history_uses_hypo_ids_gather():
+    source = _read("src/bloombee/client/inference_session.py")
+    start = source.index("row_selector = None")
+    end = source.index("self.history = torch.cat", start)
+    block = source[start:end]
+
+    assert "hypo_ids" in block
+    assert "row_selector = hypo_ids.to" in block
+    assert "self.history = self.history.index_select(0, row_selector)" in block
+    assert "Active-row compaction hypo_ids are out of bounds" in block
+
+
+def test_s2s_int8_hidden_requires_quant_metadata():
+    path = ROOT / "src/bloombee/utils/s2s_activation_quant.py"
+    spec = importlib.util.spec_from_file_location("s2s_activation_quant_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    hidden = torch.ones(2, 3, dtype=torch.int8)
+    with pytest.raises(ValueError, match="without quantization metadata"):
+        module.dequantize_s2s_hidden_from_transport(hidden, None)
+    with pytest.raises(ValueError, match="without quantization metadata"):
+        module.dequantize_s2s_hidden_from_transport(hidden, {})
+    with pytest.raises(ValueError, match="Unsupported S2S activation quantization scheme"):
+        module.dequantize_s2s_hidden_from_transport(hidden, {"s2s_hidden_quant": {"scheme": "other"}})

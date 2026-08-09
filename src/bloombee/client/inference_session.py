@@ -203,12 +203,40 @@ class _ServerInferenceSession:
         if self.history is None: # if the history log is empty
             self.history = inputs # assign the current inputs to the history log
         elif self.history.shape[1] == self._position: # if the length of the history equals the current position
-            if self.history.shape[0] != inputs.shape[0]:
+            row_selector = None
+            if (
+                hypo_ids is not None
+                and not is_dummy(hypo_ids)
+                and torch.is_tensor(hypo_ids)
+                and hypo_ids.ndim == 1
+                and hypo_ids.numel() == inputs.shape[0]
+            ):
+                row_selector = hypo_ids.to(device=self.history.device, dtype=torch.long)
+            row_selector_is_identity = (
+                row_selector is not None
+                and row_selector.numel() == self.history.shape[0]
+                and torch.equal(
+                    row_selector,
+                    torch.arange(row_selector.numel(), device=row_selector.device, dtype=row_selector.dtype),
+                )
+            )
+            if self.history.shape[0] != inputs.shape[0] or (row_selector is not None and not row_selector_is_identity):
                 # Active-row compaction: the step batch shrank (or was permuted)
-                # mid-session. The full history is only replayed on the first
-                # (un-stepped) request; past that point only the width matters,
-                # so keep the leading compacted rows.
-                self.history = self.history[: inputs.shape[0]]
+                # mid-session. Retry replays the full history into a new server
+                # cache, so history must use the same row gather sent via
+                # hypo_ids; slicing the leading rows would replay finished rows.
+                if row_selector is not None:
+                    if row_selector.numel() > 0 and (
+                        int(row_selector.min().item()) < 0
+                        or int(row_selector.max().item()) >= self.history.shape[0]
+                    ):
+                        raise ValueError(
+                            "Active-row compaction hypo_ids are out of bounds for replay history: "
+                            f"hypo_ids={row_selector.tolist()}, history_batch={self.history.shape[0]}"
+                        )
+                    self.history = self.history.index_select(0, row_selector)
+                else:
+                    self.history = self.history[: inputs.shape[0]]
             self.history = torch.cat([self.history, inputs[:, -n_input_tokens:]], dim=1) # append the last n_input_tokens of the current input to history
         # history can cat input if it's spec decoding and pruning happened, need fall  back
         # assert self.history.shape[1] == self._position + n_input_tokens,
