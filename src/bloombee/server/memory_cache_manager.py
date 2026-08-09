@@ -785,11 +785,10 @@ class KVCacheManager:
         if full_batch_size > 0 and micro_batch_size > 0:
             if gpu_multiplexing:
                 if hasattr(k_cache, "device") and getattr(getattr(k_cache, "device", None), "device_type", None) == DeviceType.MIXED:
-                    self._log_kv_once(
-                        ("kv_mixed_multiplex_unsupported", int(full_batch_size), int(micro_batch_size)),
-                        "[KVCACHE_OFFLOAD_UNSUPPORTED] MixedDevice cache + GPU multiplexing is not equivalent to per-microbatch KV staging. "
-                        "cache_gpu/cache_cpu splits one micro-batch across devices, but does not preserve separate KV snapshots for other micro-batches. "
-                        "This can change activation values and make wire-byte compression ratios look artificially better.",
+                    raise RuntimeError(
+                        "MixedDevice cache + GPU micro-batch multiplexing is unsupported: "
+                        "cache_gpu/cache_cpu splits one micro-batch across devices but does not preserve "
+                        "separate KV snapshots for other micro-batches. Disable KV offload or GPU multiplexing."
                     )
                 mb_index = self._compute_microbatch_index(batch_offset, micro_batch_size, full_batch_size)
                 working_slot, slot_batch_start, active_batch_size, _ = self._resolve_working_slot(
@@ -1542,6 +1541,12 @@ class KVCacheManager:
         )
 
         if gpu_multiplexing:
+            if hasattr(k_cache, "device") and getattr(getattr(k_cache, "device", None), "device_type", None) == DeviceType.MIXED:
+                raise RuntimeError(
+                    "MixedDevice cache + GPU micro-batch multiplexing is unsupported: "
+                    "cache_gpu/cache_cpu splits one micro-batch across devices but does not preserve "
+                    "separate KV snapshots for other micro-batches. Disable KV offload or GPU multiplexing."
+                )
             self._log_kv_once(
                 ("kv_write_mode", "multiplex"),
                 "[MBPIPE_KV_VERIFY] KV WRITE mode: GPU MULTIPLEXING (micro-batches write into a bounded set of GPU working slots)",

@@ -10,6 +10,15 @@ from transformers.models.mixtral.modeling_mixtral import (
 from bloombee.utils.cache_compat import make_past_kv_cache, make_empty_kv_cache, read_kv_from_cache
 
 
+def _to_additive_4d_mask(mask: torch.Tensor, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    if mask.dim() == 3:
+        mask = mask.unsqueeze(1)
+    if mask.dtype == torch.bool:
+        additive = torch.full(mask.shape, torch.finfo(dtype).min, dtype=dtype, device=device)
+        return additive.masked_fill(mask.to(device=device), 0.0)
+    return mask.to(device=device, dtype=dtype)
+
+
 class WrappedMixtralBlock(MixtralDecoderLayer):
     def __init__(self, config: MixtralConfig, layer_idx: int):
         super().__init__(config, layer_idx)
@@ -57,9 +66,24 @@ class WrappedMixtralBlock(MixtralDecoderLayer):
         elif use_cache:
             past_key_value = make_empty_kv_cache(self.layer_idx)
 
-        # tf 5.x attention implementations handle causal masking internally when
-        # attention_mask=None. No need for the deprecated _prepare_4d_causal_* helpers.
-        attention_mask = None
+        if attention_mask is None:
+            total_len = past_key_values_length + seq_length
+            neg_inf = torch.finfo(hidden_states.dtype).min
+            causal = torch.full(
+                (seq_length, total_len),
+                neg_inf,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            if total_len > 0:
+                causal = torch.triu(causal, diagonal=past_key_values_length + 1)
+            attention_mask = causal.unsqueeze(0).unsqueeze(0)
+        else:
+            attention_mask = _to_additive_4d_mask(
+                attention_mask,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
 
         position_ids = kwargs.pop("position_ids", None)
         if position_ids is None:
