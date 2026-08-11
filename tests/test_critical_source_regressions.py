@@ -18,9 +18,11 @@ def test_session_history_uses_active_row_gather():
 def test_spec_cache_valid_mask_fails_closed_on_batch_mismatch():
     source = _source("src/bloombee/server/backend.py")
     fn = source[source.index("    def _spec_cache_valid_mask("): source.index("    def _expand_local_tree_attention_mask(")]
+    mismatch_block = fn[fn.index("        if ids.ndim < 2 or ids.shape[0] != batch_size:"): fn.index("        valid_mask = ids >= 0")]
 
-    assert "refusing to mark all prefix cache slots valid" in fn
-    assert "return torch.ones(batch_size, cache_len" not in fn
+    assert "refusing to mark all prefix cache slots valid" in mismatch_block
+    assert "raise RuntimeError" in mismatch_block
+    assert "return torch.ones(batch_size, cache_len" not in mismatch_block
 
 
 def test_microbatch_merge_layout_validation_is_fatal():
@@ -71,7 +73,7 @@ def test_s2s_int8_hidden_states_require_quant_metadata():
 
 def test_active_row_cache_compaction_validates_permutation():
     source = _source("src/bloombee/server/memory_cache_manager.py")
-    fn = source[source.index("    def permute_batch_rows("): source.index("    def _resolve_working_slot(")]
+    fn = source[source.index("    def permute_batch_rows("): source.index("    async def use_cache(")]
 
     assert "perm contains out-of-range rows" in fn
     assert "perm contains duplicate rows" in fn
