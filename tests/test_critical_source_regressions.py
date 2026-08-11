@@ -73,7 +73,7 @@ def test_s2s_int8_hidden_states_require_quant_metadata():
 
 def test_active_row_cache_compaction_validates_permutation():
     source = _source("src/bloombee/server/memory_cache_manager.py")
-    fn = source[source.index("    def permute_batch_rows("): source.index("    async def use_cache(")]
+    fn = source[source.index("    def permute_batch_rows("): source.index("    def tokens_left(")]
 
     assert "perm contains out-of-range rows" in fn
     assert "perm contains duplicate rows" in fn
