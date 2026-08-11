@@ -687,6 +687,10 @@ class KVCacheManager:
         assert 0 < n <= B_cache, (
             f"[ROW_COMPACT] perm has {n} entries but cache holds {B_cache} rows"
         )
+        if bool((perm < 0).any().item()) or bool((perm >= B_cache).any().item()):
+            raise ValueError(f"[ROW_COMPACT] perm contains out-of-range rows for cache batch {B_cache}: {perm.tolist()}")
+        if torch.unique(perm).numel() != n:
+            raise ValueError(f"[ROW_COMPACT] perm contains duplicate rows: {perm.tolist()}")
         # Expand batch indices to BH indices: bh_perm[i*H + h] = perm[i]*H + h.
         # Advanced indexing materializes the RHS before assignment, so the
         # in-place front-gather is safe even when src/dst overlap.

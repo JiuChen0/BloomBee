@@ -1369,7 +1369,8 @@ async def iterate_rpc_inference(
                 if layout_issues:
                     preview = "; ".join(layout_issues[:3])
                     suffix = " ..." if len(layout_issues) > 3 else ""
-                    logger.warning(
+                    _drop_mb_step_state(mb_accum_key, accum=True)
+                    raise ValueError(
                         f"{MBPIPE_LOG_PREFIX} Micro-batch merge layout check failed for step_id={step_id}: "
                         f"{preview}{suffix}"
                     )

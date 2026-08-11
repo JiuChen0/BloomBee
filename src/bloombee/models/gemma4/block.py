@@ -165,15 +165,16 @@ class WrappedGemma4Block(_BaseDecoderLayer):
         #     builds this as a dict `{full: ..., sliding: ...}` at the
         #     model level; BloomBee wraps bare layers so we do it here
         #     per-block, keyed on `self.layer_type`.
+        layer_type_mask = _build_layer_type_mask(
+            layer_type=self.layer_type,
+            sliding_window=self.sliding_window,
+            query_length=seq_length,
+            past_length=past_key_values_length,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
         if attention_mask is None:
-            attention_mask = _build_layer_type_mask(
-                layer_type=self.layer_type,
-                sliding_window=self.sliding_window,
-                query_length=seq_length,
-                past_length=past_key_values_length,
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
+            attention_mask = layer_type_mask
         elif attention_mask.dim() == 3:
             # BloomBee's backend builds the mask as [B, S, K]; Gemma4 attention
             # expects 4D [B, 1, S, K] so it broadcasts over the heads dim.
@@ -181,6 +182,19 @@ class WrappedGemma4Block(_BaseDecoderLayer):
             # tensor b (B) at non-singleton dimension 1" (same root cause as the
             # Qwen3 fix in 1be0a3e).
             attention_mask = attention_mask.unsqueeze(1)
+        if attention_mask is not layer_type_mask:
+            attention_mask = attention_mask.to(device=hidden_states.device)
+            if attention_mask.dtype == torch.bool:
+                neg_inf = torch.finfo(hidden_states.dtype).min
+                attention_mask = torch.where(
+                    attention_mask,
+                    torch.tensor(0.0, dtype=hidden_states.dtype, device=hidden_states.device),
+                    torch.tensor(neg_inf, dtype=hidden_states.dtype, device=hidden_states.device),
+                )
+            elif attention_mask.dtype != hidden_states.dtype:
+                attention_mask = attention_mask.to(dtype=hidden_states.dtype)
+            if attention_mask.shape[-2:] == layer_type_mask.shape[-2:]:
+                attention_mask = torch.minimum(attention_mask, layer_type_mask)
 
         position_ids = kwargs.pop("position_ids", None)
         if position_ids is None:

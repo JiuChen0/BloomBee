@@ -206,9 +206,24 @@ class _ServerInferenceSession:
             if self.history.shape[0] != inputs.shape[0]:
                 # Active-row compaction: the step batch shrank (or was permuted)
                 # mid-session. The full history is only replayed on the first
-                # (un-stepped) request; past that point only the width matters,
-                # so keep the leading compacted rows.
-                self.history = self.history[: inputs.shape[0]]
+                # (un-stepped) request, so keep it aligned with the same row
+                # gather the server applies to KV cache rows.
+                if torch.is_tensor(hypo_ids) and not is_dummy(hypo_ids) and hypo_ids.ndim == 1:
+                    if hypo_ids.numel() != inputs.shape[0]:
+                        raise ValueError(
+                            f"Cannot align replay history: hypo_ids has {hypo_ids.numel()} rows, "
+                            f"inputs has {inputs.shape[0]}"
+                        )
+                    history_rows = self.history.shape[0]
+                    gather = hypo_ids.to(device=self.history.device, dtype=torch.long)
+                    if bool((gather < 0).any().item()) or bool((gather >= history_rows).any().item()):
+                        raise ValueError(
+                            f"Cannot align replay history with out-of-range hypo_ids={hypo_ids.tolist()} "
+                            f"for history batch={history_rows}"
+                        )
+                    self.history = self.history.index_select(0, gather)
+                else:
+                    self.history = self.history[: inputs.shape[0]]
             self.history = torch.cat([self.history, inputs[:, -n_input_tokens:]], dim=1) # append the last n_input_tokens of the current input to history
         # history can cat input if it's spec decoding and pruning happened, need fall  back
         # assert self.history.shape[1] == self._position + n_input_tokens,
