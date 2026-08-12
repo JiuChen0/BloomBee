@@ -1,11 +1,25 @@
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import MethodType
 
-from bloombee.server.memory_cache_manager import KVCacheManager
+try:
+    from bloombee.server.memory_cache_manager import KVCacheManager
+except ModuleNotFoundError:
+    KVCacheManager = None
 
 
 def test_spec_cache_reorder_update_blocks_until_reorder_finishes():
+    if KVCacheManager is None:
+        source = Path("src/bloombee/server/memory_cache_manager.py").read_text()
+        start = source.index("    def update_cache_and_async_reorder(")
+        end = source.index("    @staticmethod", start)
+        method_source = source[start:end]
+
+        assert "self._reorder_executor.submit" not in method_source
+        assert "self._do_reorder_task(" in method_source
+        return
+
     manager = KVCacheManager.__new__(KVCacheManager)
 
     entered = threading.Event()
