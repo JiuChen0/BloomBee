@@ -9,12 +9,20 @@ except ModuleNotFoundError:
     KVCacheManager = None
 
 
+def _method_source(path: str, name: str, next_marker: str) -> str:
+    source = Path(path).read_text()
+    start = source.index(f"    def {name}(")
+    end = source.index(next_marker, start)
+    return source[start:end]
+
+
 def test_spec_cache_reorder_update_blocks_until_reorder_finishes():
     if KVCacheManager is None:
-        source = Path("src/bloombee/server/memory_cache_manager.py").read_text()
-        start = source.index("    def update_cache_and_async_reorder(")
-        end = source.index("    @staticmethod", start)
-        method_source = source[start:end]
+        method_source = _method_source(
+            "src/bloombee/server/memory_cache_manager.py",
+            "update_cache_and_async_reorder",
+            "    @staticmethod",
+        )
 
         assert "self._reorder_executor.submit" not in method_source
         assert "self._do_reorder_task(" in method_source
@@ -56,3 +64,19 @@ def test_spec_cache_reorder_update_blocks_until_reorder_finishes():
         release.set()
         manager._reorder_executor.shutdown(wait=True)
         caller.join(timeout=1.0)
+
+
+def test_spec_cache_valid_mask_batch_mismatch_fails_closed():
+    method_source = _method_source(
+        "src/bloombee/server/backend.py",
+        "_spec_cache_valid_mask",
+        "    def _expand_local_tree_attention_mask",
+    )
+
+    mismatch_block = method_source[
+        method_source.index("if ids.ndim < 2 or ids.shape[0] != batch_size:"):
+        method_source.index("valid_mask = ids >= 0"),
+    ]
+
+    assert "raise RuntimeError" in mismatch_block
+    assert "torch.ones" not in mismatch_block
