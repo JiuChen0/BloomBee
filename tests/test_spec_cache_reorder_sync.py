@@ -73,10 +73,9 @@ def test_spec_cache_valid_mask_batch_mismatch_fails_closed():
         "    def _expand_local_tree_attention_mask",
     )
 
-    mismatch_block = method_source[
-        method_source.index("if ids.ndim < 2 or ids.shape[0] != batch_size:"):
-        method_source.index("valid_mask = ids >= 0"),
-    ]
+    mismatch_start = method_source.index("if ids.ndim < 2 or ids.shape[0] != batch_size:")
+    mismatch_end = method_source.index("valid_mask = ids >= 0")
+    mismatch_block = method_source[mismatch_start:mismatch_end]
 
     assert "raise RuntimeError" in mismatch_block
     assert "torch.ones" not in mismatch_block
