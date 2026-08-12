@@ -2241,8 +2241,9 @@ class KVCacheManager:
         cache_manager = self
 
         self.wait_for_pending_reorder()
-        future = self._reorder_executor.submit(
-            self._do_reorder_task,
+        # Speculative decode reuses the same cache slab on the very next step.
+        # Do not return until compaction and the new tree write are visible.
+        self._do_reorder_task(
             new_kvs,
             kv_cache_position_ids,
             cache_tensors,
@@ -2251,8 +2252,6 @@ class KVCacheManager:
             micro_batch_size,
             cache_manager,
         )
-        with self._pending_reorder_lock:
-            self._pending_reorder = future
 
     @staticmethod
     def _plain_tensor_or_none(value):
