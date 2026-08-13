@@ -1,4 +1,5 @@
 import torch
+import pytest
 
 from bloombee.server.backend import TransformerBackend
 
@@ -28,6 +29,31 @@ def test_expand_local_tree_attention_mask_uses_compacted_cache_prefix():
     assert full_mask[0, 1, :8].all()
     assert full_mask[0, 1, 8].item()
     assert full_mask[0, 1, 9].item()
+
+
+def test_expand_local_tree_attention_mask_rejects_cache_position_batch_mismatch():
+    backend = object.__new__(TransformerBackend)
+
+    local_tree_mask = torch.ones((2, 2, 2), dtype=torch.bool)
+
+    with pytest.raises(RuntimeError, match="kv_cache_position_ids batch mismatch"):
+        backend._expand_local_tree_attention_mask(
+            local_tree_mask,
+            kv_cache_position_ids=torch.tensor(
+                [
+                    [2, 4, -1],
+                    [3, 5, -1],
+                    [7, 9, -1],
+                ],
+                dtype=torch.long,
+            ),
+            batch_size=2,
+            seq_len=2,
+            cache_len=6,
+            batch_offset=0,
+            full_batch_size=4,
+            device=torch.device("cpu"),
+        )
 
 
 def test_generation_tree_position_ids_follow_tree_depths():
