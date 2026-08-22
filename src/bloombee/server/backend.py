@@ -326,8 +326,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
     ) -> Optional[Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]]:
         """One transformer block forward pass on a (chunked) hidden-states slice.
 
-        Chunk-level seam. Returns (output_hidden_states_chunk, new_kvs) or None
-        on failure.
+        Chunk-level seam. Returns (output_hidden_states_chunk, new_kvs).
         """
         forward_result = self.module.forward(
             hidden_states_chunk,
@@ -338,8 +337,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             rotary_position_ids=rotary_position_ids,
         )
         if forward_result is None:
-            logger.info(" ERROR: module.forward returned None!")
-            return None
+            raise RuntimeError("module.forward returned None")
         output_hidden_states_chunk, new_kvs = forward_result
         return output_hidden_states_chunk, new_kvs
 
@@ -548,13 +546,11 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         if ids.ndim >= 2 and ids.shape[0] == 1 and batch_size > 1:
             ids = ids.expand(batch_size, -1)
         if ids.ndim < 2 or ids.shape[0] != batch_size:
-            logger.warning(
-                "[SPEC_LOCAL_MASK] kv_cache_position_ids batch mismatch: got=%s expected=%s; "
-                "falling back to all-prefix-valid cache mask",
-                tuple(ids.shape) if torch.is_tensor(ids) else None,
-                batch_size,
+            raise RuntimeError(
+                "[SPEC_LOCAL_MASK] kv_cache_position_ids batch mismatch: "
+                f"got={tuple(ids.shape) if torch.is_tensor(ids) else None} expected={batch_size}; "
+                "cannot safely expand speculative cache mask"
             )
-            return torch.ones(batch_size, cache_len, dtype=torch.bool, device=device)
 
         valid_mask = ids >= 0
         has_valid = valid_mask.any(dim=1)
