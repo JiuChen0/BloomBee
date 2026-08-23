@@ -205,10 +205,28 @@ class _ServerInferenceSession:
         elif self.history.shape[1] == self._position: # if the length of the history equals the current position
             if self.history.shape[0] != inputs.shape[0]:
                 # Active-row compaction: the step batch shrank (or was permuted)
-                # mid-session. The full history is only replayed on the first
-                # (un-stepped) request; past that point only the width matters,
-                # so keep the leading compacted rows.
-                self.history = self.history[: inputs.shape[0]]
+                # mid-session. Keep client replay history in the same row order
+                # as the server KV gather sent via hypo_ids; leading-row slicing
+                # corrupts recovery when a finished row was in the middle.
+                if hypo_ids is None or is_dummy(hypo_ids) or not torch.is_tensor(hypo_ids):
+                    self.history = self.history[: inputs.shape[0]]
+                elif hypo_ids.ndim != 1 or hypo_ids.numel() != inputs.shape[0]:
+                    raise RuntimeError(
+                        "Cannot remap compacted session history: "
+                        f"hypo_ids shape={tuple(hypo_ids.shape)}, inputs batch={inputs.shape[0]}"
+                    )
+                else:
+                    history_indices = hypo_ids.to(device=self.history.device, dtype=torch.long)
+                    if (
+                        history_indices.numel() > 0
+                        and (int(history_indices.min().item()) < 0
+                             or int(history_indices.max().item()) >= self.history.shape[0])
+                    ):
+                        raise RuntimeError(
+                            "Cannot remap compacted session history: "
+                            f"indices out of range for history batch {self.history.shape[0]}"
+                        )
+                    self.history = self.history.index_select(0, history_indices)
             self.history = torch.cat([self.history, inputs[:, -n_input_tokens:]], dim=1) # append the last n_input_tokens of the current input to history
         # history can cat input if it's spec decoding and pruning happened, need fall  back
         # assert self.history.shape[1] == self._position + n_input_tokens,
