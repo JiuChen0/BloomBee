@@ -51,3 +51,11 @@ def test_mixtral_preserves_backend_attention_masks():
     assert "_prepare_bloombee_attention_mask(" in source
     assert "attention_mask=attention_mask" in source
     assert "masked_fill(~mask" in source
+
+
+def test_active_row_compaction_history_uses_hypo_ids_gather():
+    source = _read("src/bloombee/client/inference_session.py")
+
+    assert "self.history = self.history[: inputs.shape[0]]" in source
+    assert "self.history.index_select(0, history_indices)" in source
+    assert "indices out of range for history batch" in source
