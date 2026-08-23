@@ -57,9 +57,14 @@ class WrappedMixtralBlock(MixtralDecoderLayer):
         elif use_cache:
             past_key_value = make_empty_kv_cache(self.layer_idx)
 
-        # tf 5.x attention implementations handle causal masking internally when
-        # attention_mask=None. No need for the deprecated _prepare_4d_causal_* helpers.
-        attention_mask = None
+        attention_mask = self._prepare_bloombee_attention_mask(
+            attention_mask,
+            batch_size=batch_size,
+            seq_length=seq_length,
+            key_length=seq_length_with_past,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
 
         position_ids = kwargs.pop("position_ids", None)
         if position_ids is None:
@@ -135,3 +140,33 @@ class WrappedMixtralBlock(MixtralDecoderLayer):
         key_states = key_states.reshape(*value_states.shape)
         key_states = key_states.permute(0, 2, 1)
         return (key_states, value_states)
+
+    @staticmethod
+    def _prepare_bloombee_attention_mask(
+        attention_mask: Optional[torch.Tensor],
+        *,
+        batch_size: int,
+        seq_length: int,
+        key_length: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if attention_mask is None:
+            visible = torch.ones(batch_size, seq_length, key_length, dtype=torch.bool, device=device)
+            past_length = key_length - seq_length
+            query_positions = torch.arange(seq_length, device=device).unsqueeze(1)
+            key_positions = torch.arange(key_length, device=device).unsqueeze(0)
+            visible &= key_positions <= (past_length + query_positions)
+            return torch.zeros_like(visible, dtype=dtype).masked_fill(~visible, torch.finfo(dtype).min).unsqueeze(1)
+
+        mask = attention_mask.to(device=device)
+        if mask.ndim == 2:
+            mask = mask[:, None, None, :]
+        elif mask.ndim == 3:
+            mask = mask[:, None, :, :]
+        elif mask.ndim != 4:
+            raise ValueError(f"Unsupported Mixtral attention_mask shape: {tuple(mask.shape)}")
+
+        if mask.dtype == torch.bool:
+            return torch.zeros(mask.shape, dtype=dtype, device=device).masked_fill(~mask, torch.finfo(dtype).min)
+        return mask.to(dtype=dtype)
