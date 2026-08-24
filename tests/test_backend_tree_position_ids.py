@@ -1,4 +1,5 @@
 import torch
+import pytest
 
 from bloombee.server.backend import TransformerBackend
 
@@ -28,6 +29,20 @@ def test_expand_local_tree_attention_mask_uses_compacted_cache_prefix():
     assert full_mask[0, 1, :8].all()
     assert full_mask[0, 1, 8].item()
     assert full_mask[0, 1, 9].item()
+
+
+def test_spec_cache_valid_mask_rejects_unaligned_position_metadata():
+    backend = object.__new__(TransformerBackend)
+
+    with pytest.raises(RuntimeError, match="metadata batch mismatch"):
+        backend._spec_cache_valid_mask(
+            kv_cache_position_ids=torch.tensor([[5, 7], [6, 8]], dtype=torch.long),
+            batch_size=3,
+            cache_len=9,
+            batch_offset=0,
+            full_batch_size=0,
+            device=torch.device("cpu"),
+        )
 
 
 def test_generation_tree_position_ids_follow_tree_depths():
