@@ -10,6 +10,67 @@ from transformers.models.mixtral.modeling_mixtral import (
 from bloombee.utils.cache_compat import make_past_kv_cache, make_empty_kv_cache, read_kv_from_cache
 
 
+def _build_causal_attention_mask(
+    *,
+    batch_size: int,
+    query_length: int,
+    past_length: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if query_length <= 1:
+        return None
+
+    source_length = past_length + query_length
+    query_positions = torch.arange(
+        past_length,
+        past_length + query_length,
+        device=device,
+        dtype=torch.long,
+    )
+    key_positions = torch.arange(source_length, device=device, dtype=torch.long)
+    blocked = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
+    mask = torch.zeros(query_length, source_length, dtype=dtype, device=device)
+    mask = mask.masked_fill(blocked, torch.finfo(dtype).min)
+    return mask.unsqueeze(0).unsqueeze(0).expand(
+        batch_size, 1, query_length, source_length
+    )
+
+
+def _prepare_mixtral_attention_mask(
+    attention_mask: Optional[torch.Tensor],
+    *,
+    batch_size: int,
+    query_length: int,
+    past_length: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if attention_mask is None:
+        return _build_causal_attention_mask(
+            batch_size=batch_size,
+            query_length=query_length,
+            past_length=past_length,
+            dtype=dtype,
+            device=device,
+        )
+
+    if attention_mask.dtype == torch.bool:
+        scores = torch.zeros(attention_mask.shape, dtype=dtype, device=device)
+        attention_mask = scores.masked_fill(
+            ~attention_mask.to(device=device), torch.finfo(dtype).min
+        )
+    elif attention_mask.device != device or attention_mask.dtype != dtype:
+        attention_mask = attention_mask.to(device=device, dtype=dtype)
+
+    if attention_mask.dim() == 3:
+        # BloomBee's backend builds masks as [B, S, K]; Mixtral attention expects
+        # [B, 1, S, K] so the mask broadcasts over attention heads.
+        attention_mask = attention_mask.unsqueeze(1)
+
+    return attention_mask
+
+
 class WrappedMixtralBlock(MixtralDecoderLayer):
     def __init__(self, config: MixtralConfig, layer_idx: int):
         super().__init__(config, layer_idx)
@@ -57,9 +118,14 @@ class WrappedMixtralBlock(MixtralDecoderLayer):
         elif use_cache:
             past_key_value = make_empty_kv_cache(self.layer_idx)
 
-        # tf 5.x attention implementations handle causal masking internally when
-        # attention_mask=None. No need for the deprecated _prepare_4d_causal_* helpers.
-        attention_mask = None
+        attention_mask = _prepare_mixtral_attention_mask(
+            attention_mask,
+            batch_size=batch_size,
+            query_length=seq_length,
+            past_length=past_key_values_length,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
 
         position_ids = kwargs.pop("position_ids", None)
         if position_ids is None:
