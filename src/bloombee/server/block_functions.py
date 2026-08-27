@@ -1369,9 +1369,12 @@ async def iterate_rpc_inference(
                 if layout_issues:
                     preview = "; ".join(layout_issues[:3])
                     suffix = " ..." if len(layout_issues) > 3 else ""
-                    logger.warning(
-                        f"{MBPIPE_LOG_PREFIX} Micro-batch merge layout check failed for step_id={step_id}: "
-                        f"{preview}{suffix}"
+                    _drop_mb_step_state(mb_accum_key, accum=True)
+                    if overlap_tracking_key in _CROSS_STAGE_OVERLAP_DATA:
+                        _drop_mb_step_state(overlap_tracking_key, overlap=True)
+                    raise ValueError(
+                        f"Micro-batch merge layout check failed for step_id={step_id}: "
+                        f"{preview}{suffix}. Refusing to merge partial or misordered rows."
                     )
                 elif log_mb_detail:
                     logger.info(

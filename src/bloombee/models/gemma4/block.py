@@ -174,13 +174,32 @@ class WrappedGemma4Block(_BaseDecoderLayer):
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
-        elif attention_mask.dim() == 3:
-            # BloomBee's backend builds the mask as [B, S, K]; Gemma4 attention
-            # expects 4D [B, 1, S, K] so it broadcasts over the heads dim.
-            # Without this lift, bs>1 fails with "tensor a (num_heads) must match
-            # tensor b (B) at non-singleton dimension 1" (same root cause as the
-            # Qwen3 fix in 1be0a3e).
-            attention_mask = attention_mask.unsqueeze(1)
+        else:
+            if attention_mask.device != hidden_states.device:
+                attention_mask = attention_mask.to(device=hidden_states.device)
+            if attention_mask.dtype == torch.bool:
+                neg_inf = torch.finfo(hidden_states.dtype).min
+                attention_mask = torch.where(
+                    attention_mask,
+                    torch.tensor(0.0, dtype=hidden_states.dtype, device=hidden_states.device),
+                    torch.tensor(neg_inf, dtype=hidden_states.dtype, device=hidden_states.device),
+                )
+            elif attention_mask.dtype != hidden_states.dtype:
+                attention_mask = attention_mask.to(dtype=hidden_states.dtype)
+            if attention_mask.dim() == 3:
+                # BloomBee's backend builds the mask as [B, S, K]; Gemma4 attention
+                # expects 4D [B, 1, S, K] so it broadcasts over the heads dim.
+                attention_mask = attention_mask.unsqueeze(1)
+            if self.is_sliding:
+                sliding_mask = _build_layer_type_mask(
+                    layer_type=self.layer_type,
+                    sliding_window=self.sliding_window,
+                    query_length=seq_length,
+                    past_length=past_key_values_length,
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+                attention_mask = torch.minimum(attention_mask, sliding_mask)
 
         position_ids = kwargs.pop("position_ids", None)
         if position_ids is None:
