@@ -57,9 +57,14 @@ class WrappedMixtralBlock(MixtralDecoderLayer):
         elif use_cache:
             past_key_value = make_empty_kv_cache(self.layer_idx)
 
-        # tf 5.x attention implementations handle causal masking internally when
-        # attention_mask=None. No need for the deprecated _prepare_4d_causal_* helpers.
-        attention_mask = None
+        attention_mask = self._prepare_decoder_attention_mask(
+            attention_mask,
+            batch_size=batch_size,
+            seq_length=seq_length,
+            past_key_values_length=past_key_values_length,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
 
         position_ids = kwargs.pop("position_ids", None)
         if position_ids is None:
@@ -107,6 +112,44 @@ class WrappedMixtralBlock(MixtralDecoderLayer):
                 return (output_hidden, present_key_value)
 
         return (output_hidden, None)
+
+    @staticmethod
+    def _prepare_decoder_attention_mask(
+        attention_mask: Optional[torch.Tensor],
+        *,
+        batch_size: int,
+        seq_length: int,
+        past_key_values_length: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        src_length = int(past_key_values_length) + int(seq_length)
+        min_value = torch.finfo(dtype).min
+
+        if attention_mask is None:
+            query_positions = torch.arange(
+                past_key_values_length,
+                src_length,
+                dtype=torch.long,
+                device=device,
+            ).view(1, 1, seq_length, 1)
+            key_positions = torch.arange(src_length, dtype=torch.long, device=device).view(1, 1, 1, src_length)
+            visible = key_positions <= query_positions
+            mask = torch.zeros(1, 1, seq_length, src_length, dtype=dtype, device=device)
+            mask = mask.masked_fill(~visible, min_value)
+            return mask.expand(batch_size, -1, -1, -1)
+
+        mask = attention_mask.to(device=device)
+        if mask.dtype == torch.bool:
+            mask = torch.zeros(mask.shape, dtype=dtype, device=device).masked_fill(~mask, min_value)
+        else:
+            mask = mask.to(dtype=dtype)
+
+        if mask.ndim == 2:
+            mask = mask[:, None, None, :]
+        elif mask.ndim == 3:
+            mask = mask[:, None, :, :]
+        return mask
 
     def _reorder_cache_from_bloom(
         self, key_value: Tuple[torch.Tensor], batch_size: int, seq_length: int

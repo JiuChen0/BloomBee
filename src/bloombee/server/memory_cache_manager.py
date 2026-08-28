@@ -6,8 +6,7 @@ import torch
 import os
 import threading
 import time
-from typing import Optional, Tuple, AsyncContextManager, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Any, Optional, Tuple, AsyncContextManager, Sequence
 
 from bloombee.server.memory_cache import MemoryCache, AdaptedKVCache, KVCacheMetadata, _is_paged_kv_enabled
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
@@ -54,8 +53,7 @@ class KVCacheManager:
         # mainline. The legacy _write_kvs slab write remains the source of
         # truth in both modes.
         self._paged_kv_enabled = _is_paged_kv_enabled()
-        self._reorder_executor = ThreadPoolExecutor(max_workers=1)
-        self._pending_reorder: Optional[Future] = None
+        self._pending_reorder: Optional[Any] = None
         self._pending_reorder_lock = threading.Lock()
         
         # [KVCACHE_OFFLOAD] Micro-batch level memory reuse state
@@ -2241,8 +2239,7 @@ class KVCacheManager:
         cache_manager = self
 
         self.wait_for_pending_reorder()
-        future = self._reorder_executor.submit(
-            self._do_reorder_task,
+        self._do_reorder_task(
             new_kvs,
             kv_cache_position_ids,
             cache_tensors,
@@ -2251,8 +2248,6 @@ class KVCacheManager:
             micro_batch_size,
             cache_manager,
         )
-        with self._pending_reorder_lock:
-            self._pending_reorder = future
 
     @staticmethod
     def _plain_tensor_or_none(value):
