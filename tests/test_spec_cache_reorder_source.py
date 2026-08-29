@@ -10,10 +10,10 @@ BLOCK_FUNCTIONS = REPO_ROOT / "src" / "bloombee" / "server" / "block_functions.p
 MIXTRAL_BLOCK = REPO_ROOT / "src" / "bloombee" / "models" / "mixtral" / "block.py"
 
 
-def _get_function(path: Path, name: str) -> ast.FunctionDef:
+def _get_function(path: Path, name: str) -> ast.AST:
     tree = ast.parse(path.read_text())
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == name:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
             return node
     raise AssertionError(f"{name} not found")
 
@@ -83,3 +83,20 @@ def test_microbatch_merge_layout_violations_are_fatal():
     assert "raise ValueError" in merge_source
     assert "_drop_mb_step_state(mb_accum_key, overlap=True, accum=True)" in merge_source
     assert "logger.warning(\n" not in merge_source
+
+
+def test_push_microbatch_releases_limiter_on_setup_failure():
+    handler = REPO_ROOT / "src" / "bloombee" / "server" / "handler.py"
+    fn = _get_function(handler, "_push_microbatch")
+    source = textwrap.dedent(ast.get_source_segment(handler.read_text(), fn))
+
+    assert "acquired_slot = False" in source
+    assert "release_slot_handed_off = False" in source
+    assert "release_slot=acquired_slot" in source
+    assert "release_slot_handed_off = True" in source
+
+    except_branch = source.split("except Exception as e:", 1)[1].split(
+        "async def _do_rpc_push_async", 1
+    )[0]
+    assert "if acquired_slot and not release_slot_handed_off:" in except_branch
+    assert "await self._push_limiter.release(send_time_ms=0.0, success=False)" in except_branch
