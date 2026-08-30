@@ -1358,23 +1358,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     past_key_values.set_is_spec_decoding(old_spec_flag)
                 except Exception:
                     pass
-            logger.error(f"Fallback generation failed: {e}")
-            eos_token_id = getattr(self.config, 'eos_token_id', 2)
-            batch_size = input_ids.shape[0]
-            device = input_ids.device
-            empty_hidden = torch.zeros(
-                batch_size,
-                1,
-                self.config.hidden_size,
-                dtype=torch.float32,
-                device=device,
-            )
-            return (
-                torch.full((batch_size, 1), eos_token_id, device=device),
-                (seq_lengths - 1).to(device=device)[:, None],
-                empty_hidden,
-                torch.zeros(batch_size, dtype=torch.long, device=device),
-            )
+            logger.exception("Fallback generation failed")
+            raise
     
     def _build_speculative_trees_batched(
         self, 
