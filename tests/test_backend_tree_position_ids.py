@@ -30,6 +30,34 @@ def test_expand_local_tree_attention_mask_uses_compacted_cache_prefix():
     assert full_mask[0, 1, 9].item()
 
 
+def test_spec_cache_mask_rejects_unaligned_position_metadata():
+    backend = object.__new__(TransformerBackend)
+
+    # If this metadata cannot be sliced/aligned to the active speculative rows,
+    # treating every cache column as visible would expose rejected draft KV.
+    kv_cache_position_ids = torch.tensor(
+        [
+            [5, 6, -1],
+            [7, -1, -1],
+        ],
+        dtype=torch.long,
+    )
+
+    try:
+        backend._spec_cache_valid_mask(
+            kv_cache_position_ids=kv_cache_position_ids,
+            batch_size=3,
+            cache_len=8,
+            batch_offset=0,
+            full_batch_size=0,
+            device=torch.device("cpu"),
+        )
+    except RuntimeError as exc:
+        assert "cannot build a safe speculative cache mask" in str(exc)
+    else:
+        raise AssertionError("misaligned speculative cache metadata must fail closed")
+
+
 def test_generation_tree_position_ids_follow_tree_depths():
     backend = object.__new__(TransformerBackend)
 
