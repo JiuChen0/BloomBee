@@ -1161,14 +1161,21 @@ class TransformerConnectionHandler(ConnectionHandler):
             "receiver_processing_ms": receiver_processing_ms,
         }
 
-    def _put_into_session_queue(self, session_id: str, request: runtime_pb2.ExpertRequest):
+    def _put_into_session_queue(self, session_id: str, request: runtime_pb2.ExpertRequest) -> bool:
         handler_index = self._session_handlers.get(session_id)
         if handler_index is None:
             logger.debug(f"Ignored rpc_push to unknown session ID: {session_id}")
+            return False
         elif handler_index == self._handler_index:
-            self._session_queues[session_id].put_nowait(request)
+            maybe_session_queue = self._session_queues.get(session_id)
+            if maybe_session_queue is None:
+                logger.debug(f"Ignored rpc_push to closed session ID: {session_id}")
+                return False
+            maybe_session_queue.put_nowait(request)
+            return True
         else:
             self._handler_event_queues[handler_index].put_nowait((Event.PUSH, session_id, request))
+            return True
 
     async def _get_from_session_queue(self, session_id: str) -> Optional[runtime_pb2.ExpertRequest]:
         assert self._session_handlers[session_id] == self._handler_index, "session belongs to another handler"
@@ -1429,7 +1436,8 @@ class TransformerConnectionHandler(ConnectionHandler):
             metadata["_s2s_payload_bytes"] = int(payload_bytes)
             request.metadata = MSGPackSerializer.dumps(metadata)
         self._log_request("rpc_push", requested_uids, context, debug=f"session_id={session_id}")
-        self._put_into_session_queue(session_id, request)
+        if not self._put_into_session_queue(session_id, request):
+            raise ValueError(f"Cannot push to unknown or closed inference session: {session_id}")
         return self._build_rpc_push_ack_response(receive_us)
     
     async def _handle_microbatch_push(
@@ -1499,7 +1507,6 @@ class TransformerConnectionHandler(ConnectionHandler):
             )
             return runtime_pb2.ExpertResponse()
         
-        self._mb_processed[mb_key].add(mb_idx)
         metadata["s2s_receiver_receive_us"] = int(receive_us)
 
         # [S2S_WIRE] Sender->receiver micro-batch transport timing breakdown.
@@ -1620,14 +1627,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                 f"expecting {expected_num_mb} micro-batches"
             )
         
-        self._mb_received[mb_key] = self._mb_received.get(mb_key, 0) + 1
-        received_count = self._mb_received[mb_key]
-
-        logger.debug(
-            f"{MBPIPE_LOG_PREFIX} rpc_push: step_id={step_id}, mb_idx={mb_idx}, "
-            f"start_from_position={start_from_position}, received={received_count}/{expected_num_mb}"
-        )
-        
         # Each micro-batch goes straight into the session queue as a queue item;
         # the consume side (_iterate_inference_steps) detects and processes them
         # individually for pipeline overlap. (The old wait-all-then-assemble
@@ -1647,7 +1646,22 @@ class TransformerConnectionHandler(ConnectionHandler):
             full_batch_size=full_batch_size,
         )
 
-        self._put_into_session_queue(session_id, mb_queue_item)
+        if not self._put_into_session_queue(session_id, mb_queue_item):
+            self._mb_expected.pop(mb_key, None)
+            self._mb_received.pop(mb_key, None)
+            if not self._mb_processed.get(mb_key):
+                self._mb_processed.pop(mb_key, None)
+                self._mb_processed_timestamps.pop(mb_key, None)
+            raise ValueError(f"Cannot push micro-batch to unknown or closed inference session: {session_id}")
+
+        self._mb_processed[mb_key].add(mb_idx)
+        self._mb_received[mb_key] = self._mb_received.get(mb_key, 0) + 1
+        received_count = self._mb_received[mb_key]
+
+        logger.debug(
+            f"{MBPIPE_LOG_PREFIX} rpc_push: step_id={step_id}, mb_idx={mb_idx}, "
+            f"start_from_position={start_from_position}, received={received_count}/{expected_num_mb}"
+        )
 
         logger.debug(
             f"{MBPIPE_LOG_PREFIX} rpc_push: mb_idx={mb_idx} queued to session "
