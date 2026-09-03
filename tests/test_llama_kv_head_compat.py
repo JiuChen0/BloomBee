@@ -53,3 +53,35 @@ def test_llama_cache_reorder_infers_kv_heads_from_groups():
     )
     torch.testing.assert_close(key_roundtrip, key_bloom)
     torch.testing.assert_close(value_roundtrip, value_bloom)
+
+
+def test_llama_cache_reorder_slices_expanded_4d_gqa_cache_to_kv_heads():
+    batch_size = 2
+    num_heads = 8
+    num_key_value_heads = 2
+    seq_length = 3
+    head_dim = 5
+
+    block = WrappedLlamaBlock.__new__(WrappedLlamaBlock)
+    block.self_attn = SimpleNamespace(
+        num_heads=num_heads,
+        num_key_value_heads=num_key_value_heads,
+        head_dim=head_dim,
+    )
+
+    key_expanded = torch.arange(
+        batch_size * num_heads * seq_length * head_dim,
+        dtype=torch.float32,
+    ).view(batch_size, num_heads, seq_length, head_dim)
+    value_expanded = key_expanded + 1000
+
+    key_llama, value_llama = block._reorder_cache_from_bloom_to_llama(
+        (key_expanded, value_expanded),
+        batch_size=batch_size,
+        seq_length=seq_length,
+    )
+
+    assert key_llama.shape == (batch_size, num_key_value_heads, seq_length, head_dim)
+    assert value_llama.shape == (batch_size, num_key_value_heads, seq_length, head_dim)
+    torch.testing.assert_close(key_llama, key_expanded[:, :num_key_value_heads])
+    torch.testing.assert_close(value_llama, value_expanded[:, :num_key_value_heads])
