@@ -57,9 +57,23 @@ class WrappedMixtralBlock(MixtralDecoderLayer):
         elif use_cache:
             past_key_value = make_empty_kv_cache(self.layer_idx)
 
-        # tf 5.x attention implementations handle causal masking internally when
-        # attention_mask=None. No need for the deprecated _prepare_4d_causal_* helpers.
-        attention_mask = None
+        # tf 5.x eager/SDPA attention does not add the model-level mask for a
+        # bare decoder layer. Preserve BloomBee's backend mask when present and
+        # otherwise build the causal additive mask that MixtralModel would pass.
+        if attention_mask is None:
+            total_len = past_key_values_length + seq_length
+            neg_inf = torch.finfo(hidden_states.dtype).min
+            causal = torch.full(
+                (seq_length, total_len),
+                neg_inf,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            if total_len > 0:
+                causal = torch.triu(causal, diagonal=past_key_values_length + 1)
+            attention_mask = causal.unsqueeze(0).unsqueeze(0)
+        elif attention_mask.dim() == 3:
+            attention_mask = attention_mask.unsqueeze(1)
 
         position_ids = kwargs.pop("position_ids", None)
         if position_ids is None:
