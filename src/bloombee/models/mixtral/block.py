@@ -10,6 +10,24 @@ from transformers.models.mixtral.modeling_mixtral import (
 from bloombee.utils.cache_compat import make_past_kv_cache, make_empty_kv_cache, read_kv_from_cache
 
 
+def _build_causal_mask(
+    *,
+    batch_size: int,
+    query_length: int,
+    past_length: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    total_len = past_length + query_length
+    q_pos = torch.arange(past_length, total_len, device=device)
+    k_pos = torch.arange(total_len, device=device)
+    masked = k_pos.unsqueeze(0) > q_pos.unsqueeze(1)
+    min_value = torch.finfo(dtype).min
+    additive = torch.zeros((query_length, total_len), dtype=dtype, device=device)
+    additive = additive.masked_fill(masked, min_value)
+    return additive.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, query_length, total_len)
+
+
 class WrappedMixtralBlock(MixtralDecoderLayer):
     def __init__(self, config: MixtralConfig, layer_idx: int):
         super().__init__(config, layer_idx)
@@ -57,9 +75,23 @@ class WrappedMixtralBlock(MixtralDecoderLayer):
         elif use_cache:
             past_key_value = make_empty_kv_cache(self.layer_idx)
 
-        # tf 5.x attention implementations handle causal masking internally when
-        # attention_mask=None. No need for the deprecated _prepare_4d_causal_* helpers.
-        attention_mask = None
+        if attention_mask is None:
+            attention_mask = _build_causal_mask(
+                batch_size=batch_size,
+                query_length=seq_length,
+                past_length=past_key_values_length,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        elif attention_mask.dim() == 3:
+            attention_mask = attention_mask.unsqueeze(1)
+        if attention_mask is not None and attention_mask.dtype == torch.bool:
+            min_value = torch.finfo(hidden_states.dtype).min
+            attention_mask = torch.where(
+                attention_mask,
+                torch.zeros((), dtype=hidden_states.dtype, device=hidden_states.device),
+                torch.full((), min_value, dtype=hidden_states.dtype, device=hidden_states.device),
+            )
 
         position_ids = kwargs.pop("position_ids", None)
         if position_ids is None:

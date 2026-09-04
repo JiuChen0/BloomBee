@@ -550,11 +550,11 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         if ids.ndim < 2 or ids.shape[0] != batch_size:
             logger.warning(
                 "[SPEC_LOCAL_MASK] kv_cache_position_ids batch mismatch: got=%s expected=%s; "
-                "falling back to all-prefix-valid cache mask",
+                "treating cache prefix as invalid for this speculative tree mask",
                 tuple(ids.shape) if torch.is_tensor(ids) else None,
                 batch_size,
             )
-            return torch.ones(batch_size, cache_len, dtype=torch.bool, device=device)
+            return torch.zeros(batch_size, cache_len, dtype=torch.bool, device=device)
 
         valid_mask = ids >= 0
         has_valid = valid_mask.any(dim=1)
