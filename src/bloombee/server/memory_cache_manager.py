@@ -201,6 +201,7 @@ class KVCacheManager:
         source_bh: int,
         full_batch_size: int = 0,
         micro_batch_size: int = 0,
+        source_head_dim: Optional[int] = None,
     ) -> int:
         """Infer how many source KV rows belong to each batch item.
 
@@ -208,9 +209,41 @@ class KVCacheManager:
         return only num_key_value_heads rows per batch. Batched writes must
         preserve that per-batch stride instead of treating the source rows as
         one contiguous attention-head block.
+
+        Gemma-4 full-attention layers emit ``num_global_key_value_heads`` rows
+        with ``global_head_dim``, while sliding layers emit
+        ``num_key_value_heads`` with ``head_dim``. The shared block_config
+        still reports the sliding KV count, so a write of B=4 full-attention
+        rows (BH=16 on 31B) would otherwise look like one sliding row and
+        silently collapse the batch. Prefer the emitted source head dim when
+        it distinguishes those layouts.
         """
         attention_heads = max(1, int(attention_heads))
         source_bh = int(source_bh)
+
+        def _as_pos_int(value) -> Optional[int]:
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                return None
+            return value if value > 0 else None
+
+        def _accept(heads: Optional[int]) -> bool:
+            return heads is not None and 0 < heads <= attention_heads and source_bh % heads == 0
+
+        source_head_dim = _as_pos_int(source_head_dim)
+        sliding_hd = _as_pos_int(getattr(self.block_config, "head_dim", None))
+        global_hd = _as_pos_int(getattr(self.block_config, "global_head_dim", None))
+        sliding_kv = _as_pos_int(getattr(self.block_config, "num_key_value_heads", None))
+        global_kv = _as_pos_int(getattr(self.block_config, "num_global_key_value_heads", None))
+
+        # Layer-type match from the emitted KV width. Required when a full-
+        # attention BH is also divisible by the sliding KV head count.
+        if source_head_dim is not None and global_hd is not None and global_hd != sliding_hd:
+            if source_head_dim == global_hd and _accept(global_kv):
+                return int(global_kv)
+            if source_head_dim == sliding_hd and _accept(sliding_kv):
+                return int(sliding_kv)
 
         if full_batch_size > 0 and micro_batch_size > 0:
             runtime_batch = int(micro_batch_size)
@@ -219,7 +252,7 @@ class KVCacheManager:
                 if 0 < heads <= attention_heads:
                     return int(heads)
 
-        kv_heads = getattr(self.block_config, "num_key_value_heads", None)
+        kv_heads = sliding_kv
         if kv_heads is None:
             groups = getattr(self.block_config, "num_key_value_groups", None)
             try:
@@ -229,13 +262,10 @@ class KVCacheManager:
             if groups > 1 and attention_heads % groups == 0:
                 kv_heads = attention_heads // groups
 
-        try:
-            kv_heads = int(kv_heads) if kv_heads is not None else attention_heads
-        except (TypeError, ValueError):
-            kv_heads = attention_heads
-
-        if 0 < kv_heads <= attention_heads and source_bh % kv_heads == 0:
+        if _accept(kv_heads):
             return int(kv_heads)
+        if _accept(global_kv):
+            return int(global_kv)
         return attention_heads
 
     def _get_slot_state_key_for_mb(self, mb_index: int) -> Optional[Tuple[int, int]]:
@@ -548,9 +578,11 @@ class KVCacheManager:
             key_data = key.data if hasattr(key, "data") else key
             if key_data.ndim != 3:
                 return [], 0
-            BH, _D, s_new = key_data.shape
+            BH, source_head_dim, s_new = key_data.shape
             H = getattr(self.block_config, "num_attention_heads", 32) or 32
-            source_heads = self._source_heads_per_batch(H, BH)
+            source_heads = self._source_heads_per_batch(
+                H, BH, source_head_dim=int(source_head_dim)
+            )
             if source_heads <= 0 or BH % source_heads != 0:
                 return [], 0
             B = BH // source_heads
@@ -1598,7 +1630,9 @@ class KVCacheManager:
         BH_src, D_src, s_new = key_t.shape
         assert value_t.shape == (BH_src, s_new, D_src), f"value shape {value_t.shape} != (BH, s_new, D)"
         assert D_src == D_dst, f"D mismatch: src {D_src} vs dst {D_dst}"
-        source_heads = self._source_heads_per_batch(H, BH_src, full_batch_size, micro_batch_size)
+        source_heads = self._source_heads_per_batch(
+            H, BH_src, full_batch_size, micro_batch_size, source_head_dim=int(D_src)
+        )
         assert BH_src % source_heads == 0, (
             f"BH_src={BH_src} not divisible by source_heads={source_heads}"
         )
