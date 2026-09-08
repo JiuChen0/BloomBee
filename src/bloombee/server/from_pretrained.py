@@ -263,15 +263,18 @@ def _load_hf_block_weights(
         return block.load_checkpoint_state(state_dict, torch_dtype)
     if isinstance(block, WrappedDeepseekV3Block):
         state_dict = _remap_deepseekv3_expert_state_dict(state_dict)
-        result = block.load_state_dict(state_dict, strict=False)
-        if result.missing_keys or result.unexpected_keys:
-            logger.warning(
-                f"{block_prefix}: state_dict load left {len(result.missing_keys)} missing and "
-                f"{len(result.unexpected_keys)} unexpected key(s) -- weights may be incomplete. "
-                f"missing={result.missing_keys[:10]} unexpected={result.unexpected_keys[:10]}"
-            )
-    else:
-        block.load_state_dict(state_dict, strict=False)
+    # Bare decoder layers have initialized parameters even before loading.
+    # Reject incomplete checkpoints before mutating the block, while allowing
+    # optional/generated buffers (e.g. rotary frequencies) to be absent.
+    missing_parameters = sorted(set(dict(block.named_parameters())) - state_dict.keys())
+    if missing_parameters:
+        raise ValueError(
+            f"Incomplete checkpoint for {block_prefix} from {model_name}: "
+            f"missing required parameters {missing_parameters}"
+        )
+    result = block.load_state_dict(state_dict, strict=False)
+    if result.unexpected_keys:
+        logger.warning(f"{block_prefix}: ignoring unexpected checkpoint keys {result.unexpected_keys[:10]}")
     return block.to(dtype=torch_dtype)
 
 
