@@ -124,16 +124,32 @@ def test_decode_step_after_prefill_extends_kv():
 def test_rotary_buffers_stay_fp32_after_half_cast():
     """Regression: Gemma-4's rotary holds one inv_freq pair per layer type;
     _apply must keep all of them in fp32 across .half() so rotary positions
-    don't accumulate quantization error."""
+    don't accumulate quantization error.
+
+    Dtype-only checks are not enough: restoring with ``buf.float()`` after
+    the fp16 cast stores rounded values in an fp32 tensor. Compare against
+    the original fp32 bits, not the round-tripped ones.
+    """
     torch.manual_seed(0)
     cfg = _make_mini_config()
     block = WrappedGemma4Block(cfg, layer_idx=0)
+    rot = block._rotary_emb
+    originals = {
+        f"{lt}_{suffix}": getattr(rot, f"{lt}_{suffix}").detach().cpu().clone()
+        for lt in rot.layer_types
+        for suffix in ("inv_freq", "original_inv_freq")
+    }
     block = block.half()
 
-    rot = block._rotary_emb
-    for lt in rot.layer_types:
-        for suffix in ("inv_freq", "original_inv_freq"):
-            buf = getattr(rot, f"{lt}_{suffix}")
-            assert buf.dtype == torch.float32, (
-                f"{lt}_{suffix} got {buf.dtype}, expected float32"
+    for name, original in originals.items():
+        buf = getattr(rot, name)
+        assert buf.dtype == torch.float32, f"{name} got {buf.dtype}, expected float32"
+        assert torch.equal(buf.detach().cpu(), original), (
+            f"{name} lost fp32 precision across .half(); "
+            "save the original tensor before Module.to(dtype)"
+        )
+        rounded = original.half().float()
+        if not torch.equal(original, rounded):
+            assert not torch.equal(buf.detach().cpu(), rounded), (
+                f"{name} matches fp16-rounded values; restore used post-cast data"
             )

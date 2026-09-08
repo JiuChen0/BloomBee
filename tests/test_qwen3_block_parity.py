@@ -131,12 +131,22 @@ def test_rotary_inv_freq_stays_fp32_under_fp16_cast():
     """Regression: `.to(torch.float16)` used to downcast rotary `inv_freq`,
     which caused fp16 rounding of RoPE positions and catastrophic generation
     quality loss on real checkpoints (token collapse into repeated groups).
+
+    Restoring with ``buf.float()`` after the cast keeps dtype=fp32 but loses
+    mantissa bits; compare against the original values, not just dtype.
     """
     cfg = _make_config()
     block = WrappedQwen3Block(cfg, layer_idx=0).eval()
+    original = block._rotary_emb.inv_freq.detach().cpu().clone()
+    original_copy = block._rotary_emb.original_inv_freq.detach().cpu().clone()
     block.to(torch.float16)
     assert block._rotary_emb.inv_freq.dtype == torch.float32
     assert block._rotary_emb.original_inv_freq.dtype == torch.float32
+    assert torch.equal(block._rotary_emb.inv_freq.detach().cpu(), original)
+    assert torch.equal(block._rotary_emb.original_inv_freq.detach().cpu(), original_copy)
+    rounded = original.half().float()
+    if not torch.equal(original, rounded):
+        assert not torch.equal(block._rotary_emb.inv_freq.detach().cpu(), rounded)
 
 
 def test_fp16_block_matches_hf_layer_with_causal_mask():

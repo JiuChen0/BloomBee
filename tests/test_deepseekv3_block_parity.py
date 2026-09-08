@@ -149,3 +149,22 @@ def test_matches_reference_decoder_layer_prefill():
     ref_hidden = ref_out[0] if isinstance(ref_out, tuple) else ref_out
 
     torch.testing.assert_close(out_wrapped, ref_hidden)
+
+
+def test_rotary_inv_freq_keeps_fp32_bits_under_fp16_cast():
+    """Bare DeepSeek-V3 blocks are cast with block.to(dtype) and do not inherit
+    the full model's _keep_in_fp32_modules. Save rotary frequencies before that
+    cast; upcasting the rounded fp16/bf16 buffer cannot recover precision.
+    """
+    cfg = _make_config()
+    block = WrappedDeepseekV3Block(cfg, layer_idx=0).eval()
+    original = block._rotary_emb.inv_freq.detach().cpu().clone()
+    original_copy = block._rotary_emb.original_inv_freq.detach().cpu().clone()
+    block.to(torch.float16)
+    assert block._rotary_emb.inv_freq.dtype == torch.float32
+    assert block._rotary_emb.original_inv_freq.dtype == torch.float32
+    assert torch.equal(block._rotary_emb.inv_freq.detach().cpu(), original)
+    assert torch.equal(block._rotary_emb.original_inv_freq.detach().cpu(), original_copy)
+    rounded = original.half().float()
+    if not torch.equal(original, rounded):
+        assert not torch.equal(block._rotary_emb.inv_freq.detach().cpu(), rounded)
