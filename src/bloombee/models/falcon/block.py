@@ -43,6 +43,21 @@ class OptimizedFalconRotaryEmbedding(nn.Module):
         self.input_surface = None
         self.static_outputs = None
 
+    def _apply(self, fn, recurse=True):
+        # cos_sin() builds frequencies as t * inv_freq in inv_freq.dtype.
+        # _load_hf_block_weights ends in block.to(dtype=fp16/bf16), which
+        # would downcast this buffer; later emb.float() cannot recover the
+        # lost mantissa bits, so long-context RoPE drifts.
+        inv_freq = self.inv_freq if self.inv_freq is not None and self.inv_freq.is_floating_point() else None
+        out = super()._apply(fn, recurse=recurse)
+        if inv_freq is not None:
+            self.register_buffer(
+                "inv_freq",
+                inv_freq.to(device=self.inv_freq.device, dtype=torch.float32),
+                persistent=False,
+            )
+        return out
+
     def _optimized_apply_rotary(self, query, key, cos, sin):
         if self.cuda_graph is None:
             self.cuda_graph = torch.cuda.CUDAGraph()
