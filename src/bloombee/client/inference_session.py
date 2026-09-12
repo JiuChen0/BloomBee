@@ -234,41 +234,6 @@ class _ServerInferenceSession:
             self.history = self.history[:, :start_from_position, :] if start_from_position > 0 else None
             self._history_storage = None
 
-    def compact_history_to_accepted_kv(self, position_ids: Optional[torch.Tensor]) -> None:
-        """Keep prefix + accepted speculative tokens, matching server KV gather.
-
-        Prefix truncate is wrong when accepted tokens are not a leading slice of
-        the flattened tree (e.g. history ``[p0,p1,root,A,B]`` accepting root,B).
-        """
-        if self.history is None or position_ids is None or not torch.is_tensor(position_ids):
-            return
-        ids = position_ids[0] if position_ids.ndim == 2 else position_ids
-        valid = ids[ids >= 0]
-        if valid.numel() == 0:
-            self.history = None
-            self._history_storage = None
-            self._position = 0
-            return
-        hist_len = int(self.history.shape[1])
-        root = int(valid[0].item())
-        prefix_end = min(max(root + 1, 0), hist_len)
-        keep: List[int] = list(range(prefix_end))
-        seen = set(keep)
-        for raw in valid[1:].detach().cpu().tolist():
-            pos = int(raw)
-            if 0 <= pos < hist_len and pos not in seen:
-                keep.append(pos)
-                seen.add(pos)
-        if not keep:
-            self.history = None
-            self._history_storage = None
-            self._position = 0
-            return
-        index = torch.tensor(keep, dtype=torch.long, device=self.history.device)
-        self.history = self.history.index_select(1, index)
-        self._history_storage = None
-        self._position = int(self.history.shape[1])
-
     def step(
         self,
         inputs: torch.Tensor,
@@ -709,19 +674,6 @@ class InferenceSession:
         for session in self._server_sessions:
             assert isinstance(session, _ServerInferenceSession)
             session.position = start_from_position
-
-    def compact_history_to_accepted_kv(self, position_ids: Optional[torch.Tensor]) -> None:
-        """Gather each span's recovery history onto the accepted KV path."""
-        if not self._server_sessions:
-            if position_ids is not None and torch.is_tensor(position_ids):
-                ids = position_ids[0] if position_ids.ndim == 2 else position_ids
-                valid = ids[ids >= 0]
-                self._position = int(valid.numel())
-            return
-        for session in self._server_sessions:
-            assert isinstance(session, _ServerInferenceSession)
-            session.compact_history_to_accepted_kv(position_ids)
-        self._position = self._server_sessions[0]._position
 
     def _enter_server_sessions(self, chosen_spans: List[RemoteSpanInfo]) -> List[_ServerInferenceSession]:
         server_sessions = []  # build server sessions; on error, ensure already-created ones exit cleanly

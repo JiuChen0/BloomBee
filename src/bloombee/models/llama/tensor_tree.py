@@ -180,25 +180,7 @@ def greedy_verify_tensorized(
         bidx = torch.arange(B, device=device_h)
         parent_hidden = hidden_states[bidx, pos_clamped, :]            # [B, H]
         logits = project_rows(parent_hidden)                          # [B, vocab]
-        if logits_processor and len(logits_processor) > 0 and input_ids is not None:
-            predicted_rows = []
-            extra_by_row = [[] for _ in range(B)]
-            if accepted_tokens_steps:
-                toks_so_far = torch.stack(accepted_tokens_steps, dim=1)
-                for b in range(B):
-                    extra_by_row[b] = [int(t) for t in toks_so_far[b].tolist() if int(t) >= 0]
-            for b in range(B):
-                processed = logits[b:b + 1].clone()
-                hist = input_ids[b:b + 1]
-                if extra_by_row[b]:
-                    extra = torch.tensor(extra_by_row[b], dtype=hist.dtype, device=hist.device).unsqueeze(0)
-                    hist = torch.cat([hist, extra], dim=1)
-                for proc in logits_processor:
-                    processed = proc(hist, processed)
-                predicted_rows.append(processed[0].argmax(dim=-1))
-            predicted = torch.stack(predicted_rows, dim=0)
-        else:
-            predicted = logits.argmax(dim=-1)                             # [B]
+        predicted = logits.argmax(dim=-1)                             # [B]
         # Match: children of active_node whose token == predicted; pick lowest node index.
         is_child = (parent_idx == active_node.unsqueeze(1)) & alive   # [B, N]
         match = is_child & (token == predicted.unsqueeze(1))          # [B, N]

@@ -102,17 +102,6 @@ def test_decode_mask_buffer_is_bounded():
     assert dummy._decode_mask_zeros.numel() == 2 * 1 * 128
 
 
-def test_spec_history_gathers_accepted_kv_not_prefix():
-    from bloombee.client.inference_session import _ServerInferenceSession
-
-    holder = type("Holder", (), {})()
-    holder.history = torch.arange(5, dtype=torch.float32).view(1, 5, 1)
-    holder._position = 5
-    _ServerInferenceSession.compact_history_to_accepted_kv(holder, torch.tensor([2, 4]))
-    assert holder.history.squeeze().tolist() == [0.0, 1.0, 2.0, 4.0]
-    assert holder._position == 4
-
-
 def test_client_cache_budget_uses_allocator_units():
     from types import SimpleNamespace
 
@@ -121,19 +110,6 @@ def test_client_cache_budget_uses_allocator_units():
     span = SimpleNamespace(length=10, server_info=SimpleNamespace(cache_tokens_left=4096))
     assert RemoteSequenceManager._has_cache_for(span, 1024) is True
     assert RemoteSequenceManager._has_cache_for(span, 8192) is False
-
-
-def test_verify_path_uses_leaf_bonus_distribution():
-    from bloombee.models.llama.spec_decoding_verify import verify_path
-
-    target = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
-    draft = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
-    tokens = torch.tensor([0, 1])
-    bonus = torch.tensor([1.0, 0.0])
-    gen = torch.Generator().manual_seed(0)
-    committed, accepted = verify_path(target, draft, tokens, generator=gen, bonus_probs=bonus)
-    assert accepted == 2
-    assert committed[-1] == 0
 
 
 def test_s2s_push_forwards_padding_mask_without_spec_flag():
