@@ -77,6 +77,28 @@ def append_sequence_history(
     return storage[:, :need], storage
 
 
+def seed_replacement_session_history(updated_sessions, recovered_history) -> None:
+    """Seed failover replacements with the failed span's activation history.
+
+    Only the first replacement hop may replay the failed span's *input*
+    activations. Later hops in a split replacement path must start empty so
+    they consume the previous hop's replayed outputs. Cloning the same input
+    history onto every replacement rebuilds later spans from the wrong layer
+    activations and corrupts KV after a mid-generation reroute.
+    """
+    if not updated_sessions:
+        return
+    first = updated_sessions[0]
+    if recovered_history is None:
+        first.history = None
+    else:
+        first.history = recovered_history.clone()
+    first._history_storage = None
+    for session in updated_sessions[1:]:
+        session.history = None
+        session._history_storage = None
+
+
 _FLOATING_WIRE_DTYPES = {torch.float16, torch.bfloat16, torch.float32, torch.float64}
 
 
@@ -1086,12 +1108,9 @@ class InferenceSession:
         
         # If there is a failed span, this code replaces it, otherwise it just adds new ones
         if server_idx < n_prev_spans:
-            recovered_history = self._server_sessions[server_idx].history
-            for session in updated_sessions:
-                if recovered_history is None:
-                    session.history = None
-                else:
-                    session.history = recovered_history.clone()
+            seed_replacement_session_history(
+                updated_sessions, self._server_sessions[server_idx].history
+            )
         self._server_sessions[server_idx : server_idx + 1] = updated_sessions
 
         # Update links to the next server session for direct server-to-server communication via rpc_push()
