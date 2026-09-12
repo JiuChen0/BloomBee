@@ -2,6 +2,7 @@
 Tools for converting transformer blocks, applying quantization and/or tensor parallelism
 """
 import re
+import warnings
 from enum import Enum
 from typing import Optional, Sequence
 
@@ -299,9 +300,6 @@ def convert_block(
         def named_parameters(self, *args, **kwargs):
             return self._module.named_parameters(*args, **kwargs)
 
-        def parameters(self, *args, **kwargs):
-            return self._module.parameters(*args, **kwargs)
-            
         def named_buffers(self, *args, **kwargs):
             return self._module.named_buffers(*args, **kwargs)
 
@@ -353,7 +351,12 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
     This function is a no-op and kept for backward compatibility.
     """
     if quant_type != QuantType.NONE:
-        logger.debug(f"Quantization type {quant_type} specified, but quantization is handled by FlexGen compression system")
+        warnings.warn(
+            f"quantize_module(quant_type={quant_type}) is a no-op; "
+            "BloomBee quantization is handled by FlexGen compression, not this shim.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     return model
 
 

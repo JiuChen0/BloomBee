@@ -248,10 +248,20 @@ class KVCacheManager:
             kv_heads = max(matching) if matching else None
         else:
             kv_heads = None
-            if source_head_dim > 0 and source_head_dim == getattr(self.block_config, "global_head_dim", None):
-                kv_heads = getattr(self.block_config, "num_global_key_value_heads", None)
+            try:
+                global_hd = getattr(self.block_config, "global_head_dim", None)
+            except Exception:
+                global_hd = None
+            if source_head_dim > 0 and source_head_dim == global_hd:
+                try:
+                    kv_heads = getattr(self.block_config, "num_global_key_value_heads", None)
+                except Exception:
+                    kv_heads = None
             if kv_heads is None:
-                kv_heads = getattr(self.block_config, "num_key_value_heads", None)
+                try:
+                    kv_heads = getattr(self.block_config, "num_key_value_heads", None)
+                except Exception:
+                    kv_heads = None
         if kv_heads is None:
             groups = getattr(self.block_config, "num_key_value_groups", None)
             try:

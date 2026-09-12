@@ -39,6 +39,44 @@ from bloombee.utils.microbatch_config import (
 logger = get_logger(__name__)
 
 
+def append_sequence_history(
+    history: Optional[torch.Tensor],
+    tokens: torch.Tensor,
+    storage: Optional[torch.Tensor] = None,
+    *,
+    min_capacity: int = 64,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Append ``tokens`` along the sequence dim using a growable buffer.
+
+    Returns ``(history_view, storage)``. ``history_view`` is ``storage[:, :used]``.
+    Avoids the quadratic ``torch.cat`` on every decode step.
+    """
+    if tokens.ndim != 3:
+        combined = tokens if history is None else torch.cat([history, tokens], dim=1)
+        return combined, combined
+    n_new = int(tokens.shape[1])
+    batch, hidden = int(tokens.shape[0]), int(tokens.shape[2])
+    n_old = 0 if history is None else int(history.shape[1])
+    need = n_old + n_new
+    reuse = (
+        storage is not None
+        and storage.ndim == 3
+        and int(storage.shape[0]) == batch
+        and int(storage.shape[2]) == hidden
+        and int(storage.shape[1]) >= need
+        and (history is None or history.data_ptr() == storage.data_ptr())
+    )
+    if not reuse:
+        cap = max(need * 2, min_capacity)
+        if storage is not None and storage.ndim == 3:
+            cap = max(cap, int(storage.shape[1]) * 2)
+        storage = tokens.new_empty(batch, cap, hidden)
+        if history is not None and n_old > 0:
+            storage[:, :n_old] = history
+    storage[:, n_old:need] = tokens
+    return storage[:, :need], storage
+
+
 _FLOATING_WIRE_DTYPES = {torch.float16, torch.bfloat16, torch.float32, torch.float64}
 
 
@@ -133,6 +171,7 @@ class _ServerInferenceSession:
 
         self._position = 0
         self.history = None  # Used in case of server failures to regenerate attention caches on new servers
+        self._history_storage = None
         self.next_session = None
         # Session-open logical batch. Pinned on the first step so active-row
         # compaction (smaller later steps) keeps server KV allocation stable.
@@ -175,6 +214,42 @@ class _ServerInferenceSession:
         self._position = start_from_position
         if self.history is not None and self.history.shape[1] >= start_from_position:
             self.history = self.history[:, :start_from_position, :] if start_from_position > 0 else None
+            self._history_storage = None
+
+    def compact_history_to_accepted_kv(self, position_ids: Optional[torch.Tensor]) -> None:
+        """Keep prefix + accepted speculative tokens, matching server KV gather.
+
+        Prefix truncate is wrong when accepted tokens are not a leading slice of
+        the flattened tree (e.g. history ``[p0,p1,root,A,B]`` accepting root,B).
+        """
+        if self.history is None or position_ids is None or not torch.is_tensor(position_ids):
+            return
+        ids = position_ids[0] if position_ids.ndim == 2 else position_ids
+        valid = ids[ids >= 0]
+        if valid.numel() == 0:
+            self.history = None
+            self._history_storage = None
+            self._position = 0
+            return
+        hist_len = int(self.history.shape[1])
+        root = int(valid[0].item())
+        prefix_end = min(max(root + 1, 0), hist_len)
+        keep: List[int] = list(range(prefix_end))
+        seen = set(keep)
+        for raw in valid[1:].detach().cpu().tolist():
+            pos = int(raw)
+            if 0 <= pos < hist_len and pos not in seen:
+                keep.append(pos)
+                seen.add(pos)
+        if not keep:
+            self.history = None
+            self._history_storage = None
+            self._position = 0
+            return
+        index = torch.tensor(keep, dtype=torch.long, device=self.history.device)
+        self.history = self.history.index_select(1, index)
+        self._history_storage = None
+        self._position = int(self.history.shape[1])
 
     def step(
         self,
@@ -198,10 +273,13 @@ class _ServerInferenceSession:
         """
         if self.closed:
             raise Exception("Session is closed, cannot perform step")
-        n_input_tokens = inputs.shape[1]
+        n_new_tokens = inputs.shape[1]
+        n_input_tokens = n_new_tokens
         # print('client step() n_input_tokens', n_input_tokens)
         if self.history is None: # if the history log is empty
-            self.history = inputs # assign the current inputs to the history log
+            self.history, self._history_storage = append_sequence_history(
+                None, inputs, getattr(self, "_history_storage", None)
+            )
         elif self.history.shape[1] == self._position: # if the length of the history equals the current position
             if hypo_ids is not None and not is_dummy(hypo_ids):
                 # Recovery must replay the same rows as the server KV gather,
@@ -216,9 +294,12 @@ class _ServerInferenceSession:
                 if indices.unique().numel() != indices.numel():
                     raise ValueError("Duplicate active-row gather for session history")
                 self.history = self.history.index_select(0, indices)
+                self._history_storage = None
             elif self.history.shape[0] != inputs.shape[0]:
                 raise RuntimeError("Session history batch changed without active-row gather metadata")
-            self.history = torch.cat([self.history, inputs[:, -n_input_tokens:]], dim=1) # append the last n_input_tokens of the current input to history
+            self.history, self._history_storage = append_sequence_history(
+                self.history, inputs[:, -n_input_tokens:], getattr(self, "_history_storage", None)
+            )
         # history can cat input if it's spec decoding and pruning happened, need fall  back
         # assert self.history.shape[1] == self._position + n_input_tokens,
         #     f"Broken input cache: span={self.span} shape={self.history.shape} "
@@ -229,6 +310,7 @@ class _ServerInferenceSession:
             inputs = self.history  # Pass full inputs including prefix
         else:
             inputs = inputs  # No need to pass prefix further
+        n_tokens_on_wire = int(inputs.shape[1]) if inputs.ndim >= 2 else n_new_tokens
 
         def _infer_batch_dim(value) -> int:
             if value is None or is_dummy(value):
@@ -518,7 +600,7 @@ class _ServerInferenceSession:
         #     outputs[0].shape == inputs.shape
         # ), f"output activation shape is different from input shape: {outputs[0].shape} != {inputs.shape}"
 
-        self._position += n_input_tokens
+        self._position += n_tokens_on_wire
         if client_inference_logs_enabled:
             logger.info(f"server inference session self._position: {self._position}")
         return outputs
@@ -609,6 +691,19 @@ class InferenceSession:
         for session in self._server_sessions:
             assert isinstance(session, _ServerInferenceSession)
             session.position = start_from_position
+
+    def compact_history_to_accepted_kv(self, position_ids: Optional[torch.Tensor]) -> None:
+        """Gather each span's recovery history onto the accepted KV path."""
+        if not self._server_sessions:
+            if position_ids is not None and torch.is_tensor(position_ids):
+                ids = position_ids[0] if position_ids.ndim == 2 else position_ids
+                valid = ids[ids >= 0]
+                self._position = int(valid.numel())
+            return
+        for session in self._server_sessions:
+            assert isinstance(session, _ServerInferenceSession)
+            session.compact_history_to_accepted_kv(position_ids)
+        self._position = self._server_sessions[0]._position
 
     def _enter_server_sessions(self, chosen_spans: List[RemoteSpanInfo]) -> List[_ServerInferenceSession]:
         server_sessions = []  # build server sessions; on error, ensure already-created ones exit cleanly
@@ -764,8 +859,15 @@ class InferenceSession:
                     # retry's replay keeps getting passed downstream as `inputs`, inflating
                     # the apparent token count (and the pre-allocated-cache check) for every
                     # later hop in the chain, compounding until some hop's budget overflows.
+                    next_session = (
+                        self._server_sessions[server_idx + 1]
+                        if server_idx + 1 < len(self._server_sessions)
+                        else None
+                    )
+                    next_needs_replay = next_session is not None and not next_session.stepped
                     if (
                         not is_spec_dec
+                        and not next_needs_replay
                         and torch.is_tensor(inputs)
                         and inputs.ndim == 3
                         and n_input_tokens > 0
@@ -988,7 +1090,12 @@ class InferenceSession:
         
         # If there is a failed span, this code replaces it, otherwise it just adds new ones
         if server_idx < n_prev_spans:
-            updated_sessions[0].history = self._server_sessions[server_idx].history
+            recovered_history = self._server_sessions[server_idx].history
+            for session in updated_sessions:
+                if recovered_history is None:
+                    session.history = None
+                else:
+                    session.history = recovered_history.clone()
         self._server_sessions[server_idx : server_idx + 1] = updated_sessions
 
         # Update links to the next server session for direct server-to-server communication via rpc_push()

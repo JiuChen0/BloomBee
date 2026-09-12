@@ -375,25 +375,15 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
             model_name = model_name[:-3]
 
         self.llama_config.name = model_name
-        expanded_path = os.path.abspath(os.path.expanduser(
-            os.path.join(self.path, f"{model_name}-np")))
-        check_path = os.path.join(expanded_path, "embed_tokens.weight")
-        if not os.path.exists(check_path) and DUMMY_WEIGHT not in check_path:
-            if local_src_dir is not None:
-                from bloombee.flexgen_utils.llama_config import convert_local_llama_weights
-                convert_local_llama_weights(local_src_dir, model_name, self.path)
-            elif raw_path and "/" in raw_path:
-                # A real hub repo id: convert the actual repo's weights instead of
-                # guessing a huggyllama mirror (which only exists for canonical
-                # llama-7b/13b/30b/65b sizes and silently mismatches anything else,
-                # e.g. TinyLlama).
-                from huggingface_hub import snapshot_download
-                from bloombee.flexgen_utils.llama_config import convert_local_llama_weights
-                src_dir = snapshot_download(raw_path, allow_patterns=["*.safetensors", "*.bin", "*.json"])
-                convert_local_llama_weights(src_dir, model_name, self.path)
-            else:
-                download_llama_weights(self.llama_config.name, self.path)
-
+        from bloombee.flexgen_utils.llama_config import resolve_flexgen_llama_weights
+        expanded_path = resolve_flexgen_llama_weights(
+            path=self.path,
+            model_name=model_name,
+            raw_path=raw_path,
+            local_src_dir=local_src_dir,
+            revision=getattr(self.llama_config, "_bloombee_revision", None),
+            token=getattr(self.llama_config, "_bloombee_token", None),
+        )
         self.expanded_apth = expanded_path
         self.layers[j].init_weight(self.weight_home[j], expanded_path)
 

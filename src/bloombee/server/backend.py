@@ -196,7 +196,9 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         # per distinct (B, src_len, device) triple instead of every step.
         # At B=32 × 40 layers × 128 decode steps this removes ~160k
         # per-step allocs of a float32 tensor that's otherwise constant.
-        self._decode_mask_scores_cache: Dict[Tuple[int, int, torch.device], torch.Tensor] = {}
+        # Decode-path mask scores: a single growable zeros tensor per backend.
+        # Caching every (B, src_len) copy would grow as O(L^2) over a long session.
+        self._decode_mask_zeros: Optional[torch.Tensor] = None
 
         # Decide device placement policy for module based on offloading policy
         offload_policy = cache_manager.offloading_policy
@@ -239,6 +241,21 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             return False
         expected = torch.arange(hypo_ids.numel(), device=hypo_ids.device, dtype=hypo_ids.dtype)
         return torch.equal(hypo_ids, expected)
+
+    def _get_decode_mask_scores(self, batch_size: int, src_len: int, device: torch.device) -> torch.Tensor:
+        buf = self._decode_mask_zeros
+        if (
+            buf is None
+            or buf.device != device
+            or buf.dtype != torch.float32
+            or buf.shape[0] < batch_size
+            or buf.shape[-1] < src_len
+        ):
+            new_b = batch_size if buf is None else max(int(buf.shape[0]), batch_size)
+            new_s = src_len if buf is None else max(int(buf.shape[-1]), src_len)
+            self._decode_mask_zeros = torch.zeros(new_b, 1, new_s, dtype=torch.float32, device=device)
+            buf = self._decode_mask_zeros
+        return buf[:batch_size, :, :src_len]
 
     def get_inference_cache_descriptors(self, batch_size: int, max_length: int) -> Sequence[TensorDescriptor]:
         """Create tensor descriptors for attention cache tensors used during inference_step.
@@ -312,7 +329,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         )
         layer_type = self._layer_type_for_this_block()
         if layer_type == "full_attention":
-            global_hd = getattr(self.config, "global_head_dim", None)
+            try:
+                global_hd = getattr(self.config, "global_head_dim", None)
+            except Exception:
+                global_hd = None
             if global_hd:
                 return int(global_hd)
         return int(default_hd)
@@ -784,16 +804,39 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # use_cache), then treat downstream as identity. Subsequent smaller
                 # steps then read/write the contiguous first B_active rows.
                 row_perm_applied = False
+                full_batch_size = int(inference_info.full_batch_size or 0) or int(hidden_states.shape[0])
+                batch_offset = int(getattr(inference_info, "batch_offset", 0) or 0)
                 if (
                     hypo_ids is not None
                     and not is_dummy(hypo_ids)
                     and hypo_ids.ndim == 1
                     and hypo_ids.numel() > 0
-                    and not self._is_identity_hypo_ids(hypo_ids)
                 ):
-                    self.cache_manager.permute_batch_rows(hypo_ids, cache_tensors)
-                    hypo_ids = torch.arange(hypo_ids.numel(), dtype=hypo_ids.dtype, device=hypo_ids.device)
-                    row_perm_applied = True
+                    if hypo_ids.numel() == full_batch_size:
+                        if batch_offset == 0 and not self._is_identity_hypo_ids(hypo_ids):
+                            self.cache_manager.permute_batch_rows(hypo_ids, cache_tensors)
+                            row_perm_applied = True
+                        hypo_ids = torch.arange(batch_size, dtype=hypo_ids.dtype, device=hypo_ids.device)
+                    else:
+                        expected_global = torch.arange(
+                            batch_offset,
+                            batch_offset + hypo_ids.numel(),
+                            device=hypo_ids.device,
+                            dtype=hypo_ids.dtype,
+                        )
+                        if torch.equal(hypo_ids, expected_global) or self._is_identity_hypo_ids(hypo_ids):
+                            hypo_ids = torch.arange(hypo_ids.numel(), dtype=hypo_ids.dtype, device=hypo_ids.device)
+                        elif batch_offset == 0:
+                            self.cache_manager.permute_batch_rows(hypo_ids, cache_tensors)
+                            row_perm_applied = True
+                            hypo_ids = torch.arange(hypo_ids.numel(), dtype=hypo_ids.dtype, device=hypo_ids.device)
+                        else:
+                            logger.warning(
+                                "Skipping sliced non-identity hypo_ids at batch_offset=%s; "
+                                "row permutation must be applied once at request scope",
+                                batch_offset,
+                            )
+                            hypo_ids = torch.arange(hypo_ids.numel(), dtype=hypo_ids.dtype, device=hypo_ids.device)
 
                 logger.debug(f"[MB_DEBUG] backend.inference_step: uid={inference_info.uid}, "
                             f"batch_offset={inference_info.batch_offset}, "
@@ -948,14 +991,9 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                             attention_mask = self.convert_mask_to_scores(full_mask)
                     elif seq_len == 1 and cache_len >= 0 and not self._is_spec_decoding:
                         src_len = cache_len + 1
-                        cache_key = (batch_size, src_len, hidden_states.device)
-                        attention_mask = self._decode_mask_scores_cache.get(cache_key)
-                        if attention_mask is None:
-                            attention_mask = torch.zeros(
-                                batch_size, seq_len, src_len,
-                                dtype=torch.float, device=hidden_states.device,
-                            )
-                            self._decode_mask_scores_cache[cache_key] = attention_mask
+                        attention_mask = self._get_decode_mask_scores(
+                            batch_size, src_len, hidden_states.device
+                        )
                         full_mask = None
                     else:
                         full_mask = self._create_causal_attention_mask(

@@ -36,6 +36,58 @@ fix_recursive_import()
 
 logger = get_logger(__name__)
 
+RECONSTRUCTABLE_WEIGHT_SUFFIXES = ("rotary_emb.inv_freq",)
+
+
+def _default_llama_inv_freq(head_dim: int, rope_theta: float) -> torch.Tensor:
+    return 1.0 / (float(rope_theta) ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+
+
+def _llama_rope_type(config) -> str:
+    rope_scaling = getattr(config, "rope_scaling", None) or {}
+    if isinstance(rope_scaling, dict):
+        return str(rope_scaling.get("rope_type") or rope_scaling.get("type") or "default")
+    return "default"
+
+
+def compute_llama_inv_freq(config, head_dim: int) -> torch.Tensor:
+    """Build RoPE inv_freq from the model config, including non-default scaling.
+
+    FlexGen applies ``t * inv_freq``. HF linear RoPE instead scales positions by
+    ``1/factor``, so a successful HF init still has to bake that factor into the
+    stored frequencies for this kernel.
+    """
+    rope_theta = float(getattr(config, "rope_theta", 10000.0))
+    rope_type = _llama_rope_type(config)
+    rope_scaling = getattr(config, "rope_scaling", None) or {}
+    inv_freq = None
+
+    try:
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+        init_fn = ROPE_INIT_FUNCTIONS.get(rope_type) or ROPE_INIT_FUNCTIONS.get("default")
+        if init_fn is not None:
+            maybe_inv_freq, _attention_scaling = init_fn(config, device=torch.device("cpu"))
+            if maybe_inv_freq is not None and maybe_inv_freq.numel() == head_dim // 2:
+                inv_freq = maybe_inv_freq.to(dtype=torch.float32)
+    except Exception:
+        logger.debug("Falling back to explicit RoPE inv_freq", exc_info=True)
+
+    if inv_freq is None:
+        inv_freq = _default_llama_inv_freq(head_dim, rope_theta)
+        if rope_type == "linear" and isinstance(rope_scaling, dict):
+            factor = float(rope_scaling.get("factor", 1.0) or 1.0)
+            if factor != 1.0:
+                inv_freq = inv_freq / factor
+        return inv_freq
+
+    if rope_type == "linear" and isinstance(rope_scaling, dict):
+        factor = float(rope_scaling.get("factor", 1.0) or 1.0)
+        if factor != 1.0:
+            # HF linear scaling leaves inv_freq unchanged and divides positions.
+            inv_freq = inv_freq / factor
+    return inv_freq
+
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
     LlamaConfig,
@@ -170,51 +222,39 @@ def init_weight_list(weight_specs, policy, env):
             pin_memory = policy.pin_weight
             compress = policy.compress_weight
 
+        reconstructable = any(str(filename).endswith(suffix) for suffix in RECONSTRUCTABLE_WEIGHT_SUFFIXES)
+
+        def _load_or_fail(target, *, compressed: bool = False):
+            if DUMMY_WEIGHT in filename:
+                if compressed:
+                    for part in target.data:
+                        part.load_from_np(np.ones(part.shape, torch_dtype_to_np_dtype[part.dtype]))
+                else:
+                    target.load_from_np(np.ones(shape, dtype))
+                return
+            try:
+                target.load_from_np_file(filename)
+            except (FileNotFoundError, AttributeError) as exc:
+                if reconstructable:
+                    logger.info("Reconstructable weight missing at %s; caller will refill it (%s)", filename, exc)
+                    return
+                raise FileNotFoundError(
+                    f"Missing learned FlexGen weight {filename}: {exc}"
+                ) from exc
+
         if not compress:
             weight = home.allocate(shape, dtype, pin_memory=pin_memory)
-
-            if DUMMY_WEIGHT not in filename:
-                try:
-                    weight.load_from_np_file(weight_specs[i][2])
-                except (FileNotFoundError, AttributeError) as e:
-                    logger.warning(f"Could not load weight from file {weight_specs[i][2]}: {e}")
-                    # If file does not exist or loading fails, use random initialization
-                    weight.load_from_np(np.random.rand(*shape).astype(dtype))
-            else:
-                weight.load_from_np(np.ones(shape, dtype))
-                #weight.load_from_np(np.random.rand(*shape).astype(dtype))
+            _load_or_fail(weight)
         else:
             # Check if compressed device is available
             if hasattr(home, 'compressed_device') and home.compressed_device is not None:
                 weight = home.compressed_device.allocate(
                     shape, dtype, policy.comp_weight_config, pin_memory=pin_memory)
-
-                if DUMMY_WEIGHT not in filename:
-                    try:
-                        weight.load_from_np_file(weight_specs[i][2])
-                    except (FileNotFoundError, AttributeError) as e:
-                        logger.warning(f"Could not load weight from file {weight_specs[i][2]}: {e}")
-                        # If file does not exist or loading fails, use random initialization
-                        for i in range(2):
-                            x = weight.data[i]
-                            x.load_from_np(np.random.rand(*x.shape).astype(torch_dtype_to_np_dtype[x.dtype]))
-                else:
-                    for i in range(2):
-                        x = weight.data[i]
-                        x.load_from_np(np.ones(x.shape, torch_dtype_to_np_dtype[x.dtype]))
+                _load_or_fail(weight, compressed=True)
             else:
-                # If compressed device is not available, fall back to non-compressed method
                 logger.warning("Compressed device not available, falling back to non-compressed allocation")
                 weight = home.allocate(shape, dtype, pin_memory=pin_memory)
-                if DUMMY_WEIGHT not in filename:
-                    try:
-                        weight.load_from_np_file(weight_specs[i][2])
-                    except (FileNotFoundError, AttributeError) as e:
-                        logger.warning(f"Could not load weight from file {weight_specs[i][2]}: {e}")
-                        # If file does not exist or loading fails, use random initialization
-                        weight.load_from_np(np.random.rand(*shape).astype(dtype))
-                else:
-                    weight.load_from_np(np.ones(shape, dtype))
+                _load_or_fail(weight)
         ret.append(weight)
         
     return ret
@@ -322,21 +362,20 @@ class FLEX_LlamaAttention(LlamaAttention):
             ((h, q_dim), dtype, path + "self_attn.o_proj.weight"),
             # input layer norm
             ((h, ), dtype, path + "input_layernorm.weight"),
-            # rotary_embed
-            ((head_dim // 2, ), dtype, path + "self_attn.rotary_emb.inv_freq"),
+            # rotary_embed — reconstructable from config; keep FP32 for frequency precision
+            ((head_dim // 2, ), np.float32, path + "self_attn.rotary_emb.inv_freq"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
         # transformers >= 4.38 no longer persists rotary_emb.inv_freq, so the
-        # np file is usually absent and the slot holds uninitialized memory.
-        # The value is fully determined by the config; always recompute it.
-        rope_theta = float(getattr(self.config, "rope_theta", 10000.0))
-        inv_freq = 1.0 / (
-            rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
-        )
+        # np file is usually absent. Always recompute from the model config,
+        # including non-default rope_scaling.
+        inv_freq = compute_llama_inv_freq(self.config, head_dim)
         try:
-            weights[5].data.copy_(inv_freq.to(weights[5].data.dtype))
-        except Exception:
-            logger.warning("Could not overwrite rotary inv_freq; falling back to file contents")
+            weights[5].data.copy_(inv_freq.to(device=weights[5].data.device, dtype=torch.float32))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to write reconstructed RoPE inv_freq for layer {self.layer_id}: {exc}"
+            ) from exc
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
@@ -466,8 +505,12 @@ class FLEX_LlamaAttention(LlamaAttention):
             # prefill
             # import pdb;pdb.set_trace()---------------------
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-            h, new_k_cache, new_v_cache = self.compute.mha_llama(h, mask, w_q, w_k, w_v, w_out,
-                                       num_attention_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config, input_layernorm, rotary_emb_inv_freq, rotary_position_ids)
+            h, new_k_cache, new_v_cache = self.compute.mha_llama(
+                h, mask, w_q, w_k, w_v, w_out,
+                num_attention_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config,
+                input_layernorm, rotary_emb_inv_freq, rotary_position_ids,
+                rms_norm_eps=float(getattr(self.config, "rms_norm_eps", 1e-5)),
+            )
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:
             # decoding
@@ -480,7 +523,9 @@ class FLEX_LlamaAttention(LlamaAttention):
                 self.policy.compress_cache, self.policy.comp_cache_config,
                 input_layernorm,
                 rotary_emb_inv_freq,
-                rotary_position_ids)
+                rotary_position_ids,
+                rms_norm_eps=float(getattr(self.config, "rms_norm_eps", 1e-5)),
+            )
             cache_write_buf.store((new_k_cache, new_v_cache))
         hidden.val = h
         self.temp_hidden_states.val=h

@@ -77,7 +77,9 @@ def slice_microbatch_inputs(
     if hypo_ids is None or is_dummy(hypo_ids):
         mb_hypo = hypo_ids
     else:
-        mb_hypo = hypo_ids[mb_start:mb_end]
+        # Keep the full mapping. Slicing global row ids like [2, 3] makes
+        # TransformerBackend treat them as a permutation of the entire KV slab.
+        mb_hypo = hypo_ids
 
     # Micro-batches are processed sequentially on the current runtime path, so we
     # can pass a view into the original hidden-state batch instead of eagerly
@@ -213,3 +215,56 @@ def resolve_expected_num_microbatches(
     if micro_batch_size > 0:
         return max(1, (int(full_batch_size) + micro_batch_size - 1) // micro_batch_size)
     return 1
+
+
+S2S_SPEC_TENSOR_NAMES: Tuple[str, ...] = (
+    "tree_attention_mask",
+    "kv_cache_position_ids",
+    "draft_tokens",
+    "prefill_length",
+)
+
+
+def build_s2s_spec_tensors(
+    *,
+    is_spec_dec: bool,
+    tree_attention_mask: Any = None,
+    kv_cache_position_ids: Any = None,
+    draft_tokens: Any = None,
+    prefill_length: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Tensors attached to a cross-stage micro-batch push."""
+    tensors: Dict[str, Any] = {}
+    if torch.is_tensor(tree_attention_mask) and not is_dummy(tree_attention_mask):
+        tensors["tree_attention_mask"] = tree_attention_mask
+    if is_spec_dec:
+        tensors["kv_cache_position_ids"] = kv_cache_position_ids
+        tensors["draft_tokens"] = draft_tokens
+        tensors["prefill_length"] = prefill_length
+        return tensors
+    return tensors or None
+
+
+def s2s_extra_tensor_names(
+    is_spec_dec: bool,
+    spec_tensors: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, ...]:
+    if is_spec_dec:
+        return S2S_SPEC_TENSOR_NAMES
+    mask = (spec_tensors or {}).get("tree_attention_mask")
+    if torch.is_tensor(mask) and mask.ndim >= 2 and not is_dummy(mask):
+        return ("tree_attention_mask",)
+    return ()
+
+
+def unpack_s2s_extras(
+    flat_tensors: Sequence[Any],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Tuple[Any, Any, Any, Any]:
+    """Unpack extras after hidden_states/keep_indices. Scale tensors use metadata index."""
+    metadata = metadata or {}
+    if bool(metadata.get("is_spec_dec")) and len(flat_tensors) >= 6:
+        return tuple(flat_tensors[2:6])
+    if metadata.get("s2s_padding_mask") and len(flat_tensors) >= 3:
+        return flat_tensors[2], None, None, None
+    return None, None, None, None

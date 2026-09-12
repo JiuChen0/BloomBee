@@ -29,7 +29,7 @@ from bloombee.data_structures import CHAIN_DELIMITER, UID_DELIMITER, Handle, Mod
 from bloombee.server.backend import TransformerBackend
 from bloombee.server.memory_cache import AllocationFailed
 from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_backward, run_rpc_forward
-from bloombee.server.microbatch import resolve_expected_num_microbatches
+from bloombee.server.microbatch import resolve_expected_num_microbatches, s2s_extra_tensor_names
 from bloombee.server.s2s_flow import AdaptivePushConcurrency, S2SLinkTelemetry
 from bloombee.server.timing_summary import emit_session_timing_summary
 from bloombee.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritizerBase
@@ -1451,6 +1451,33 @@ class TransformerConnectionHandler(ConnectionHandler):
         """
         session_id = metadata["session_id"]
         step_id = metadata.get("step_id")
+        if metadata.get("s2s_abort"):
+            mb_key = (session_id, step_id)
+            logger.warning(
+                f"{MBPIPE_LOG_PREFIX} rpc_push abort: session={session_id} step={step_id}"
+            )
+            self._mb_processed.pop(mb_key, None)
+            self._mb_processed_timestamps.pop(mb_key, None)
+            self._mb_expected.pop(mb_key, None)
+            self._mb_received.pop(mb_key, None)
+            from bloombee.server.block_functions import _drop_mb_step_state
+            _drop_mb_step_state(mb_key, overlap=True, accum=True)
+            abort_metadata = dict(metadata)
+            abort_metadata["type"] = "micro_batch"
+            abort_metadata["s2s_abort"] = True
+            abort_item = create_microbatch_queue_item(
+                request_id=session_id,
+                step_id=step_id,
+                mb_idx=int(metadata.get("micro_batch_idx", -1)),
+                expected_num_mb=1,
+                payload=request,
+                metadata=abort_metadata,
+                offset=0,
+                size=0,
+                full_batch_size=int(metadata.get("full_batch_size", 1) or 1),
+            )
+            self._put_into_session_queue(session_id, abort_item)
+            return runtime_pb2.ExpertResponse()
         mb_idx = metadata.get("micro_batch_idx", 0)
         mb_offset = metadata.get("micro_batch_offset", 0)
         mb_size = metadata.get("micro_batch_size", 1)
@@ -2133,33 +2160,30 @@ class TransformerConnectionHandler(ConnectionHandler):
                         },
                     )
                 serialized_spec_tensors = []
-                if is_spec_push and spec_tensors:
-                    for tensor_name in (
-                        "tree_attention_mask",
-                        "kv_cache_position_ids",
-                        "draft_tokens",
-                        "prefill_length",
-                    ):
-                        value = spec_tensors.get(tensor_name)
-                        if value is None:
-                            value = torch.empty(0, dtype=torch.int64)
-                        elif not torch.is_tensor(value):
-                            value = torch.as_tensor(value)
-                        serialized_spec_tensors.append(
-                            serialize_torch_tensor(
-                                value,
-                                runtime_pb2.CompressionType.NONE,
-                                allow_inplace=True,
-                                debug_context={
-                                    "phase": transport_phase,
-                                    "tensor_name": tensor_name,
-                                    "source": "server",
-                                    "channel": "rpc_push_microbatch",
-                                    "blocks": push_blocks,
-                                    "batch": int(mb_size),
-                                },
-                            )
+                extra_names = s2s_extra_tensor_names(is_spec_push, spec_tensors)
+                if extra_names == ("tree_attention_mask",):
+                    metadata["s2s_padding_mask"] = True
+                for tensor_name in extra_names:
+                    value = (spec_tensors or {}).get(tensor_name)
+                    if value is None:
+                        value = torch.empty(0, dtype=torch.int64)
+                    elif not torch.is_tensor(value):
+                        value = torch.as_tensor(value)
+                    serialized_spec_tensors.append(
+                        serialize_torch_tensor(
+                            value,
+                            runtime_pb2.CompressionType.NONE,
+                            allow_inplace=True,
+                            debug_context={
+                                "phase": transport_phase,
+                                "tensor_name": tensor_name,
+                                "source": "server",
+                                "channel": "rpc_push_microbatch",
+                                "blocks": push_blocks,
+                                "batch": int(mb_size),
+                            },
                         )
+                    )
                 serialized_scale = None
                 if quant_meta is not None:
                     if scale_tensor is None:
@@ -2294,6 +2318,8 @@ class TransformerConnectionHandler(ConnectionHandler):
                 # [MBPIPE_FIX] Critical for KV correctness on downstream stage:
                 # ensures each micro-batch of a step uses the same logical prefix.
                 "start_from_position",
+                "hypo_ids",
+                "s2s_padding_mask",
             ]:
                 if key in metadata:
                     push_metadata[key] = metadata[key]
@@ -2461,7 +2487,22 @@ class TransformerConnectionHandler(ConnectionHandler):
                 )
                 await asyncio.sleep(synthetic_delay_ms / 1000.0)
 
-            response = await stub.rpc_push(request, timeout=self.request_timeout)
+            last_error = None
+            response = None
+            for attempt in range(3):
+                try:
+                    response = await stub.rpc_push(request, timeout=self.request_timeout)
+                    last_error = None
+                    break
+                except Exception as send_exc:
+                    last_error = send_exc
+                    logger.warning(
+                        f"{MBPIPE_LOG_PREFIX} [ASYNC_PUSH] MB{mb_idx} send attempt {attempt + 1}/3 failed: {send_exc}"
+                    )
+                    if attempt < 2:
+                        await asyncio.sleep(0.05 * (attempt + 1))
+            if last_error is not None or response is None:
+                raise last_error if last_error is not None else RuntimeError("S2S rpc_push returned no response")
             sender_ack_us = self._now_us()
             rpc_timing = self._extract_rpc_push_timing(
                 response,
@@ -2515,6 +2556,26 @@ class TransformerConnectionHandler(ConnectionHandler):
             logger.warning(
                 f"{MBPIPE_LOG_PREFIX} [ASYNC_PUSH] MB{mb_idx} send failed: {e}"
             )
+            abort_meta = {
+                "session_id": push_metadata.get("session_id"),
+                "step_id": step_id,
+                "s2s_abort": True,
+                "pushed": True,
+                "is_microbatch_push": True,
+                "type": "micro_batch",
+            }
+            try:
+                abort_request = runtime_pb2.ExpertRequest(
+                    uid=next_uid,
+                    tensors=[],
+                    metadata=MSGPackSerializer.dumps(abort_meta),
+                )
+                await stub.rpc_push(abort_request, timeout=min(float(self.request_timeout), 2.0))
+            except Exception as abort_exc:
+                logger.warning(
+                    f"{MBPIPE_LOG_PREFIX} [ASYNC_PUSH] failed to abort downstream "
+                    f"session={abort_meta.get('session_id')} step={step_id}: {abort_exc}"
+                )
         finally:
             if isinstance(request_metadata, dict):
                 _cleanup_s2s_local_shm_refs(request_metadata.get("_s2s_local_shm_refs"))

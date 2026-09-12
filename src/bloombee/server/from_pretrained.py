@@ -61,10 +61,10 @@ logger = get_logger(__name__)
 def load_pretrained_block(
     model_name: str,
     block_index: int,
-    env: ExecutionEnv,
-    policy: Policy,
-    weight_home: array_1d,
-    path: str,
+    env: Optional[ExecutionEnv] = None,
+    policy: Optional[Policy] = None,
+    weight_home: Optional[array_1d] = None,
+    path: Optional[str] = None,
     *,
     config: Optional[PretrainedConfig] = None,
     torch_dtype: Union[torch.dtype, str] = "auto",
@@ -90,6 +90,11 @@ def load_pretrained_block(
             config._name_or_path = model_name
         except Exception:
             pass
+    try:
+        config._bloombee_revision = revision
+        config._bloombee_token = token
+    except Exception:
+        pass
 
     use_native_flexgen_llama_tp = (
         getattr(config, "model_type", None) == "llama"
@@ -106,6 +111,10 @@ def load_pretrained_block(
         WrappedGemma4Block,
         WrappedDeepseekV3Block,
     )
+
+    needs_flexgen = (not _is_hf_model) and getattr(config, "model_type", None) != "gpt_oss"
+    if needs_flexgen and None in (env, policy, weight_home, path):
+        raise TypeError("LLaMA FlexGen load_pretrained_block requires env, policy, weight_home, and path")
 
     if use_native_flexgen_llama_tp:
         with init_empty_weights():
@@ -128,6 +137,7 @@ def load_pretrained_block(
         block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_index)
         block = _load_hf_block_weights(
             block, model_name, block_index, config,
+            revision=revision,
             token=token, cache_dir=cache_dir, max_disk_space=max_disk_space, torch_dtype=torch_dtype,
         )
     else:
@@ -146,6 +156,11 @@ def load_pretrained_block(
                 config._name_or_path = model_name
             except Exception:
                 pass
+        try:
+            config._bloombee_revision = revision
+            config._bloombee_token = token
+        except Exception:
+            pass
         with init_empty_weights():
             logger.debug('load_pretrained_block: init_empty_weights()')
             block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_index)
@@ -243,6 +258,7 @@ def _load_hf_block_weights(
     block_index: int,
     config: PretrainedConfig,
     *,
+    revision: Optional[str] = None,
     token: Optional[Union[str, bool]],
     cache_dir: str,
     max_disk_space: Optional[int],
@@ -250,10 +266,11 @@ def _load_hf_block_weights(
 ) -> nn.Module:
     """Load HF state dict weights into a block for non-FlexGen models (Falcon, Mixtral)."""
     block_prefix = f"{config.block_prefix}.{block_index}."
-    logger.info(f"Loading HF weights for {block_prefix} from {model_name}")
+    logger.info(f"Loading HF weights for {block_prefix} from {model_name} revision={revision}")
     state_dict = _load_state_dict_from_repo(
         model_name,
         block_prefix,
+        revision=revision,
         token=token,
         cache_dir=cache_dir,
         max_disk_space=max_disk_space,
@@ -295,7 +312,13 @@ def _load_state_dict_from_repo(
 
     index_file = _find_index_file(model_name, revision=revision, token=token, cache_dir=cache_dir)
     if index_file.endswith(".index.json"):  # Sharded model
-        path = get_file_from_repo(model_name, filename=index_file, use_auth_token=token, cache_dir=cache_dir)
+        path = get_file_from_repo(
+            model_name,
+            filename=index_file,
+            revision=revision,
+            use_auth_token=token,
+            cache_dir=cache_dir,
+        )
         if path is None:
             # _find_index_file() told that a file exists but we can't get it (e.g., it just disappeared)
             raise ValueError(f"Failed to get file {index_file}")
