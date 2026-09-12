@@ -63,3 +63,10 @@ def test_first_step_replays_local_history_when_seeded():
     src = _SESSION_SRC.read_text()
     assert "if not self.stepped:" in src
     assert "inputs = self.history" in src
+
+
+def test_two_hop_failover_replays_only_until_next_session_has_stepped():
+    src = _SESSION_SRC.read_text()
+    assert "next_needs_replay = next_session is not None and not next_session.stepped" in src
+    assert "and not next_needs_replay" in src
+    assert "seed_replacement_session_history" in src

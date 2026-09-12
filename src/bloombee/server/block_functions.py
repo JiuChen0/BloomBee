@@ -178,6 +178,18 @@ def _s2s_quant_scale_tensor(
     return flat_tensors[index_int]
 
 
+def _s2s_hypo_ids_payload(wire_hypo_ids: Any, step_metadata: Optional[Dict[str, Any]]) -> Any:
+    """Prefer the S2S hypo_ids tensor; fall back to JSON metadata."""
+    if torch.is_tensor(wire_hypo_ids) and not is_dummy(wire_hypo_ids) and wire_hypo_ids.numel() > 0:
+        return wire_hypo_ids
+    raw = None if not isinstance(step_metadata, dict) else step_metadata.get("hypo_ids")
+    if raw is None:
+        return None
+    if torch.is_tensor(raw):
+        return raw
+    return torch.as_tensor(raw, dtype=torch.long)
+
+
 def _effective_token_increment(
     hidden_states: torch.Tensor,
     kv_cache_position_ids: Any,
@@ -857,6 +869,7 @@ async def iterate_rpc_inference(
                 mb_kv_cache_position_ids,
                 mb_draft_tokens,
                 mb_prefill_length,
+                mb_hypo_ids,
             ) = unpack_s2s_extras(flat_tensors, step_metadata)
             spec_payload_present = flag_to_bool(step_metadata.get("is_spec_dec", 0)) and len(flat_tensors) >= 6
             padding_payload_present = mb_tree_attention_mask is not None and not spec_payload_present
@@ -917,12 +930,7 @@ async def iterate_rpc_inference(
                     step_metadata["need_pruning"] = False
                 request_context.cache_from_mb0(
                     prompts=[None] * len(requested_backends),
-                    hypo_ids=(
-                        torch.as_tensor(step_metadata.get("hypo_ids"), dtype=torch.long)
-                        if step_metadata.get("hypo_ids") is not None
-                        and not torch.is_tensor(step_metadata.get("hypo_ids"))
-                        else step_metadata.get("hypo_ids")
-                    ),
+                    hypo_ids=_s2s_hypo_ids_payload(mb_hypo_ids, step_metadata),
                     tree_attention_mask=mb_tree_attention_mask,
                     kv_cache_position_ids=mb_kv_cache_position_ids,
                     draft_tokens=mb_draft_tokens,
@@ -952,6 +960,8 @@ async def iterate_rpc_inference(
                 tree_attention_mask = mb_tree_attention_mask
             elif not flag_to_bool(is_spec_dec):
                 tree_attention_mask = None
+            if mb_hypo_ids is not None and torch.is_tensor(mb_hypo_ids) and not is_dummy(mb_hypo_ids):
+                hypo_ids = mb_hypo_ids
 
             if is_spec_dec and _should_restore_spec_hidden_states(hidden_states, keep_indices, draft_tokens):
                 logger.info(
@@ -1230,6 +1240,7 @@ async def iterate_rpc_inference(
                     kv_cache_position_ids=kv_cache_position_ids,
                     draft_tokens=draft_tokens,
                     prefill_length=prefill_length,
+                    hypo_ids=hypo_ids,
                 )
                 asyncio.create_task(
                     cross_stage_push_fn(push_hidden, push_keep, push_metadata, spec_tensors)
@@ -2139,6 +2150,7 @@ async def iterate_rpc_inference(
                                 kv_cache_position_ids=mb_inputs.kv_cache_position_ids,
                                 draft_tokens=mb_inputs.draft_tokens,
                                 prefill_length=mb_inputs.prefill_length,
+                                hypo_ids=hypo_ids,
                             )
                             push_task = asyncio.create_task(
                                 cross_stage_push_fn(push_hidden, push_keep, push_metadata, spec_tensors)
@@ -2395,6 +2407,7 @@ async def iterate_rpc_inference(
                                 kv_cache_position_ids=mb_inputs.kv_cache_position_ids,
                                 draft_tokens=mb_inputs.draft_tokens,
                                 prefill_length=mb_inputs.prefill_length,
+                                hypo_ids=hypo_ids,
                             )
                             push_task = asyncio.create_task(
                                 cross_stage_push_fn(push_hidden, push_keep, push_metadata, spec_tensors)

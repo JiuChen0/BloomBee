@@ -2140,8 +2140,10 @@ class TransformerConnectionHandler(ConnectionHandler):
                     )
                 serialized_spec_tensors = []
                 extra_names = s2s_extra_tensor_names(is_spec_push, spec_tensors)
-                if extra_names == ("tree_attention_mask",):
+                if "tree_attention_mask" in extra_names and not is_spec_push:
                     metadata["s2s_padding_mask"] = True
+                if "hypo_ids" in extra_names:
+                    metadata["s2s_hypo_ids"] = True
                 for tensor_name in extra_names:
                     value = (spec_tensors or {}).get(tensor_name)
                     if value is None:
@@ -2285,6 +2287,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 "start_from_position",
                 "hypo_ids",
                 "s2s_padding_mask",
+                "s2s_hypo_ids",
             ]:
                 if key in metadata:
                     push_metadata[key] = metadata[key]

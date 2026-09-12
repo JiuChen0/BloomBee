@@ -148,13 +148,70 @@ def test_s2s_push_forwards_padding_mask_without_spec_flag():
     assert names == ("tree_attention_mask",)
     hidden = torch.zeros(2, 3, 4)
     keep = torch.arange(3)
-    parsed_mask, kv_pos, draft, prefill = unpack_s2s_extras(
+    parsed_mask, kv_pos, draft, prefill, hypo = unpack_s2s_extras(
         (hidden, keep, mask), {"s2s_padding_mask": True}
     )
     assert torch.equal(parsed_mask, mask)
-    assert kv_pos is None and draft is None and prefill is None
+    assert kv_pos is None and draft is None and prefill is None and hypo is None
     assert s2s_extra_tensor_names(False, {}) == ()
     assert s2s_extra_tensor_names(True, {"tree_attention_mask": mask}) == S2S_SPEC_TENSOR_NAMES
+
+
+def test_s2s_push_forwards_hypo_ids_without_spec_flag():
+    from bloombee.server.microbatch import (
+        S2S_SPEC_TENSOR_NAMES,
+        build_s2s_spec_tensors,
+        s2s_extra_tensor_names,
+        unpack_s2s_extras,
+    )
+
+    mask = torch.tensor([[True, True, False], [True, False, False]])
+    hypo = torch.tensor([1, 0], dtype=torch.int64)
+    packed = build_s2s_spec_tensors(is_spec_dec=False, tree_attention_mask=mask, hypo_ids=hypo)
+    assert packed["hypo_ids"] is hypo
+    names = s2s_extra_tensor_names(False, packed)
+    assert names == ("tree_attention_mask", "hypo_ids")
+    hidden = torch.zeros(2, 3, 4)
+    keep = torch.arange(3)
+    parsed_mask, kv_pos, draft, prefill, parsed_hypo = unpack_s2s_extras(
+        (hidden, keep, mask, hypo),
+        {"s2s_padding_mask": True, "s2s_hypo_ids": True},
+    )
+    assert torch.equal(parsed_mask, mask)
+    assert torch.equal(parsed_hypo, hypo)
+    assert kv_pos is None and draft is None and prefill is None
+
+    hypo_only = build_s2s_spec_tensors(is_spec_dec=False, hypo_ids=hypo)
+    assert s2s_extra_tensor_names(False, hypo_only) == ("hypo_ids",)
+    _, _, _, _, parsed_hypo_only = unpack_s2s_extras(
+        (hidden, keep, hypo), {"s2s_hypo_ids": True}
+    )
+    assert torch.equal(parsed_hypo_only, hypo)
+
+    spec_with_hypo = build_s2s_spec_tensors(
+        is_spec_dec=True,
+        tree_attention_mask=mask,
+        kv_cache_position_ids=torch.tensor([0]),
+        draft_tokens=torch.tensor([1]),
+        prefill_length=torch.tensor([3]),
+        hypo_ids=hypo,
+    )
+    assert s2s_extra_tensor_names(True, spec_with_hypo) == S2S_SPEC_TENSOR_NAMES + ("hypo_ids",)
+    tree, kv_pos, draft, prefill, parsed_spec_hypo = unpack_s2s_extras(
+        (
+            hidden,
+            keep,
+            spec_with_hypo["tree_attention_mask"],
+            spec_with_hypo["kv_cache_position_ids"],
+            spec_with_hypo["draft_tokens"],
+            spec_with_hypo["prefill_length"],
+            hypo,
+        ),
+        {"is_spec_dec": True, "s2s_hypo_ids": True},
+    )
+    assert torch.equal(tree, mask)
+    assert torch.equal(parsed_spec_hypo, hypo)
+    assert kv_pos is not None and draft is not None and prefill is not None
 
 
 def test_append_sequence_history_grows_without_recopying_prefix():
@@ -228,3 +285,76 @@ def test_flexgen_raw_path_ignores_baked_local_llama_path():
     assert not _looks_like_hf_repo_id("/home/sgugger/tmp/llama/llama-7b/")
     assert not _looks_like_hf_repo_id(None)
     assert not _looks_like_hf_repo_id("./weights")
+
+
+def test_falcon_default_revision_is_not_pinned_to_bin_commits():
+    from pathlib import Path
+
+    src = Path("src/bloombee/utils/auto_config.py").read_text()
+    assert "4e2d06f0a7c6370ebabbc30c6f59377ae8f73d76" not in src
+    assert "f1ba7d328c06aa6fbb4a8afd3c756f46d7e6b232" not in src
+    assert "DEFAULT_REVISIONS: dict[str, str] = {}" in src
+
+
+def _load_mixtral_expert_remap():
+    import ast
+    import re
+    from collections import defaultdict
+    from pathlib import Path
+
+    tree = ast.parse(Path("src/bloombee/server/from_pretrained.py").read_text())
+    needed = []
+    wanted = {
+        "_MIXTRAL_LEGACY_EXPERT_KEY_RE",
+        "_MIXTRAL_LEGACY_GATE_KEY_RE",
+        "_remap_mixtral_expert_state_dict",
+    }
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in wanted:
+                    needed.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name in wanted:
+            needed.append(node)
+    namespace = {"re": re, "defaultdict": defaultdict, "torch": torch}
+    exec(compile(ast.Module(body=needed, type_ignores=[]), "<mixtral_remap>", "exec"), namespace)
+    return namespace["_remap_mixtral_expert_state_dict"]
+
+
+def test_mixtral_legacy_experts_remap_to_packed_tensors():
+    remap = _load_mixtral_expert_remap()
+    hidden, intermediate, num_experts = 4, 8, 2
+    state = {
+        "block_sparse_moe.gate.weight": torch.arange(num_experts * hidden, dtype=torch.float32).view(
+            num_experts, hidden
+        ),
+        "self_attn.q_proj.weight": torch.ones(hidden, hidden),
+    }
+    for i in range(num_experts):
+        state[f"block_sparse_moe.experts.{i}.w1.weight"] = torch.full(
+            (intermediate, hidden), float(i + 1)
+        )
+        state[f"block_sparse_moe.experts.{i}.w3.weight"] = torch.full(
+            (intermediate, hidden), float(i + 10)
+        )
+        state[f"block_sparse_moe.experts.{i}.w2.weight"] = torch.full(
+            (hidden, intermediate), float(i + 20)
+        )
+
+    remapped = remap(state)
+    assert "mlp.gate.weight" in remapped
+    assert remapped["mlp.experts.gate_up_proj"].shape == (num_experts, 2 * intermediate, hidden)
+    assert remapped["mlp.experts.down_proj"].shape == (num_experts, hidden, intermediate)
+    assert torch.equal(remapped["mlp.experts.gate_up_proj"][0, :intermediate], torch.full((intermediate, hidden), 1.0))
+    assert torch.equal(remapped["mlp.experts.gate_up_proj"][0, intermediate:], torch.full((intermediate, hidden), 10.0))
+    assert torch.equal(remapped["mlp.experts.down_proj"][1], torch.full((hidden, intermediate), 21.0))
+    assert remapped["self_attn.q_proj.weight"].shape == (hidden, hidden)
+    assert not any(key.startswith("block_sparse_moe.") for key in remapped)
+
+    packed = {
+        "mlp.gate.weight": torch.ones(2, 4),
+        "mlp.experts.gate_up_proj": torch.zeros(2, 16, 4),
+        "mlp.experts.down_proj": torch.zeros(2, 4, 8),
+    }
+    unchanged = remap(dict(packed))
+    assert set(unchanged) == set(packed)

@@ -68,4 +68,5 @@ jobs:
             tests/test_backend_tree_position_ids.py \
             tests/test_spe_dec_tree.py \
             tests/test_fast_generate_eligibility.py \
-            tests/test_qwen3_block_parity.py
+            tests/test_qwen3_block_parity.py \
+            tests/test_recovery_history_source.py

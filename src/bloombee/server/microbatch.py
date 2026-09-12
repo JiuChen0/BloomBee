@@ -189,6 +189,10 @@ S2S_SPEC_TENSOR_NAMES: Tuple[str, ...] = (
 )
 
 
+def _is_s2s_hypo_tensor(value: Any) -> bool:
+    return torch.is_tensor(value) and value.ndim == 1 and value.numel() > 0 and not is_dummy(value)
+
+
 def build_s2s_spec_tensors(
     *,
     is_spec_dec: bool,
@@ -196,11 +200,19 @@ def build_s2s_spec_tensors(
     kv_cache_position_ids: Any = None,
     draft_tokens: Any = None,
     prefill_length: Any = None,
+    hypo_ids: Any = None,
 ) -> Optional[Dict[str, Any]]:
-    """Tensors attached to a cross-stage micro-batch push."""
+    """Tensors attached to a cross-stage micro-batch push.
+
+    Non-spec extras are optional padding mask then optional hypo_ids.
+    Spec extras keep ``S2S_SPEC_TENSOR_NAMES`` first; hypo_ids is appended
+    after those four so existing ``len >= 6`` unpacking stays valid.
+    """
     tensors: Dict[str, Any] = {}
     if torch.is_tensor(tree_attention_mask) and not is_dummy(tree_attention_mask):
         tensors["tree_attention_mask"] = tree_attention_mask
+    if _is_s2s_hypo_tensor(hypo_ids):
+        tensors["hypo_ids"] = hypo_ids
     if is_spec_dec:
         tensors["kv_cache_position_ids"] = kv_cache_position_ids
         tensors["draft_tokens"] = draft_tokens
@@ -213,22 +225,42 @@ def s2s_extra_tensor_names(
     is_spec_dec: bool,
     spec_tensors: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, ...]:
+    spec_tensors = spec_tensors or {}
+    names: list[str] = []
     if is_spec_dec:
-        return S2S_SPEC_TENSOR_NAMES
-    mask = (spec_tensors or {}).get("tree_attention_mask")
-    if torch.is_tensor(mask) and mask.ndim >= 2 and not is_dummy(mask):
-        return ("tree_attention_mask",)
-    return ()
+        names.extend(S2S_SPEC_TENSOR_NAMES)
+    else:
+        mask = spec_tensors.get("tree_attention_mask")
+        if torch.is_tensor(mask) and mask.ndim >= 2 and not is_dummy(mask):
+            names.append("tree_attention_mask")
+    if _is_s2s_hypo_tensor(spec_tensors.get("hypo_ids")):
+        names.append("hypo_ids")
+    return tuple(names)
 
 
 def unpack_s2s_extras(
     flat_tensors: Sequence[Any],
     metadata: Optional[Dict[str, Any]] = None,
-) -> Tuple[Any, Any, Any, Any]:
-    """Unpack extras after hidden_states/keep_indices. Scale tensors use metadata index."""
+) -> Tuple[Any, Any, Any, Any, Any]:
+    """Unpack extras after hidden_states/keep_indices. Scale tensors use metadata index.
+
+    Returns ``(tree_or_mask, kv_pos, draft, prefill, hypo_ids)``.
+    Non-spec extras occupy slots after keep_indices in this order:
+    optional padding mask, optional hypo_ids. Spec extras occupy ``[2:6]``;
+    hypo_ids follows those four when ``s2s_hypo_ids`` is set.
+    """
     metadata = metadata or {}
+    hypo_ids = None
     if bool(metadata.get("is_spec_dec")) and len(flat_tensors) >= 6:
-        return tuple(flat_tensors[2:6])
-    if metadata.get("s2s_padding_mask") and len(flat_tensors) >= 3:
-        return flat_tensors[2], None, None, None
-    return None, None, None, None
+        tree, kv_pos, draft, prefill = flat_tensors[2:6]
+        if metadata.get("s2s_hypo_ids") and len(flat_tensors) >= 7:
+            hypo_ids = flat_tensors[6]
+        return tree, kv_pos, draft, prefill, hypo_ids
+    next_idx = 2
+    mask = None
+    if metadata.get("s2s_padding_mask") and len(flat_tensors) > next_idx:
+        mask = flat_tensors[next_idx]
+        next_idx += 1
+    if metadata.get("s2s_hypo_ids") and len(flat_tensors) > next_idx:
+        hypo_ids = flat_tensors[next_idx]
+    return mask, None, None, None, hypo_ids

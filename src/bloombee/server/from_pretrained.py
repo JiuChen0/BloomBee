@@ -165,6 +165,10 @@ def load_pretrained_block(
 
 
 _DEEPSEEKV3_LEGACY_EXPERT_KEY_RE = re.compile(r"^(.*mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
+_MIXTRAL_LEGACY_EXPERT_KEY_RE = re.compile(
+    r"^(.*)block_sparse_moe\.experts\.(\d+)\.(w1|w2|w3)\.weight$"
+)
+_MIXTRAL_LEGACY_GATE_KEY_RE = re.compile(r"^(.*)block_sparse_moe\.gate\.(weight|bias)$")
 
 
 def _remap_deepseekv3_expert_state_dict(state_dict: "StateDict") -> "StateDict":
@@ -248,6 +252,91 @@ def _remap_deepseekv3_expert_state_dict(state_dict: "StateDict") -> "StateDict":
     return state_dict
 
 
+def _remap_mixtral_expert_state_dict(state_dict: "StateDict") -> "StateDict":
+    """Map Hub Mixtral per-expert keys onto Transformers 5 packed experts.
+
+    Official checkpoints store:
+        block_sparse_moe.gate.weight
+        block_sparse_moe.experts.{i}.w1.weight  [intermediate, hidden]  (gate)
+        block_sparse_moe.experts.{i}.w3.weight  [intermediate, hidden]  (up)
+        block_sparse_moe.experts.{i}.w2.weight  [hidden, intermediate]  (down)
+    Transformers 5 ``MixtralDecoderLayer`` uses:
+        mlp.gate.weight
+        mlp.experts.gate_up_proj  [E, 2*intermediate, hidden]  (w1 then w3)
+        mlp.experts.down_proj     [E, hidden, intermediate]    (w2)
+    """
+    per_expert = defaultdict(dict)
+    for key in list(state_dict.keys()):
+        m = _MIXTRAL_LEGACY_EXPERT_KEY_RE.match(key)
+        if m is None:
+            continue
+        stem, expert_idx, proj = m.group(1), int(m.group(2)), m.group(3)
+        per_expert[(stem, expert_idx)][proj] = state_dict.pop(key)
+
+    for key in list(state_dict.keys()):
+        m = _MIXTRAL_LEGACY_GATE_KEY_RE.match(key)
+        if m is None:
+            continue
+        stem, leaf = m.group(1), m.group(2)
+        state_dict[f"{stem}mlp.gate.{leaf}"] = state_dict.pop(key)
+
+    if not per_expert:
+        return state_dict
+
+    by_stem = defaultdict(dict)
+    for (stem, expert_idx), tensors in per_expert.items():
+        by_stem[stem][expert_idx] = tensors
+    per_expert.clear()
+
+    for stem, experts_by_idx in by_stem.items():
+        num_experts = max(experts_by_idx) + 1
+        missing = [i for i in range(num_experts) if i not in experts_by_idx]
+        if missing:
+            raise ValueError(
+                f"{stem}block_sparse_moe: missing expert indices {missing} while remapping "
+                f"legacy Mixtral weights (found {sorted(experts_by_idx)})"
+            )
+        sample = experts_by_idx[0].get("w1")
+        if sample is None:
+            raise ValueError(
+                f"{stem}block_sparse_moe.experts.0: missing w1 while remapping legacy Mixtral weights"
+            )
+        intermediate, hidden = sample.shape
+        dtype = sample.dtype
+        gate_up_proj = torch.empty((num_experts, 2 * intermediate, hidden), dtype=dtype)
+        down_proj = torch.empty((num_experts, hidden, intermediate), dtype=dtype)
+        required = ("w1", "w2", "w3")
+        for i in range(num_experts):
+            tensors = experts_by_idx.pop(i)
+            missing_proj = [name for name in required if name not in tensors]
+            if missing_proj:
+                raise ValueError(
+                    f"{stem}block_sparse_moe.experts.{i}: missing {missing_proj} "
+                    f"while remapping legacy Mixtral weights"
+                )
+            w1 = tensors.pop("w1")
+            w3 = tensors.pop("w3")
+            w2 = tensors.pop("w2")
+            if tuple(w1.shape) != (intermediate, hidden) or tuple(w3.shape) != (intermediate, hidden):
+                raise ValueError(
+                    f"{stem}block_sparse_moe.experts.{i}: expected w1/w3 "
+                    f"{(intermediate, hidden)}, got w1={tuple(w1.shape)} w3={tuple(w3.shape)}"
+                )
+            if tuple(w2.shape) != (hidden, intermediate):
+                raise ValueError(
+                    f"{stem}block_sparse_moe.experts.{i}: expected w2 "
+                    f"{(hidden, intermediate)}, got {tuple(w2.shape)}"
+                )
+            gate_up_proj[i, :intermediate] = w1
+            gate_up_proj[i, intermediate:] = w3
+            down_proj[i] = w2
+        prefix = f"{stem}mlp.experts"
+        state_dict[f"{prefix}.gate_up_proj"] = gate_up_proj
+        state_dict[f"{prefix}.down_proj"] = down_proj
+
+    return state_dict
+
+
 def _load_hf_block_weights(
     block: nn.Module,
     model_name: str,
@@ -276,6 +365,8 @@ def _load_hf_block_weights(
         return block.load_checkpoint_state(state_dict, torch_dtype)
     if isinstance(block, WrappedDeepseekV3Block):
         state_dict = _remap_deepseekv3_expert_state_dict(state_dict)
+    elif isinstance(block, WrappedMixtralBlock):
+        state_dict = _remap_mixtral_expert_state_dict(state_dict)
     # Bare decoder layers have initialized parameters even before loading.
     # Reject incomplete checkpoints before mutating the block, while allowing
     # optional/generated buffers (e.g. rotary frequencies) to be absent.
