@@ -53,6 +53,15 @@ torch_dtype_to_num_bytes = {
 }
 
 
+def get_choice(cur_percent, percents, choices):
+    percents = np.cumsum(percents)
+    assert np.abs(percents[-1] - 100) < 1e-5
+    for i in range(len(percents)):
+        if cur_percent < percents[i]:
+            return choices[i]
+    return choices[-1]
+
+
 def piecewise_linear_func(xs, ys):
     """Return a function created by linear inerpolation."""
     indices = np.argsort(xs)

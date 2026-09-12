@@ -19,7 +19,7 @@ from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import, general
 from bloombee.flexgen_utils.utils import (GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
     torch_mem_stats, torch_dtype_to_np_dtype, write_benchmark_log,
-    read_benchmark_log)
+    read_benchmark_log, get_choice)
 from bloombee.flexgen_utils.task import Task
 from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
@@ -27,7 +27,6 @@ from torch import nn
 from transformers import AutoTokenizer
 from bloombee.flexgen_utils.timer import timers
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
-from bloombee.utils.memory_usage import see_memory_usage, log_mem
 from bloombee.utils.debug import dprint
 
 from hivemind.utils import get_logger
@@ -192,15 +191,6 @@ def apply_rotary_pos_emb(q, k, cos, sin):
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 
 from pynvml import *
-
-def get_choice(cur_percent, percents, choices):
-    percents = np.cumsum(percents)
-    assert np.abs(percents[-1] - 100) < 1e-5
-
-    for i in range(len(percents)):
-        if cur_percent < percents[i]:
-            return choices[i]
-    return choices[-1]
 
 def init_weight_list(weight_specs, policy, env):
     

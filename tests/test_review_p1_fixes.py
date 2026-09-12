@@ -188,3 +188,43 @@ def test_quantize_module_warns_for_non_none():
         out = quantize_module(mod, quant_type=QuantType.INT8)
     assert out is mod
     assert any(issubclass(item.category, DeprecationWarning) for item in caught)
+
+
+def test_shared_misc_helpers_cover_former_copies():
+    from bloombee.utils.misc import dtype_name, flag_to_bool, slice_batch_aligned, to_int
+
+    assert flag_to_bool(None) is False
+    assert flag_to_bool(0) is False
+    assert flag_to_bool(1) is True
+    assert flag_to_bool(torch.empty(0)) is False
+    assert flag_to_bool(torch.tensor([0, 1])) is True
+    assert to_int("12") == 12
+    assert to_int("nope", 7) == 7
+    assert dtype_name(torch.float16) == "float16"
+    assert dtype_name(None) == ""
+
+    full = torch.arange(6).view(3, 2)
+    sliced = slice_batch_aligned(full, 1, 3, 3)
+    assert torch.equal(sliced, full[1:3])
+    assert slice_batch_aligned(torch.tensor(5), 0, 1, 3).item() == 5
+    assert slice_batch_aligned(None, 0, 1, 3) is None
+
+
+def test_get_choice_uses_flexgen_helper():
+    from bloombee.flexgen_utils.utils import get_choice
+
+    choices = ["disk", "cpu", "gpu"]
+    percents = [0.0, 50.0, 50.0]
+    assert get_choice(10, percents, choices) == "cpu"
+    assert get_choice(60, percents, choices) == "gpu"
+
+
+def test_flexgen_raw_path_ignores_baked_local_llama_path():
+    from bloombee.flexgen_utils.llama_config import _looks_like_hf_repo_id
+
+    assert _looks_like_hf_repo_id("huggyllama/llama-7b")
+    assert _looks_like_hf_repo_id("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    assert _looks_like_hf_repo_id("llama-7b")
+    assert not _looks_like_hf_repo_id("/home/sgugger/tmp/llama/llama-7b/")
+    assert not _looks_like_hf_repo_id(None)
+    assert not _looks_like_hf_repo_id("./weights")

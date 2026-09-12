@@ -66,6 +66,7 @@ from bloombee.utils.microbatch_schema import (
     MBPIPE_SCHEMA_PREFIX,
 )
 from bloombee.utils.p2p import apply_p2p_max_msg_size, get_default_p2p_max_msg_size
+from bloombee.utils.misc import dtype_name, flag_to_bool, to_int
 
 logger = get_logger(__name__)
 
@@ -314,13 +315,6 @@ class TransformerConnectionHandler(ConnectionHandler):
     def _now_us() -> int:
         return int(time.time() * 1_000_000)
 
-    @staticmethod
-    def _to_int(value: Any, default: int = 0) -> int:
-        try:
-            return int(value)
-        except Exception:
-            return default
-
     def _get_clock_sync_estimate(self, peer_id: str) -> Optional[Dict[str, int]]:
         state = self._clock_sync_state.get(peer_id)
         if not state:
@@ -385,8 +379,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         if not isinstance(response_meta, dict):
             return
 
-        receiver_recv_us = self._to_int(response_meta.get("clock_sync_receiver_recv_us"), 0)
-        receiver_ack_us = self._to_int(response_meta.get("clock_sync_receiver_ack_us"), 0)
+        receiver_recv_us = to_int(response_meta.get("clock_sync_receiver_recv_us"), 0)
+        receiver_ack_us = to_int(response_meta.get("clock_sync_receiver_ack_us"), 0)
         if receiver_recv_us <= 0 or receiver_ack_us <= 0 or sender_ack_us < sender_send_us:
             return
 
@@ -681,16 +675,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 points = metadata.get("points", 0)
                 session_id = metadata.get("session_id")
                 alloc_timeout = float(metadata.get("alloc_timeout", 0.0))
-                def _flag_to_bool(value: Any) -> bool:
-                    if value is None:
-                        return False
-                    if torch.is_tensor(value):
-                        if value.numel() == 0:
-                            return False
-                        return bool(value.bool().any().item())
-                    return bool(value)
-
-                is_spec_request = _flag_to_bool(metadata.get("is_spec_dec", 0))
+                is_spec_request = flag_to_bool(metadata.get("is_spec_dec", 0))
                 if is_spec_request and not self._speculative_pruner_enabled:
                     logger.info(
                         f"{MBPIPE_LOG_PREFIX} Speculative decoding requested without an active pruner; "
@@ -1147,8 +1132,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         if not isinstance(response_meta, dict):
             return result
 
-        receiver_recv_us = self._to_int(response_meta.get("clock_sync_receiver_recv_us"), 0)
-        receiver_ack_us = self._to_int(response_meta.get("clock_sync_receiver_ack_us"), 0)
+        receiver_recv_us = to_int(response_meta.get("clock_sync_receiver_recv_us"), 0)
+        receiver_ack_us = to_int(response_meta.get("clock_sync_receiver_ack_us"), 0)
         if receiver_recv_us <= 0 or receiver_ack_us < receiver_recv_us or sender_ack_us < sender_send_us:
             return result
 
@@ -1388,9 +1373,9 @@ class TransformerConnectionHandler(ConnectionHandler):
         if metadata.get("pushed"):
             sender_blocks = str(metadata.get("sender_blocks", "unknown"))
             receiver_blocks = str(metadata.get("receiver_blocks", "unknown"))
-            sender_send_us = self._to_int(metadata.get("clock_sync_sender_send_us"), 0)
-            sender_to_receiver_clock_offset_us = self._to_int(metadata.get("sender_to_receiver_clock_offset_us"), 0)
-            sender_to_receiver_clock_samples = self._to_int(metadata.get("sender_to_receiver_clock_samples"), 0)
+            sender_send_us = to_int(metadata.get("clock_sync_sender_send_us"), 0)
+            sender_to_receiver_clock_offset_us = to_int(metadata.get("sender_to_receiver_clock_offset_us"), 0)
+            sender_to_receiver_clock_samples = to_int(metadata.get("sender_to_receiver_clock_samples"), 0)
             clock_sync_ok = sender_to_receiver_clock_samples > 0
             raw_transfer_ms = (
                 max(0.0, (receive_us - sender_send_us) / 1000.0)
@@ -1533,11 +1518,11 @@ class TransformerConnectionHandler(ConnectionHandler):
         # Uses sender->receiver clock offset when available to isolate pure wire time.
         sender_blocks = str(metadata.get("sender_blocks", "unknown"))
         receiver_blocks = str(metadata.get("receiver_blocks", "unknown"))
-        sender_send_us = self._to_int(metadata.get("clock_sync_sender_send_us"), 0)
-        sender_ser_start_us = self._to_int(metadata.get("s2s_sender_serialize_start_us"), 0)
-        sender_ser_end_us = self._to_int(metadata.get("s2s_sender_serialize_end_us"), 0)
-        sender_enqueue_us = self._to_int(metadata.get("s2s_sender_enqueue_us"), 0)
-        push_timestamp_us = self._to_int(metadata.get("stage_push_timestamp_us"), 0)
+        sender_send_us = to_int(metadata.get("clock_sync_sender_send_us"), 0)
+        sender_ser_start_us = to_int(metadata.get("s2s_sender_serialize_start_us"), 0)
+        sender_ser_end_us = to_int(metadata.get("s2s_sender_serialize_end_us"), 0)
+        sender_enqueue_us = to_int(metadata.get("s2s_sender_enqueue_us"), 0)
+        push_timestamp_us = to_int(metadata.get("stage_push_timestamp_us"), 0)
         sender_compute_to_serialize_start_ms = 0.0
         try:
             sender_compute_to_serialize_start_ms = float(
@@ -1551,9 +1536,9 @@ class TransformerConnectionHandler(ConnectionHandler):
         except Exception:
             sender_sem_wait_ms = 0.0
 
-        sender_to_receiver_clock_offset_us = self._to_int(metadata.get("sender_to_receiver_clock_offset_us"), 0)
-        sender_to_receiver_clock_rtt_us = max(0, self._to_int(metadata.get("sender_to_receiver_clock_rtt_us"), 0))
-        sender_to_receiver_clock_samples = self._to_int(metadata.get("sender_to_receiver_clock_samples"), 0)
+        sender_to_receiver_clock_offset_us = to_int(metadata.get("sender_to_receiver_clock_offset_us"), 0)
+        sender_to_receiver_clock_rtt_us = max(0, to_int(metadata.get("sender_to_receiver_clock_rtt_us"), 0))
+        sender_to_receiver_clock_samples = to_int(metadata.get("sender_to_receiver_clock_samples"), 0)
         clock_sync_ok = sender_to_receiver_clock_samples > 0
 
         sender_serialize_ms = (
@@ -1841,7 +1826,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             if os.environ.get("BLOOMBEE_DUMP_WIRE_ACTIVATIONS", "0") == "1" and next_tensors:
                 try:
                     push_hidden = deserialize_torch_tensor(next_tensors[0])
-                    push_hidden_dtype = str(push_hidden.dtype).replace("torch.", "") if torch.is_tensor(push_hidden) else ""
+                    push_hidden_dtype = dtype_name(push_hidden.dtype) if torch.is_tensor(push_hidden) else ""
                     capture_wire_activation(
                         push_hidden,
                         source="server",
@@ -2077,7 +2062,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             
             # Serialize the micro-batch tensors
             outputs_schema = requested_backends[-1].decode_outputs_schema
-            sender_compute_end_us = self._to_int(metadata.get("stage_compute_end_timestamp_us"), 0)
+            sender_compute_end_us = to_int(metadata.get("stage_compute_end_timestamp_us"), 0)
             serialize_start_us = self._now_us()
             transport_phase = (
                 "spec_verify"
@@ -2088,9 +2073,22 @@ class TransformerConnectionHandler(ConnectionHandler):
             sender_blocks = sender_blocks_str
             push_blocks = f"{sender_blocks_str}->{next_start}:{next_end}"
             hidden_wire = mb_hidden.to(outputs_schema[0].dtype)
-            hidden_compute_dtype = str(mb_hidden.dtype).replace("torch.", "")
-            hidden_schema_dtype = str(outputs_schema[0].dtype).replace("torch.", "")
-            hidden_wire_dtype = str(hidden_wire.dtype).replace("torch.", "")
+            hidden_compute_dtype = dtype_name(mb_hidden.dtype)
+            hidden_schema_dtype = dtype_name(outputs_schema[0].dtype)
+            hidden_wire_dtype = dtype_name(hidden_wire.dtype)
+
+            def _push_debug_context(tensor_name: str, **extra: Any) -> dict:
+                ctx = {
+                    "phase": transport_phase,
+                    "tensor_name": tensor_name,
+                    "source": "server",
+                    "channel": "rpc_push_microbatch",
+                    "blocks": push_blocks,
+                    "batch": int(mb_size),
+                }
+                ctx.update(extra)
+                return ctx
+
             capture_wire_activation(
                 hidden_wire,
                 source="server",
@@ -2115,49 +2113,30 @@ class TransformerConnectionHandler(ConnectionHandler):
                     hidden_to_send,
                     _s2s_output_compression if _s2s_output_compression is not None else outputs_schema[0].compression,
                     allow_inplace=True,
-                    debug_context={
-                        "phase": transport_phase,
-                        "tensor_name": "hidden_states_int8" if quant_meta is not None else "hidden_states",
-                        "source": "server",
-                        "channel": "rpc_push_microbatch",
-                        "blocks": push_blocks,
-                        "batch": int(mb_size),
-                        "compute_dtype": hidden_compute_dtype,
-                        "schema_dtype": hidden_schema_dtype,
-                        "wire_dtype": hidden_wire_dtype,
-                        "upcast_suspect": int(
+                    debug_context=_push_debug_context(
+                        "hidden_states_int8" if quant_meta is not None else "hidden_states",
+                        compute_dtype=hidden_compute_dtype,
+                        schema_dtype=hidden_schema_dtype,
+                        wire_dtype=hidden_wire_dtype,
+                        upcast_suspect=int(
                             mb_hidden.dtype in (torch.float16, torch.bfloat16)
                             and outputs_schema[0].dtype == torch.float32
                         ),
-                    },
+                    ),
                 )
                 if mb_keep_indices is not None:
                     serialized_keep = serialize_torch_tensor(
                         mb_keep_indices.to(torch.int64),
                         outputs_schema[1].compression if len(outputs_schema) > 1 else runtime_pb2.CompressionType.NONE,
                         allow_inplace=True,
-                        debug_context={
-                            "phase": transport_phase,
-                            "tensor_name": "keep_indices",
-                            "source": "server",
-                            "channel": "rpc_push_microbatch",
-                            "blocks": push_blocks,
-                            "batch": int(mb_size),
-                        },
+                        debug_context=_push_debug_context("keep_indices"),
                     )
                 else:
                     serialized_keep = serialize_torch_tensor(
                         torch.arange(mb_hidden.shape[1], dtype=torch.int64),
                         runtime_pb2.CompressionType.NONE,
                         allow_inplace=True,
-                        debug_context={
-                            "phase": transport_phase,
-                            "tensor_name": "keep_indices",
-                            "source": "server",
-                            "channel": "rpc_push_microbatch",
-                            "blocks": push_blocks,
-                            "batch": int(mb_size),
-                        },
+                        debug_context=_push_debug_context("keep_indices"),
                     )
                 serialized_spec_tensors = []
                 extra_names = s2s_extra_tensor_names(is_spec_push, spec_tensors)
@@ -2174,14 +2153,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                             value,
                             runtime_pb2.CompressionType.NONE,
                             allow_inplace=True,
-                            debug_context={
-                                "phase": transport_phase,
-                                "tensor_name": tensor_name,
-                                "source": "server",
-                                "channel": "rpc_push_microbatch",
-                                "blocks": push_blocks,
-                                "batch": int(mb_size),
-                            },
+                            debug_context=_push_debug_context(tensor_name),
                         )
                     )
                 serialized_scale = None
@@ -2192,14 +2164,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         scale_tensor,
                         runtime_pb2.CompressionType.NONE,
                         allow_inplace=True,
-                        debug_context={
-                            "phase": transport_phase,
-                            "tensor_name": "hidden_states_int8_scale",
-                            "source": "server",
-                            "channel": "rpc_push_microbatch",
-                            "blocks": push_blocks,
-                            "batch": int(mb_size),
-                        },
+                        debug_context=_push_debug_context("hidden_states_int8_scale"),
                     )
             serialize_end_perf = perf_counter()
             serialize_end_us = self._now_us()

@@ -43,7 +43,7 @@ from bloombee.utils.s2s_activation_quant import (
     quantize_s2s_hidden_for_transport,
     s2s_activation_quant_enabled,
 )
-from bloombee.utils.misc import DUMMY, DUMMY_INT64, is_dummy
+from bloombee.utils.misc import DUMMY, DUMMY_INT64, flag_to_bool, is_dummy, dtype_name, to_int
 from bloombee.utils.real_activation_dumper import capture_wire_activation
 from bloombee.utils.debug_config import get_env_bool_with_debug_fallback
 from bloombee.utils.microbatch_config import (
@@ -71,12 +71,6 @@ logger = get_logger(__name__)
 
 
 from time import perf_counter
-from datetime import datetime, timezone
-def print_time_now(s):
-    # Get the current time in UTC and emit it through the logger
-    current_utc_datetime = datetime.now(timezone.utc)
-    formatted_utc_time = current_utc_datetime.strftime('%Y-%m-%d %H:%M:%S.%f %Z')
-    logger.debug("\t\t\t%s UTC Time: %s", s, formatted_utc_time)
 
 
 # We prioritize short inference requests and make them use a *merged* inference pool,
@@ -141,13 +135,6 @@ def _compute_micro_batch_ranges_for_request(
     return ranges
 
 
-def _to_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
 def _to_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -165,39 +152,6 @@ def _estimate_bandwidth_mbps(total_bytes: Any, elapsed_ms: Any) -> float:
     if bytes_f <= 0.0 or ms_f <= 0.0:
         return 0.0
     return (bytes_f * 8.0) / (ms_f / 1000.0) / 1_000_000.0
-
-
-def _interval_overlap_ms_from_us(
-    range_start_us: int,
-    range_end_us: int,
-    window_start_us: int,
-    window_end_us: int,
-) -> float:
-    if (
-        range_start_us <= 0
-        or range_end_us <= range_start_us
-        or window_start_us <= 0
-        or window_end_us <= window_start_us
-    ):
-        return 0.0
-    overlap_start_us = max(range_start_us, window_start_us)
-    overlap_end_us = min(range_end_us, window_end_us)
-    if overlap_end_us <= overlap_start_us:
-        return 0.0
-    return (overlap_end_us - overlap_start_us) / 1000.0
-
-
-def _as_python_bool(value: Any) -> bool:
-    """Safely normalize scalar/tensor flags to a Python bool."""
-    if value is None:
-        return False
-    if torch.is_tensor(value):
-        if is_dummy(value):
-            return False
-        if value.numel() == 0:
-            return False
-        return bool(value.bool().any().item())
-    return bool(value)
 
 
 def _s2s_quant_scale_tensor(
@@ -286,10 +240,6 @@ def _block_span_from_uids(requested_uids: Sequence[Union[ExpertUID, str]]) -> st
     return f"{start}:{end}"
 
 
-def _dtype_name(dtype: Optional[torch.dtype]) -> str:
-    return "" if dtype is None else str(dtype).replace("torch.", "")
-
-
 def _prepare_inference_output_for_wire(
     result: torch.Tensor,
     proto,
@@ -300,9 +250,9 @@ def _prepare_inference_output_for_wire(
     wire_tensor = result.to(schema_dtype) if torch.is_tensor(result) and schema_dtype is not None else result
     wire_dtype = wire_tensor.dtype if torch.is_tensor(wire_tensor) else None
     debug_fields: Dict[str, object] = {
-        "compute_dtype": _dtype_name(original_dtype),
-        "schema_dtype": _dtype_name(schema_dtype),
-        "wire_dtype": _dtype_name(wire_dtype),
+        "compute_dtype": dtype_name(original_dtype),
+        "schema_dtype": dtype_name(schema_dtype),
+        "wire_dtype": dtype_name(wire_dtype),
         "dtype_guard_applied": 0,
         "upcast_suspect": int(
             tensor_name == "hidden_states"
@@ -311,7 +261,7 @@ def _prepare_inference_output_for_wire(
         ),
     }
     if original_dtype != wire_dtype:
-        debug_fields["wire_cast"] = f"{_dtype_name(original_dtype)}_to_{_dtype_name(wire_dtype)}_server_schema"
+        debug_fields["wire_cast"] = f"{dtype_name(original_dtype)}_to_{dtype_name(wire_dtype)}_server_schema"
     return wire_tensor, debug_fields
 
 
@@ -807,22 +757,22 @@ async def iterate_rpc_inference(
             push_timestamp_us = step_metadata.get("stage_push_timestamp_us", 0)
             compute_start_timestamp_us = step_metadata.get("stage_compute_start_timestamp_us", 0)
             compute_end_timestamp_us = step_metadata.get("stage_compute_end_timestamp_us", 0)
-            sender_to_receiver_clock_offset_us = _to_int(
+            sender_to_receiver_clock_offset_us = to_int(
                 step_metadata.get("sender_to_receiver_clock_offset_us"), 0
             )
-            sender_to_receiver_clock_rtt_us = _to_int(
+            sender_to_receiver_clock_rtt_us = to_int(
                 step_metadata.get("sender_to_receiver_clock_rtt_us"), 0
             )
-            sender_to_receiver_clock_samples = _to_int(
+            sender_to_receiver_clock_samples = to_int(
                 step_metadata.get("sender_to_receiver_clock_samples"), 0
             )
-            queue_wait_start_us = _to_int(step_metadata.get("_queue_wait_start_us"), 0)
-            queue_wait_end_us = _to_int(step_metadata.get("_queue_wait_end_us"), 0)
-            receiver_receive_us = _to_int(step_metadata.get("s2s_receiver_receive_us"), 0)
-            receiver_queue_put_us = _to_int(step_metadata.get("s2s_receiver_queue_put_us"), 0)
-            sender_send_us = _to_int(step_metadata.get("clock_sync_sender_send_us"), 0)
-            sender_serialize_start_us = _to_int(step_metadata.get("s2s_sender_serialize_start_us"), 0)
-            sender_serialize_end_us = _to_int(step_metadata.get("s2s_sender_serialize_end_us"), 0)
+            queue_wait_start_us = to_int(step_metadata.get("_queue_wait_start_us"), 0)
+            queue_wait_end_us = to_int(step_metadata.get("_queue_wait_end_us"), 0)
+            receiver_receive_us = to_int(step_metadata.get("s2s_receiver_receive_us"), 0)
+            receiver_queue_put_us = to_int(step_metadata.get("s2s_receiver_queue_put_us"), 0)
+            sender_send_us = to_int(step_metadata.get("clock_sync_sender_send_us"), 0)
+            sender_serialize_start_us = to_int(step_metadata.get("s2s_sender_serialize_start_us"), 0)
+            sender_serialize_end_us = to_int(step_metadata.get("s2s_sender_serialize_end_us"), 0)
             transfer_latency_us = receive_timestamp_us - push_timestamp_us if push_timestamp_us > 0 else 0
             
             # [CROSS_STAGE] Pipeline overlap: If previous stage started MB1 compute before we receive MB0,
@@ -908,7 +858,7 @@ async def iterate_rpc_inference(
                 mb_draft_tokens,
                 mb_prefill_length,
             ) = unpack_s2s_extras(flat_tensors, step_metadata)
-            spec_payload_present = _as_python_bool(step_metadata.get("is_spec_dec", 0)) and len(flat_tensors) >= 6
+            spec_payload_present = flag_to_bool(step_metadata.get("is_spec_dec", 0)) and len(flat_tensors) >= 6
             padding_payload_present = mb_tree_attention_mask is not None and not spec_payload_present
             
             # [MB_DEBUG] Log extracted tensors
@@ -960,8 +910,8 @@ async def iterate_rpc_inference(
             # tree/KV/draft context; padded non-spec pushes carry the
             # attention mask so downstream stages do not drop it.
             if spec_payload_present or padding_payload_present or not request_context.is_initialized:
-                spec_from_metadata = _as_python_bool(step_metadata.get("is_spec_dec", 0))
-                pruning_from_metadata = _as_python_bool(step_metadata.get("need_pruning", 0))
+                spec_from_metadata = flag_to_bool(step_metadata.get("is_spec_dec", 0))
+                pruning_from_metadata = flag_to_bool(step_metadata.get("need_pruning", 0))
                 if pruning_from_metadata and not spec_pruner_enabled:
                     pruning_from_metadata = False
                     step_metadata["need_pruning"] = False
@@ -1000,7 +950,7 @@ async def iterate_rpc_inference(
             )
             if mb_tree_attention_mask is not None and not is_dummy(mb_tree_attention_mask):
                 tree_attention_mask = mb_tree_attention_mask
-            elif not _as_python_bool(is_spec_dec):
+            elif not flag_to_bool(is_spec_dec):
                 tree_attention_mask = None
 
             if is_spec_dec and _should_restore_spec_hidden_states(hidden_states, keep_indices, draft_tokens):
@@ -1694,7 +1644,7 @@ async def iterate_rpc_inference(
         inference_layout = step_metadata.get("inference_layout")
         inferred_layout = inference_layout
         if inferred_layout is None:
-            is_spec_layout = _as_python_bool(step_metadata.get("is_spec_dec", 0))
+            is_spec_layout = flag_to_bool(step_metadata.get("is_spec_dec", 0))
             if not is_spec_layout and len(flat_tensors) in (3, 4):
                 inferred_layout = "decode_minimal_v2"
             elif not is_spec_layout and len(flat_tensors) in (5, 6):
@@ -1758,14 +1708,14 @@ async def iterate_rpc_inference(
         if is_spec_dec1 is not None and not is_dummy(is_spec_dec1) and not is_spec_dec1.is_contiguous():
             is_spec_dec1 = is_spec_dec1.contiguous()
             
-        need_pruning = _as_python_bool(need_pruning1 == 1) if need_pruning1 is not None and not is_dummy(need_pruning1) else False
-        is_spec_dec = _as_python_bool(is_spec_dec1 == 1) if is_spec_dec1 is not None and not is_dummy(is_spec_dec1) else False
-        if not is_spec_dec and _as_python_bool(step_metadata.get("is_spec_dec", 0)):
+        need_pruning = flag_to_bool(need_pruning1 == 1) if need_pruning1 is not None and not is_dummy(need_pruning1) else False
+        is_spec_dec = flag_to_bool(is_spec_dec1 == 1) if is_spec_dec1 is not None and not is_dummy(is_spec_dec1) else False
+        if not is_spec_dec and flag_to_bool(step_metadata.get("is_spec_dec", 0)):
             is_spec_dec = True
             logger.info(
                 f"{MBPIPE_LOG_PREFIX} Full-batch spec override from metadata for step_id={step_metadata.get('step_id')}"
             )
-        if not need_pruning and _as_python_bool(step_metadata.get("need_pruning", 0)):
+        if not need_pruning and flag_to_bool(step_metadata.get("need_pruning", 0)):
             need_pruning = True
         if need_pruning and not spec_pruner_enabled:
             logger.info(

@@ -305,6 +305,26 @@ def download_llama_weights(model_name, path):
                 np.save(f, param.cpu().detach().numpy())
 
 
+def _looks_like_hf_repo_id(value: Optional[str]) -> bool:
+    """True for HuggingFace ids like `huggyllama/llama-7b`, not filesystem paths.
+
+    Older LLaMA configs bake a converter machine path into `_name_or_path`
+    (e.g. `/home/sgugger/tmp/llama/llama-7b/`). Those strings contain `/` but
+    are not Hub repo ids and must not be passed to `snapshot_download`.
+    """
+    if not value or not isinstance(value, str):
+        return False
+    value = value.strip()
+    if not value or os.path.isabs(value) or os.path.exists(value):
+        return False
+    if value.startswith(".") or "\\" in value or ":" in value:
+        return False
+    parts = [part for part in value.split("/") if part]
+    if len(parts) not in (1, 2):
+        return False
+    return all(part not in (".", "..") for part in parts)
+
+
 def resolve_flexgen_llama_weights(
     *,
     path: str,
@@ -325,7 +345,7 @@ def resolve_flexgen_llama_weights(
     if raw_path and os.path.isdir(raw_path):
         return convert_local_llama_weights(raw_path, model_name, path, revision=revision)
 
-    if raw_path and "/" in raw_path:
+    if _looks_like_hf_repo_id(raw_path):
         from huggingface_hub import snapshot_download
 
         src_dir = snapshot_download(

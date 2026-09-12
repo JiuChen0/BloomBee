@@ -20,7 +20,7 @@ from bloombee.data_structures import InferenceMetadata
 from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.task_pool import PrioritizedTaskPool
 from bloombee.utils.hivemind_compat import BatchTensorDescriptor, TensorDescriptor, nested_flatten
-from bloombee.utils.misc import get_size_in_bytes, is_dummy
+from bloombee.utils.misc import flag_to_bool, get_size_in_bytes, is_dummy, slice_batch_aligned
 from bloombee.utils.memory_usage import see_memory_usage
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
@@ -43,17 +43,6 @@ if TYPE_CHECKING:
 # Create dedicated offloading debug logger
 offload_logger = logging.getLogger('bloombee.offloading')
 offload_logger.setLevel(logging.INFO)
-
-
-def _flag_to_bool(value) -> bool:
-    # Hoisted from inference_step: the closure redefinition was ~1 alloc/step.
-    if value is None:
-        return False
-    if torch.is_tensor(value):
-        if value.numel() == 0:
-            return False
-        return bool(value.bool().any().item())
-    return bool(value)
 
 
 _STEP_PROFILE_ENABLED = os.environ.get("BLOOMBEE_STEP_PROFILE", "0") == "1"
@@ -319,14 +308,27 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             return int(cache_hd)
         per_layer_configs = getattr(self.config, "per_layer_config", None)
         if per_layer_configs:
-            block_index = self.block_index
-            if block_index is not None and 0 <= block_index < len(per_layer_configs):
-                return int(per_layer_configs[block_index].head_dim)
-            return int(per_layer_configs[0].head_dim)
+            try:
+                block_index = self.block_index
+                if block_index is not None and 0 <= block_index < len(per_layer_configs):
+                    layer_cfg = per_layer_configs[block_index]
+                else:
+                    layer_cfg = per_layer_configs[0]
+                hd = getattr(layer_cfg, "head_dim", None)
+                if hd:
+                    return int(hd)
+            except (TypeError, IndexError, AttributeError):
+                pass
 
-        default_hd = getattr(self.config, "head_dim", None) or (
-            self.config.hidden_size // self.config.num_attention_heads
-        )
+        try:
+            default_hd = getattr(self.config, "head_dim", None)
+        except AttributeError:
+            default_hd = None
+        if not default_hd:
+            heads = getattr(self.config, "num_attention_heads", None) or getattr(
+                self.config, "n_head", None
+            )
+            default_hd = self.config.hidden_size // int(heads)
         layer_type = self._layer_type_for_this_block()
         if layer_type == "full_attention":
             try:
@@ -483,7 +485,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         if self._is_spec_decoding:
             self.cache_manager.update_cache_and_async_reorder(
                 new_kvs,
-                self._slice_batch_aligned(
+                slice_batch_aligned(
                     kv_cache_position_ids,
                     inference_info.batch_offset,
                     inference_info.batch_offset + inference_info.micro_batch_size,
@@ -570,7 +572,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         if ids.ndim == 1:
             ids = ids.unsqueeze(0)
         if ids.ndim >= 2 and ids.shape[0] != batch_size:
-            ids = self._slice_batch_aligned(
+            ids = slice_batch_aligned(
                 ids,
                 batch_offset,
                 batch_offset + batch_size,
@@ -620,7 +622,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         """
         mask = local_tree_mask
         if mask.ndim >= 3 and mask.shape[0] != batch_size:
-            mask = self._slice_batch_aligned(
+            mask = slice_batch_aligned(
                 mask,
                 batch_offset,
                 batch_offset + batch_size,
@@ -769,8 +771,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             ) as cache_tensors, self._peft_module.using_adapter(inference_info.active_adapter): # Use adapter for inference
                 # Parse flags per request (not just first-ever call), otherwise spec/non-spec
                 # mode can get stuck after the first request served by this backend.
-                self._need_pruning = _flag_to_bool(inference_info.need_pruning)
-                requested_spec_decoding = _flag_to_bool(inference_info.is_spec_dec)
+                self._need_pruning = flag_to_bool(inference_info.need_pruning)
+                requested_spec_decoding = flag_to_bool(inference_info.is_spec_dec)
                 self._is_spec_decoding = requested_spec_decoding
                 if self._need_pruning and self.pruner_manager is None:
                     logger.debug(
@@ -965,7 +967,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         and torch.is_tensor(request_attention_mask)
                         and request_attention_mask.ndim == 2
                     ):
-                        request_attention_mask = self._slice_batch_aligned(
+                        request_attention_mask = slice_batch_aligned(
                             request_attention_mask,
                             inference_info.batch_offset,
                             inference_info.batch_offset + batch_size,
@@ -1389,7 +1391,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             # Only apply logical batch_offset slicing when the incoming tensor
             # still represents the full logical batch.
             if kv_cache_position_ids.ndim >= 2 and kv_cache_position_ids.shape[0] != B:
-                kv_cache_position_ids = self._slice_batch_aligned(
+                kv_cache_position_ids = slice_batch_aligned(
                     kv_cache_position_ids,
                     batch_offset,
                     batch_offset + B,
@@ -1416,7 +1418,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             if tree_attention_mask is not None and cache_len is not None and target_seq_len is not None:
                 tree_attention_mask = tree_attention_mask.to(device)
                 if tree_attention_mask.ndim >= 3 and tree_attention_mask.shape[0] != B:
-                    tree_attention_mask = self._slice_batch_aligned(
+                    tree_attention_mask = slice_batch_aligned(
                         tree_attention_mask,
                         batch_offset,
                         batch_offset + B,
@@ -1446,27 +1448,6 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             position_ids = base_positions.unsqueeze(1) + tree_position_ids.unsqueeze(0)
             
             return position_ids
-        
-    def _slice_batch_aligned(
-        self,
-        value: Any,
-        mb_start: int,
-        mb_end: int,
-        full_batch_size: int,
-    ) -> Any:
-        """
-        Slice tensor-like request fields only if they are batch-aligned.
-        Non-tensor / scalar / already-global fields are returned as-is.
-        """
-        if value is None or not torch.is_tensor(value):
-            return value
-        if is_dummy(value):
-            return value
-        if value.ndim == 0:
-            return value
-        if value.shape[0] == full_batch_size:
-            return value[mb_start:mb_end].contiguous()
-        return value
 
     def _normalize_kv_valid_lengths(
         self,

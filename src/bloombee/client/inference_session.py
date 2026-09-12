@@ -24,7 +24,7 @@ from bloombee.utils.lossless_transport import (
     transport_profile_scope,
     log_transport_profile_event,
 )
-from bloombee.utils.misc import DUMMY, DUMMY_INT64, is_dummy
+from bloombee.utils.misc import DUMMY, DUMMY_INT64, dtype_name, is_dummy
 from bloombee.utils.packaging import normalize_arg
 from bloombee.utils.real_activation_dumper import capture_wire_activation
 from bloombee.utils.microbatch_config import (
@@ -80,10 +80,6 @@ def append_sequence_history(
 _FLOATING_WIRE_DTYPES = {torch.float16, torch.bfloat16, torch.float32, torch.float64}
 
 
-def _dtype_name(dtype: Optional[torch.dtype]) -> str:
-    return "" if dtype is None else str(dtype).replace("torch.", "")
-
-
 def _is_floating_wire_dtype(dtype: Optional[torch.dtype]) -> bool:
     return dtype in _FLOATING_WIRE_DTYPES
 
@@ -125,9 +121,9 @@ def _prepare_rpc_inference_tensor_for_wire(
 
     proto = BatchTensorDescriptor.from_tensor(wire_tensor, compression)
     debug_fields = {
-        "compute_dtype": _dtype_name(original_dtype),
-        "schema_dtype": _dtype_name(schema_dtype),
-        "wire_dtype": _dtype_name(wire_tensor.dtype if torch.is_tensor(wire_tensor) else None),
+        "compute_dtype": dtype_name(original_dtype),
+        "schema_dtype": dtype_name(schema_dtype),
+        "wire_dtype": dtype_name(wire_tensor.dtype if torch.is_tensor(wire_tensor) else None),
         "dtype_guard_applied": dtype_guard_applied,
         "upcast_suspect": int(
             tensor_name == "hidden_states"
@@ -136,7 +132,7 @@ def _prepare_rpc_inference_tensor_for_wire(
         ),
     }
     if dtype_guard_applied:
-        debug_fields["wire_cast"] = f"{_dtype_name(original_dtype)}_to_{_dtype_name(target_dtype)}_server_schema"
+        debug_fields["wire_cast"] = f"{dtype_name(original_dtype)}_to_{dtype_name(target_dtype)}_server_schema"
     return wire_tensor, proto, debug_fields
 
 

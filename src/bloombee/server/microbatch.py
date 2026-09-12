@@ -7,7 +7,7 @@ import torch
 
 from bloombee.data_structures import Handle, InferenceMetadata
 from bloombee.utils.microbatch_config import get_micro_batch_size
-from bloombee.utils.misc import is_dummy
+from bloombee.utils.misc import is_dummy, slice_batch_aligned
 
 
 @dataclass(frozen=True)
@@ -22,42 +22,6 @@ class MicrobatchInputs:
     batch_offset: int
     full_batch_size: int
     micro_batch_size: int
-
-
-def slice_batch_aligned(
-    value: Any,
-    mb_start: int,
-    mb_end: int,
-    full_batch_size: int,
-) -> Any:
-    """
-    Slice tensor-like request fields only if they are batch-aligned.
-    Non-tensor / scalar / already-global fields are returned as-is.
-    """
-    if value is None or not torch.is_tensor(value):
-        return value
-    if is_dummy(value):
-        return value
-    if value.ndim == 0:
-        return value
-    if value.shape[0] == full_batch_size:
-        return value[mb_start:mb_end].contiguous()
-    return value
-
-
-def slice_keep_indices(
-    keep_indices: Any,
-    mb_start: int,
-    mb_end: int,
-    full_batch_size: int,
-) -> Any:
-    if keep_indices is None or not torch.is_tensor(keep_indices):
-        return keep_indices
-    if is_dummy(keep_indices) or keep_indices.ndim == 0:
-        return keep_indices
-    if keep_indices.shape[0] == full_batch_size:
-        return keep_indices[mb_start:mb_end].contiguous()
-    return keep_indices
 
 
 def slice_microbatch_inputs(
@@ -95,7 +59,7 @@ def slice_microbatch_inputs(
         kv_cache_position_ids=slice_batch_aligned(kv_cache_position_ids, mb_start, mb_end, full_batch_size),
         draft_tokens=slice_batch_aligned(draft_tokens, mb_start, mb_end, full_batch_size),
         prefill_length=slice_batch_aligned(prefill_length, mb_start, mb_end, full_batch_size),
-        keep_indices=slice_keep_indices(keep_indices, mb_start, mb_end, full_batch_size),
+        keep_indices=slice_batch_aligned(keep_indices, mb_start, mb_end, full_batch_size),
         batch_offset=mb_start,
         full_batch_size=full_batch_size,
         micro_batch_size=mb_size,

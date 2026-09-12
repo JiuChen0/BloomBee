@@ -15,27 +15,10 @@ from tensor_parallel.slicing_configs import get_bloom_config
 from transformers import PretrainedConfig
 from pynvml import *
 from bloombee.utils.debug import dprint
-from bloombee.utils.memory_usage import see_memory_usage, log_mem
+from bloombee.flexgen_utils.utils import get_choice
 from bloombee.server.flexgen_tensor_parallel import FlexgenLlamaTensorParallel
 
 logger = get_logger(__name__)
-
-
-def _get_choice(cur_percent, percents, choices):
-    """Return which device a parameter belongs to based on its cumulative position.
-
-    Mirrors LLaMA's get_choice in flex_llama.py / from_pretrained.py.
-
-    Args:
-        cur_percent: Midpoint percentage (0-100) of this parameter in the full model.
-        percents:    Allocation percentages [disk%, cpu%, gpu%] that must sum to 100.
-        choices:     Corresponding device choices.
-    """
-    cum = np.cumsum(percents)
-    for i, boundary in enumerate(cum):
-        if cur_percent < boundary:
-            return choices[i]
-    return choices[-1]
 
 
 def _named_weight_buffers(module):
@@ -83,7 +66,7 @@ def _assign_weight_devices(module, policy, gpu_device):
     weight_devices = {}
     for i, (name, _) in enumerate(weight_list):
         mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / total * 100
-        weight_devices[name] = _get_choice(mid_percent, dev_percents, dev_choices)
+        weight_devices[name] = get_choice(mid_percent, dev_percents, dev_choices)
     return weight_devices
 
 
