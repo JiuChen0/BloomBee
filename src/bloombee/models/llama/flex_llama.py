@@ -80,11 +80,9 @@ def compute_llama_inv_freq(config, head_dim: int) -> torch.Tensor:
                 inv_freq = inv_freq / factor
         return inv_freq
 
-    if rope_type == "linear" and isinstance(rope_scaling, dict):
-        factor = float(rope_scaling.get("factor", 1.0) or 1.0)
-        if factor != 1.0:
-            # HF linear scaling leaves inv_freq unchanged and divides positions.
-            inv_freq = inv_freq / factor
+    # Current Transformers linear RoPE already divides inv_freq by factor
+    # (`embs = inv_freq @ position_ids`). FlexGen multiplies the same table by
+    # positions, so do not scale a successful HF init a second time.
     return inv_freq
 
 from transformers.models.llama.modeling_llama import (

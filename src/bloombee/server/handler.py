@@ -29,7 +29,11 @@ from bloombee.data_structures import CHAIN_DELIMITER, UID_DELIMITER, Handle, Mod
 from bloombee.server.backend import TransformerBackend
 from bloombee.server.memory_cache import AllocationFailed
 from bloombee.server.block_functions import iterate_rpc_inference, run_rpc_backward, run_rpc_forward
-from bloombee.server.microbatch import resolve_expected_num_microbatches, s2s_extra_tensor_names
+from bloombee.server.microbatch import (
+    MicrobatchStepTracker,
+    resolve_expected_num_microbatches,
+    s2s_extra_tensor_names,
+)
 from bloombee.server.s2s_flow import AdaptivePushConcurrency, S2SLinkTelemetry
 from bloombee.server.timing_summary import emit_session_timing_summary
 from bloombee.server.task_prioritizer import DummyTaskPrioritizer, TaskPrioritizerBase
@@ -264,10 +268,9 @@ class TransformerConnectionHandler(ConnectionHandler):
         self._mb_expected: Dict[tuple, int] = {}
         # Key: (session_id, step_id) -> count of received micro-batches
         self._mb_received: Dict[tuple, int] = {}
-        # Key: (session_id, step_id) -> set of (mb_idx) already processed (idempotency)
-        self._mb_processed: Dict[tuple, set] = {}
-        self._mb_processed_timestamps: Dict[tuple, float] = {}
-        self._MB_PROCESSED_TTL = 120  # seconds
+        # Delivery/abort tracker: queued MBs are not replayed after a partial S2S failure.
+        self._mb_step_tracker = MicrobatchStepTracker(ttl_s=120.0)
+        self._MB_PROCESSED_TTL = 120  # seconds; kept for log compatibility
 
         # [CLOCK_SYNC] Per-peer clock offset estimator for cross-machine strict overlap.
         # offset_us is "remote_clock - local_clock" for the target peer.
@@ -1300,6 +1303,19 @@ class TransformerConnectionHandler(ConnectionHandler):
                             )
                             request = None
                             skip_direct_request = True
+                        if (
+                            (not skip_direct_request)
+                            and session_id is not None
+                            and step_id is not None
+                            and self._mb_step_tracker.is_aborted((session_id, step_id))
+                        ):
+                            logger.warning(
+                                f"{MBPIPE_LOG_PREFIX} iterate_steps: skipping full-batch replay for "
+                                f"aborted step_id={step_id} committed_mbs="
+                                f"{sorted(self._mb_step_tracker.received_indices((session_id, step_id)))}"
+                            )
+                            request = None
+                            skip_direct_request = True
 
                         if (not skip_direct_request) and (step_id is None or step_id not in processed_step_ids):
                             metadata["_queue_wait_ms"] = float(queue_wait_ms)
@@ -1438,11 +1454,11 @@ class TransformerConnectionHandler(ConnectionHandler):
         step_id = metadata.get("step_id")
         if metadata.get("s2s_abort"):
             mb_key = (session_id, step_id)
+            committed = self._mb_step_tracker.abort(mb_key)
             logger.warning(
-                f"{MBPIPE_LOG_PREFIX} rpc_push abort: session={session_id} step={step_id}"
+                f"{MBPIPE_LOG_PREFIX} rpc_push abort: session={session_id} step={step_id} "
+                f"committed_mbs={sorted(committed)}"
             )
-            self._mb_processed.pop(mb_key, None)
-            self._mb_processed_timestamps.pop(mb_key, None)
             self._mb_expected.pop(mb_key, None)
             self._mb_received.pop(mb_key, None)
             from bloombee.server.block_functions import _drop_mb_step_state
@@ -1492,26 +1508,18 @@ class TransformerConnectionHandler(ConnectionHandler):
         )
         
         mb_key = (session_id, step_id)
-        
-        # [MBPIPE] Idempotency check - skip if already processed
-        if mb_key not in self._mb_processed:
-            self._mb_processed[mb_key] = set()
-            self._mb_processed_timestamps[mb_key] = time.monotonic()
-            # TTL cleanup: remove stale entries
-            now = time.monotonic()
-            stale_keys = [k for k, t in self._mb_processed_timestamps.items()
-                          if now - t > self._MB_PROCESSED_TTL]
-            for k in stale_keys:
-                self._mb_processed.pop(k, None)
-                self._mb_processed_timestamps.pop(k, None)
-        
-        if mb_idx in self._mb_processed[mb_key]:
+        decision = self._mb_step_tracker.decide(mb_key, int(mb_idx))
+        if decision == "aborted":
+            logger.warning(
+                f"{MBPIPE_LOG_PREFIX} rpc_push: rejecting mb_idx={mb_idx} because "
+                f"session={session_id} step={step_id} was aborted"
+            )
+            return runtime_pb2.ExpertResponse()
+        if decision == "duplicate":
             logger.info(
                 f"{MBPIPE_LOG_PREFIX} rpc_push: mb_idx={mb_idx} already processed (idempotency), skipping"
             )
             return runtime_pb2.ExpertResponse()
-        
-        self._mb_processed[mb_key].add(mb_idx)
         metadata["s2s_receiver_receive_us"] = int(receive_us)
 
         # [S2S_WIRE] Sender->receiver micro-batch transport timing breakdown.
@@ -1666,12 +1674,11 @@ class TransformerConnectionHandler(ConnectionHandler):
             f"(received={received_count}/{expected_num_mb})"
         )
 
-        # Cleanup tracking when all micro-batches for this step are queued.
+        # Drop assembly counters once the step is fully queued. Keep the
+        # delivery set so a late retry cannot replay committed micro-batches.
         if received_count >= expected_num_mb:
             self._mb_expected.pop(mb_key, None)
             self._mb_received.pop(mb_key, None)
-            self._mb_processed.pop(mb_key, None)
-            self._mb_processed_timestamps.pop(mb_key, None)
 
         return runtime_pb2.ExpertResponse()
 

@@ -264,3 +264,63 @@ def unpack_s2s_extras(
     if metadata.get("s2s_hypo_ids") and len(flat_tensors) > next_idx:
         hypo_ids = flat_tensors[next_idx]
     return mask, None, None, None, hypo_ids
+
+
+class MicrobatchStepTracker:
+    """Per-(session, step) delivery / abort state for S2S micro-batches.
+
+    Queued micro-batches are treated as committed for replay purposes: a later
+    abort or retry must not re-run them against the same KV slab. Aborting a
+    step rejects remaining micro-batches instead of clearing the committed set.
+    """
+
+    __slots__ = ("ttl_s", "_received", "_received_at", "_aborted_at")
+
+    def __init__(self, ttl_s: float = 120.0) -> None:
+        self.ttl_s = float(ttl_s)
+        self._received: Dict[tuple, set] = {}
+        self._received_at: Dict[tuple, float] = {}
+        self._aborted_at: Dict[tuple, float] = {}
+
+    def _now(self) -> float:
+        import time
+
+        return time.monotonic()
+
+    def cleanup(self, now: Optional[float] = None) -> None:
+        now = self._now() if now is None else now
+        stale = [key for key, ts in self._received_at.items() if now - ts > self.ttl_s]
+        for key in stale:
+            self._received.pop(key, None)
+            self._received_at.pop(key, None)
+        stale_abort = [key for key, ts in self._aborted_at.items() if now - ts > self.ttl_s]
+        for key in stale_abort:
+            self._aborted_at.pop(key, None)
+
+    def is_aborted(self, key: tuple) -> bool:
+        return key in self._aborted_at
+
+    def received_indices(self, key: tuple) -> set:
+        return set(self._received.get(key, ()))
+
+    def decide(self, key: tuple, mb_idx: int) -> str:
+        """Return ``accept``, ``duplicate``, or ``aborted``."""
+        self.cleanup()
+        if key in self._aborted_at:
+            return "aborted"
+        received = self._received.setdefault(key, set())
+        self._received_at.setdefault(key, self._now())
+        if mb_idx in received:
+            return "duplicate"
+        received.add(mb_idx)
+        self._received_at[key] = self._now()
+        return "accept"
+
+    def abort(self, key: tuple) -> set:
+        """Mark the step aborted. Keep received indices so committed MBs are not replayed."""
+        self.cleanup()
+        self._aborted_at[key] = self._now()
+        if key not in self._received:
+            self._received[key] = set()
+            self._received_at[key] = self._now()
+        return set(self._received[key])

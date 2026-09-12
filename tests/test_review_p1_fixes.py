@@ -358,3 +358,156 @@ def test_mixtral_legacy_experts_remap_to_packed_tensors():
     }
     unchanged = remap(dict(packed))
     assert set(unchanged) == set(packed)
+
+
+def test_llama_block_does_not_cache_decode_masks():
+    from pathlib import Path
+
+    llama_src = Path("src/bloombee/models/llama/block.py").read_text()
+    template_src = Path("src/bloombee/models/template/block.py.j2").read_text()
+    assert "_attention_mask_cache" not in llama_src
+    assert "_attention_mask_cache" not in template_src
+
+
+def test_s2s_abort_does_not_clear_committed_microbatches():
+    from bloombee.server.microbatch import MicrobatchStepTracker
+
+    tracker = MicrobatchStepTracker(ttl_s=60.0)
+    key = ("session-a", "step-1")
+    assert tracker.decide(key, 0) == "accept"
+    assert tracker.decide(key, 0) == "duplicate"
+    committed = tracker.abort(key)
+    assert committed == {0}
+    assert tracker.is_aborted(key)
+    assert tracker.decide(key, 1) == "aborted"
+    assert tracker.decide(key, 0) == "aborted"
+    assert tracker.received_indices(key) == {0}
+
+
+def test_microbatch_keeps_full_hypo_ids_across_slices():
+    from bloombee.server.microbatch import slice_microbatch_inputs
+
+    hidden = torch.arange(16, dtype=torch.float32).view(4, 2, 2)
+    hypo = torch.tensor([1, 0, 3, 2], dtype=torch.int64)
+    first = slice_microbatch_inputs(
+        hidden, hypo, None, None, None, None, None, mb_start=0, mb_end=2, full_batch_size=4
+    )
+    second = slice_microbatch_inputs(
+        hidden, hypo, None, None, None, None, None, mb_start=2, mb_end=4, full_batch_size=4
+    )
+    assert torch.equal(first.hypo_ids, hypo)
+    assert torch.equal(second.hypo_ids, hypo)
+    assert first.batch_offset == 0
+    assert second.batch_offset == 2
+
+
+def test_permute_batch_rows_gathers_once_without_duplicating_rows():
+    from types import SimpleNamespace
+
+    from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
+    from bloombee.flexgen_utils.compression import CompressionConfig
+    from bloombee.flexgen_utils.policy import Policy
+    from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchTensor
+    from bloombee.server.memory_cache_manager import KVCacheManager
+
+    cpu_device = TorchDevice("cpu")
+    env = ExecutionEnv(gpu=cpu_device, cpu=cpu_device, disk=None, mixed=None)
+    policy = Policy(
+        1, 1, 100, 0, 0, 100, 100, 0,
+        overlap=False, sep_layer=True, pin_weight=False,
+        cpu_cache_compute=False, attn_sparsity=1.0,
+        compress_weight=False,
+        comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False),
+        compress_cache=False,
+        comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False),
+    )
+    manager = KVCacheManager(
+        32,
+        None,
+        policy,
+        env,
+        SimpleNamespace(num_attention_heads=2, hidden_size=16, num_key_value_groups=1),
+    )
+    batch_size, heads, head_dim, seq = 4, 2, 3, 2
+    k = torch.arange(seq * batch_size * heads * head_dim, dtype=torch.float32).view(
+        seq, batch_size * heads, head_dim
+    )
+    v = k + 1000
+    k_cache = TorchTensor.create_from_torch(k.clone(), manager.attention_compute)
+    v_cache = TorchTensor.create_from_torch(v.clone(), manager.attention_compute)
+    perm = torch.tensor([2, 3, 0, 1], dtype=torch.int64)
+    manager.permute_batch_rows(perm, cache_tensors=[(k_cache, v_cache)])
+    expected_k = torch.cat(
+        [k[:, 4:6], k[:, 6:8], k[:, 0:2], k[:, 2:4]],
+        dim=1,
+    )
+    torch.testing.assert_close(k_cache.data, expected_k)
+    unique_rows = [tuple(k_cache.data[0, i * heads:(i + 1) * heads].reshape(-1).tolist()) for i in range(batch_size)]
+    assert len(set(unique_rows)) == batch_size
+
+
+def test_on_request_failure_rebuilds_span_index():
+    from bloombee.client.routing.sequence_info import RemoteSequenceInfo
+    from bloombee.data_structures import RemoteModuleInfo, ServerInfo, ServerState
+    from bloombee.utils.hivemind_compat import PeerID
+
+    cheap = PeerID.from_base58("QmZatFVTzzh66FNsd2aRHUNm45uvnwJEe8eKvPqagW6RQZ")
+    backup = PeerID.from_base58("QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG")
+    cheap_info = ServerInfo(state=ServerState.ONLINE, throughput=10.0, start_block=0, end_block=2)
+    backup_info = ServerInfo(state=ServerState.ONLINE, throughput=1.0, start_block=0, end_block=2)
+    infos = [
+        RemoteModuleInfo("llama-7b-hf.0", {cheap: cheap_info, backup: backup_info}),
+        RemoteModuleInfo("llama-7b-hf.1", {cheap: cheap_info, backup: backup_info}),
+    ]
+    spans_before, containing_before = RemoteSequenceInfo._sort_spans(infos)
+    assert {span.peer_id for span in containing_before[0]} == {cheap, backup}
+
+    for info in infos:
+        info.servers.pop(cheap, None)
+    spans_after, containing_after = RemoteSequenceInfo._sort_spans(infos)
+    assert all(span.peer_id == backup for span in spans_after)
+    assert [span.peer_id for span in containing_after[0]] == [backup]
+    assert [span.peer_id for span in containing_after[1]] == [backup]
+
+
+def test_llama_math_matches_independent_hf_kernels():
+    from transformers import LlamaConfig
+    from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding, apply_rotary_pos_emb
+
+    from bloombee.flexgen_utils.pytorch_backend import apply_rotary_emb, precompute_freqs_cis, rms_norm
+    from bloombee.models.llama.flex_llama import compute_llama_inv_freq
+
+    torch.manual_seed(0)
+    hidden = torch.randn(2, 5, 16)
+    weight = torch.rand(16) + 0.5
+    eps = 1e-6
+    hf_norm = LlamaRMSNorm(16, eps=eps)
+    with torch.no_grad():
+        hf_norm.weight.copy_(weight)
+    torch.testing.assert_close(rms_norm(hidden, weight, variance_epsilon=eps), hf_norm(hidden), rtol=1e-5, atol=1e-5)
+
+    cfg = LlamaConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=2048,
+        rope_theta=10000.0,
+        rope_scaling={"rope_type": "linear", "factor": 8.0},
+        rms_norm_eps=eps,
+    )
+    head_dim = cfg.hidden_size // cfg.num_attention_heads
+    rotary = LlamaRotaryEmbedding(config=cfg)
+    positions = torch.arange(16).unsqueeze(0)
+    dummy = torch.zeros(1, 16, head_dim)
+    cos, sin = rotary(dummy, positions)
+    q = torch.randn(1, cfg.num_attention_heads, 16, head_dim)
+    k = torch.randn(1, cfg.num_attention_heads, 16, head_dim)
+    q_hf, k_hf = apply_rotary_pos_emb(q, k, cos, sin)
+
+    inv_freq = compute_llama_inv_freq(cfg, head_dim)
+    freqs = precompute_freqs_cis(head_dim, 16, inv_freq, position_ids=positions)
+    q_bb, k_bb = apply_rotary_emb(q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), freqs)
+    torch.testing.assert_close(q_bb.permute(0, 2, 1, 3), q_hf, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(k_bb.permute(0, 2, 1, 3), k_hf, rtol=1e-4, atol=1e-4)

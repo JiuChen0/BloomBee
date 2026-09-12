@@ -863,11 +863,6 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
 
 
 class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        #   Performance optimization: Pre-allocate attention_mask cache
-        self._attention_mask_cache = {}
-    
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -896,20 +891,18 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
             # print(f' WrappedLlamaBlock.forward: position_ids shape={position_ids.shape}, content={position_ids}')
 
         # print(f"WrappedLlamaBlock, hidden_states: {hidden_states}, seq_length: {seq_length}, past_key_value: {past_key_value}")
-        #   Optimized: Reuse cached attention_mask
+        # Decode past_len changes every step, so an unbounded per-length dict
+        # never hits and grows with sequence length. Build the mask each call.
         if attention_mask is None:
-            cache_key = (batch_size, seq_length, past_key_values_length, hidden_states.device, hidden_states.dtype)
-            if cache_key not in self._attention_mask_cache:
-                base_mask = torch.ones(
-                    (batch_size, seq_length), dtype=torch.bool, device=hidden_states.device
-                )
-                self._attention_mask_cache[cache_key] = _prepare_4d_causal_attention_mask(
-                    attention_mask=base_mask,
-                    input_shape=(batch_size, seq_length),
-                    inputs_embeds=hidden_states,
-                    past_key_values_length=past_key_values_length,
-                )
-            attention_mask = self._attention_mask_cache[cache_key]
+            base_mask = torch.ones(
+                (batch_size, seq_length), dtype=torch.bool, device=hidden_states.device
+            )
+            attention_mask = _prepare_4d_causal_attention_mask(
+                attention_mask=base_mask,
+                input_shape=(batch_size, seq_length),
+                inputs_embeds=hidden_states,
+                past_key_values_length=past_key_values_length,
+            )
         if attention_mask.dim() == 3:
             attention_mask = attention_mask.unsqueeze(1)
         elif attention_mask.dim() == 4:
