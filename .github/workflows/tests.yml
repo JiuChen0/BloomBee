@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  test-cache:
+  test-cpu:
     runs-on: ubuntu-latest
 
     steps:
@@ -20,7 +20,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('setup.cfg') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('setup.cfg', 'setup.py') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
@@ -53,6 +53,19 @@ jobs:
           python -m pip install --no-build-isolation --no-deps /tmp/hivemind
           python -m pip install --no-build-isolation -e ".[dev]"
 
-      - name: Run cache tests
+      - name: Run CPU unit tests
         run: |
-          pytest tests/test_cache.py -v
+          pytest -v \
+            tests/test_cache.py \
+            tests/test_review_p1_fixes.py \
+            tests/test_debug_config.py \
+            tests/test_lossless_transport.py \
+            tests/test_spec_decoding_verify.py \
+            tests/test_spec_session_position.py \
+            tests/test_gemma4_block_parity.py \
+            tests/test_gemma4_head_dim_dispatch.py \
+            tests/test_gemma4_kv_eq_v.py \
+            tests/test_backend_tree_position_ids.py \
+            tests/test_spe_dec_tree.py \
+            tests/test_fast_generate_eligibility.py \
+            tests/test_qwen3_block_parity.py

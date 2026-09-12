@@ -34,11 +34,12 @@ REQUIRED_FIELDS: Set[str] = {
 }
 
 # Fields that are request-level and only need to be sent with mb0
-# These are cached and reused for subsequent micro-batches
+# These are cached and reused for subsequent micro-batches.
+# tree_attention_mask is *not* request-level: padding masks are sliced
+# per micro-batch, so reusing mb0's slice would apply the wrong rows.
 REQUEST_LEVEL_FIELDS: Set[str] = {
     "prompts",
     "hypo_ids",
-    "tree_attention_mask",
     "kv_cache_position_ids",
     "draft_tokens",
     "prefill_length",

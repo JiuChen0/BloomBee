@@ -669,7 +669,7 @@ class TorchDevice:
 
         return TorchTensor.create_from_torch(value, self), k_new, v_new
     
-    def mha_llama(self, hidden_states, attention_mask, w_q, w_k, w_v, w_out, num_attention_heads, donate, compress_cache, comp_config, input_layernorm, rotary_emb_inv_freq, rotary_position_ids):
+    def mha_llama(self, hidden_states, attention_mask, w_q, w_k, w_v, w_out, num_attention_heads, donate, compress_cache, comp_config, input_layernorm, rotary_emb_inv_freq, rotary_position_ids, rms_norm_eps=1e-5):
         """Multi-head attention (prefill phase)."""
         
         if w_q.device.device_type == DeviceType.COMPRESSED:
@@ -692,7 +692,7 @@ class TorchDevice:
         freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data, position_ids=rotary_position_ids)
         scaling = head_dim ** -0.5
         
-        hidden = rms_norm(hidden_states.data, input_layernorm.data)
+        hidden = rms_norm(hidden_states.data, input_layernorm.data, variance_epsilon=rms_norm_eps)
         
         q = F.linear(hidden, w_q.data)
         k = F.linear(hidden, w_k.data)
@@ -747,7 +747,7 @@ class TorchDevice:
     
     def mha_gen_llama(self, inputs, attention_mask, w_q, w_k, w_v,
                 w_out, n_head, k_cache, v_cache, donate,
-                attn_sparsity, compress_cache, comp_config, input_layernorm, rotary_emb_inv_freq, rotary_position_ids):
+                attn_sparsity, compress_cache, comp_config, input_layernorm, rotary_emb_inv_freq, rotary_position_ids, rms_norm_eps=1e-5):
         """Multi-head attention (decoding phase)."""
         global _MHA_GEN_DECODE_PROBE_EMITTED, _MHA_GEN_DECODE_BRANCH_PROBE_EMITTED
         # decompress weights
@@ -770,7 +770,7 @@ class TorchDevice:
         freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data, position_ids=rotary_position_ids)
         scaling = head_dim ** -0.5
 
-        hidden = rms_norm(inputs.data, input_layernorm.data)
+        hidden = rms_norm(inputs.data, input_layernorm.data, variance_epsilon=rms_norm_eps)
         
         # logger.info(f"after norm, hidden states: {hidden}")
         
@@ -1082,7 +1082,11 @@ class TorchDevice:
         b, s, h = inputs.shape
         hidden_act = config.hidden_act
         act_fn = ACT2FN[hidden_act]
-        src_out = rms_norm(inputs.data, post_attention_layernorm.data)
+        src_out = rms_norm(
+            inputs.data,
+            post_attention_layernorm.data,
+            variance_epsilon=float(getattr(config, "rms_norm_eps", 1e-5)),
+        )
         # src_out = F.layer_norm(inputs.data, (h,), weight=post_attention_layernorm.data)
         out = F.linear(act_fn(F.linear(src_out, gate.data)) * F.linear(src_out, up.data), down.data)
 

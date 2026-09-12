@@ -105,6 +105,7 @@ def verify_path(
     draft_tokens: torch.Tensor,
     *,
     generator: Optional[torch.Generator] = None,
+    bonus_probs: Optional[torch.Tensor] = None,
 ) -> tuple[list[int], int]:
     """Walk one tree path applying rejection sampling until the first reject.
 
@@ -146,9 +147,10 @@ def verify_path(
             committed.append(result.sampled_token)
             return committed, accepted_len
 
-    # Full path accepted: emit an extra token sampled from the last target dist.
-    # Caller can choose to use target_probs[-1] directly, but for consistency
-    # with SpecInfer we emit one bonus token from target.
-    bonus = torch.multinomial(target_probs[-1], num_samples=1, generator=generator).item()
+    # Full path accepted: emit an extra token sampled from the leaf target dist
+    # (the distribution after consuming the last accepted draft token). Falling
+    # back to target_probs[-1] reuses the parent-of-leaf distribution.
+    bonus_dist = bonus_probs if bonus_probs is not None else target_probs[-1]
+    bonus = torch.multinomial(bonus_dist, num_samples=1, generator=generator).item()
     committed.append(int(bonus))
     return committed, accepted_len

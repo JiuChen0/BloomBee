@@ -32,6 +32,25 @@ from hivemind.utils.logging import get_logger
 
 logger = get_logger()
 
+
+def _apply_logits_processors(
+    logits_row: torch.Tensor,
+    input_ids_row: torch.Tensor,
+    seq_len: int,
+    extra_tokens: Sequence[int],
+    logits_processor: LogitsProcessorList,
+) -> torch.Tensor:
+    """Apply generation processors with the committed prefix plus newly accepted tokens."""
+    processed = logits_row.reshape(1, -1).clone()
+    hist = input_ids_row[: int(seq_len)]
+    if extra_tokens:
+        extra = torch.tensor(list(extra_tokens), dtype=hist.dtype, device=hist.device)
+        hist = torch.cat([hist, extra], dim=0)
+    hist = hist.unsqueeze(0)
+    for processor in logits_processor:
+        processed = processor(hist, processed)
+    return processed
+
 _GENERATION_CONFIG_KWARGS = (
     "do_sample",
     "temperature",
@@ -591,20 +610,25 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             
             past_key_values.set_kv_cache(verified_tokens_positions)
             compact_prefix_length = _compact_prefix_length_from_kv_positions(verified_tokens_positions)
-            if compact_prefix_length is not None:
+            if verified_tokens_positions is not None:
+                session.compact_history_to_accepted_kv(verified_tokens_positions)
+            elif compact_prefix_length is not None:
                 session.position = compact_prefix_length
+            if compact_prefix_length is not None:
                 past_key_values.update_seen(compact_prefix_length)
             
             is_first_iteration = False
             
-            # 3. Apply stopping conditions
+            # 3. Apply stopping conditions. Keep already-finished rows on PAD,
+            # but do not replace a newly emitted EOS before it is committed.
             if has_eos_stopping_criteria:
+                already_done = unfinished_sequences.eq(0)
                 if verified_tokens is not None:
                     verified_tokens = verified_tokens * unfinished_sequences.unsqueeze(-1) + pad_token_id * (
-                        1 - unfinished_sequences.unsqueeze(-1)
+                        already_done.unsqueeze(-1)
                     )
                 llm_generated_token = llm_generated_token * unfinished_sequences.unsqueeze(-1) + pad_token_id * (
-                    1 - unfinished_sequences.unsqueeze(-1)
+                    already_done.unsqueeze(-1)
                 )
 
             # 4. Update input sequence with proper padding handling
@@ -623,24 +647,28 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 append_llm_token=append_llm_token,
             )
 
+            finishing_this_round = torch.zeros(batch_size, dtype=torch.bool, device=device)
             if eos_token_tensor is not None:
                 for i in range(batch_size):
                     start = int(old_seq_lengths[i].item())
                     end = int(seq_lengths[i].item())
                     if end > start:
                         new_tokens = current_input_ids[i, start:end]
-                        if torch.isin(new_tokens, eos_token_tensor).any():
+                        eos_hits = torch.isin(new_tokens, eos_token_tensor)
+                        if bool(eos_hits.any().item()):
+                            first_eos = int(eos_hits.nonzero(as_tuple=False)[0].item())
+                            new_end = start + first_eos + 1
+                            if new_end < current_input_ids.shape[1]:
+                                current_input_ids[i, new_end:] = pad_token_id
+                            seq_lengths[i] = new_end
                             unfinished_sequences[i] = 0
-            
-            # t4 = time.perf_counter()
-            # logger.info(f"Step {step_idx}: Updated input_ids with padding in {t4 - t3:.4f} seconds")
-            
-            # logger.info(f"current_input_ids: {current_input_ids}, seq_lengths: {seq_lengths}")
+                            finishing_this_round[i] = True
 
             if streamer is not None:
-                # When streaming, emit only the valid tokens determined by valid_lengths
+                # Emit the finishing round too; previously EOS detection ran first
+                # and the streamer skipped rows that became unfinished this step.
                 for i in range(batch_size):
-                    if unfinished_sequences[i]:
+                    if int(unfinished_sequences[i].item()) == 1 or bool(finishing_this_round[i].item()):
                         if verified_tokens is not None and valid_lengths[i] > 0:
                             streamer.put(verified_tokens[i, :valid_lengths[i]].cpu())
                         if append_llm_token[i]:
@@ -1165,14 +1193,20 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             pos_index = torch.tensor(gather_pos, dtype=torch.long, device=hidden_device)
             parent_hidden = hidden_states[batch_index, pos_index, :]
             parent_logits = _project_lm_head_rows(self.lm_head, parent_hidden, drafter)
-            predicted_tokens = parent_logits.argmax(dim=-1).detach().cpu().tolist()
 
             for slot, b in enumerate(gather_batch):
                 parent = parents[b]
                 if parent is None:
                     active[b] = False
                     continue
-                predicted = int(predicted_tokens[slot])
+                processed = _apply_logits_processors(
+                    parent_logits[slot],
+                    input_ids[b],
+                    int(seq_lengths[b].item()),
+                    verified_tokens_by_batch[b],
+                    logits_processor,
+                )
+                predicted = int(processed[0].argmax(dim=-1).item())
                 matched_child = None
                 for child in parent.children:
                     if int(child.token_id) == predicted:
@@ -1221,9 +1255,13 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
 
         llm_rows: List[torch.Tensor] = []
         for b in range(batch_size):
-            processed = final_logits[b:b + 1].clone()
-            for processor in logits_processor:
-                processed = processor(input_ids[b:b + 1], processed)
+            processed = _apply_logits_processors(
+                final_logits[b],
+                input_ids[b],
+                int(seq_lengths[b].item()),
+                verified_tokens_by_batch[b],
+                logits_processor,
+            )
             llm_rows.append(torch.argmax(processed[0], dim=-1, keepdim=True).to(out_device))
         llm_generated_tokens = torch.stack(llm_rows, dim=0)
 
@@ -1538,9 +1576,12 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
 
             node_paths = batch_node_paths[batch_idx] if batch_idx < len(batch_node_paths) else []
 
-            # Rank candidate paths by cumulative draft log-prob, pick the top one.
-            best_path: List[TreeNode] = []
-            best_log = float("-inf")
+            # Sample a draft path with probability proportional to its path
+            # mass. Ranking by max log-prob would collapse a matching p=q pair
+            # onto the mode (the SpecInfer counter-example of two children
+            # 0.6/0.4 always picking the first).
+            usable_paths: List[List[TreeNode]] = []
+            path_weights: List[float] = []
             for node_path in node_paths:
                 if not node_path:
                     continue
@@ -1553,13 +1594,18 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     log_p += math.log(node.probability)
                 if not ok:
                     continue
-                # Skip paths whose positions exceed the logits window.
                 last_pos = node_path[-1].parent.position_in_sequence + 1
                 if last_pos >= seq_len:
                     continue
-                if log_p > best_log:
-                    best_log = log_p
-                    best_path = node_path
+                usable_paths.append(node_path)
+                path_weights.append(math.exp(log_p))
+
+            best_path: List[TreeNode] = []
+            if usable_paths:
+                weight_t = torch.tensor(path_weights, dtype=torch.float64)
+                weight_t = weight_t / weight_t.sum().clamp(min=1e-12)
+                chosen = int(torch.multinomial(weight_t, num_samples=1).item())
+                best_path = usable_paths[chosen]
 
             if not best_path:
                 # No usable path — resample one token from the fallback logits.
@@ -1595,9 +1641,13 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     )
                 path_positions.append(tree_root_position + node.position_in_sequence + 1)
                 row_logits = logits[batch_idx, pos].to(torch.float32)
-                processed = row_logits.unsqueeze(0).clone()
-                for processor in logits_processor:
-                    processed = processor(input_ids[batch_idx:batch_idx + 1], processed)
+                processed = _apply_logits_processors(
+                    row_logits,
+                    input_ids[batch_idx],
+                    int(actual_len),
+                    [int(n.token_id) for n in best_path[:i]],
+                    logits_processor,
+                )
                 target_probs[i] = torch.softmax(processed[0] / temp, dim=-1)
 
                 # Sparse draft distribution: siblings share the same parent, so
@@ -1610,7 +1660,24 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                         draft_probs[i, tok] = max(float(sib.probability), draft_probs[i, tok].item())
                 draft_tokens_t[i] = int(node.token_id)
 
-            committed, accepted_len = verify_path(target_probs, draft_probs, draft_tokens_t)
+            leaf = best_path[-1]
+            if is_first_iteration:
+                leaf_pos = actual_len + leaf.position_in_sequence
+            else:
+                leaf_pos = leaf.position_in_sequence + 1
+            leaf_pos = min(max(int(leaf_pos), 0), max(seq_len - 1, 0))
+            leaf_processed = _apply_logits_processors(
+                logits[batch_idx, leaf_pos].to(torch.float32),
+                input_ids[batch_idx],
+                int(actual_len),
+                [int(n.token_id) for n in best_path],
+                logits_processor,
+            )
+            bonus_probs = torch.softmax(leaf_processed[0] / temp, dim=-1)
+
+            committed, accepted_len = verify_path(
+                target_probs, draft_probs, draft_tokens_t, bonus_probs=bonus_probs
+            )
 
             if accepted_len > 0:
                 best_verified = committed[:accepted_len]
