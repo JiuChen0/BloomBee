@@ -1048,7 +1048,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         )
                         rotary_position_ids = rotary_position_ids[:, offset : offset + chunk_length]
                     else:
-                        rotary_position_ids = None
+                        # FlexGen LLaMA RoPE reads rotary_position_ids, not position_ids.
+                        # Dropping them falls back to a 4096-row table and crashes (or
+                        # applies the wrong angles) once prompt+decode exceeds that cap.
+                        rotary_position_ids = position_ids
                     
                     try:
                         step_result = self._run_block_forward(
