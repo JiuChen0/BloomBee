@@ -437,6 +437,32 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         left_key, left_value = left
         right_key, right_value = right
         if left_key.dim() == 4 and right_key.dim() == 4:
+            # select_cache() returns [B, num_attention_heads, S, D], but GQA/MQA/MLA
+            # wrappers emit packed [B, num_key_value_heads, s, D]. Concatenating
+            # those ranks on the sequence dim crashes chunked prefill once a
+            # session already has prefix KV (multi-turn generate with a long
+            # follow-up). Extra attention-head rows are unwritten padding, so
+            # keep the overlapping packed heads. Equal-head FlexGen broadcasts
+            # are unchanged.
+            heads = min(
+                int(left_key.shape[1]),
+                int(right_key.shape[1]),
+                int(left_value.shape[1]),
+                int(right_value.shape[1]),
+            )
+            if heads <= 0:
+                raise RuntimeError(
+                    "Cannot concat 4D KV caches with empty head dim: "
+                    f"left={tuple(left_key.shape)} right={tuple(right_key.shape)}"
+                )
+            if left_key.shape[1] != heads:
+                left_key = left_key[:, :heads]
+            if left_value.shape[1] != heads:
+                left_value = left_value[:, :heads]
+            if right_key.shape[1] != heads:
+                right_key = right_key[:, :heads]
+            if right_value.shape[1] != heads:
+                right_value = right_value[:, :heads]
             return (
                 torch.cat([left_key, right_key], dim=2),
                 torch.cat([left_value, right_value], dim=2),
@@ -446,7 +472,10 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 torch.cat([left_key, right_key], dim=2),
                 torch.cat([left_value, right_value], dim=1),
             )
-        return right
+        raise RuntimeError(
+            "Cannot concat KV caches with mixed ranks: "
+            f"left={tuple(left_key.shape)} right={tuple(right_key.shape)}"
+        )
 
     @staticmethod
     def _concat_bloom_kv_chunks(
