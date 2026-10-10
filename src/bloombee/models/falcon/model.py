@@ -161,13 +161,22 @@ class DistributedFalconForCausalLM(DefaultRevisionMixin, FromPretrainedMixin, Re
             else:
                 cache_length = past_length = past_key_values[0][0].shape[2]
                 max_cache_length = None
-
-            if input_ids.shape[1] > past_length:
-                remove_prefix_length = past_length
+            if hasattr(past_length, "reshape"):
+                past_length = int(past_length.reshape(-1)[0].item())
             else:
-                remove_prefix_length = input_ids.shape[1] - 1
+                past_length = int(past_length)
 
-            input_ids = input_ids[:, remove_prefix_length:]
+            # RemoteGenerationMixin._SkipTokensMixin already drops tokens that
+            # live in the remote cache, but leaves attention_mask at the full
+            # concatenated length. Upstream Falcon treats input_ids as that
+            # full sequence (`remove_prefix = past_length` vs last-1). After
+            # the skip, that crop keeps only the last new-prompt token on
+            # documented multi-turn `.generate(new_prompts, session=...)`.
+            # Use the same mask-aware window as Llama/Bloom/Qwen3/Gemma4.
+            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+            elif past_length < input_ids.shape[1]:
+                input_ids = input_ids[:, past_length:]
 
             if (
                 max_cache_length is not None
