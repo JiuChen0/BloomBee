@@ -143,6 +143,11 @@ class DistributedMixtralModel(DefaultRevisionMixin, FromPretrainedMixin, PTuneMi
 class DistributedMixtralForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, MixtralForCausalLM):
     _keys_to_ignore_on_load_missing = DistributedMixtralModel._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedMixtralModel._keys_to_ignore_on_load_unexpected
+    # Transformers 5 removed this flag from MixtralPreTrainedModel. Without it,
+    # RemoteGenerationMixin.generate AttributeErrors before injecting the remote
+    # KV stub, and HF then builds a DynamicCache that Mixtral.forward cannot
+    # advance_seen() on.
+    _supports_cache_class = True
 
     config_class = DistributedMixtralConfig
 
