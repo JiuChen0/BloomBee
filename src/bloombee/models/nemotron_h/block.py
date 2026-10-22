@@ -316,6 +316,13 @@ class WrappedNemotronHBlock(NemotronHBlock):
                 dtype=torch.long,
             )
 
+            # BloomBee scores are [batch, query, key]. HF attention adds that
+            # mask to weights shaped [batch, heads, query, key]. Leaving the
+            # mask 3D aligns batch with heads, so every full-attention step
+            # with batch size > 1 raises a size-mismatch in the score add.
+            if attention_mask is not None and attention_mask.ndim == 3:
+                attention_mask = attention_mask.unsqueeze(1)
+
             output = super().forward(
                 hidden_states,
                 past_key_values=cache,
