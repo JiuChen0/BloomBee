@@ -123,10 +123,11 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         from bloombee.server.lora import lora_enabled, run_lora_block
         if lora_enabled() and config.model_type in ("llama", "qwen3"):
             from functools import partial
+            from bloombee.server.lora_pool import LoRATaskPool
             from bloombee.utils.lora import install_lora_hooks
             if config.model_type != "llama":
                 install_lora_hooks(self.module.module_shards[0])
-            self.lora_pool = PrioritizedTaskPool(
+            self.lora_pool = LoRATaskPool(
                 partial(run_lora_block, self), max_batch_size=max_batch_size,
                 device=device, name=f"{self.name}_lora",
             )

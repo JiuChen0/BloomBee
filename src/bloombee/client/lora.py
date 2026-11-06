@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from pathlib import Path
 
 import torch
@@ -18,10 +19,13 @@ from bloombee.client.remote_sequential import RemoteSequential
 from bloombee.server.lora import LoRAService
 from bloombee.utils.hivemind_compat import MSGPackSerializer
 from bloombee.utils.lora import LORA_NAMESPACE, LORA_PROTOCOL_VERSION, LoRAConfig, LoRAProjection, projection_shapes
+from bloombee.utils.lora_profile import profile_fields, request_metadata, tensor_bytes, write_event
 from bloombee.utils.lossless_transport import deserialize_tensor_stream, serialize_torch_tensor
 
 
 async def _call_lora(manager, span, inputs, metadata):
+    profile = profile_fields(metadata)
+    started = time.perf_counter() if profile else 0.0
     stub = LoRAService.get_stub(manager.state.p2p, span.peer_id, namespace=LORA_NAMESPACE)
     uid = " ".join(manager.block_uids[span.start : span.end])
     parts = []
@@ -31,17 +35,40 @@ async def _call_lora(manager, span, inputs, metadata):
             runtime_pb2.ExpertRequest(uid=uid, tensors=[part], metadata=MSGPackSerializer.dumps(metadata))
             for part in split_for_streaming(wire, DEFAULT_MAX_MSG_SIZE)
         )
+    serialized = time.perf_counter() if profile else 0.0
+    response_proto_bytes = 0
     responses = await asyncio.wait_for(
         stub.rpc_lora_stream(iter_as_aiter(parts)), timeout=manager.config.connect_timeout
     )
 
     async def checked():
+        nonlocal response_proto_bytes
         async for response in aiter_with_timeout(responses, manager.config.request_timeout):
             if MSGPackSerializer.loads(response.metadata).get("version") != LORA_PROTOCOL_VERSION:
                 raise RuntimeError("Worker did not acknowledge LoRA protocol v1")
+            if profile:
+                response_proto_bytes += response.ByteSize()
             yield response.tensors
 
-    return await deserialize_tensor_stream(checked())
+    result = await deserialize_tensor_stream(checked())
+    if profile:
+        finished = time.perf_counter()
+        write_event(
+            "rpc",
+            **profile,
+            phase="backward" if metadata["backward"] else "forward",
+            peer=str(span.peer_id),
+            start=span.start,
+            end=span.end,
+            serialize_s=serialized - started,
+            rpc_and_deserialize_s=finished - serialized,
+            total_s=finished - started,
+            request_tensor_bytes=tensor_bytes(inputs),
+            response_tensor_bytes=tensor_bytes(result),
+            request_protobuf_bytes=sum(part.ByteSize() for part in parts),
+            response_protobuf_bytes=response_proto_bytes,
+        )
+    return result
 
 
 class _RemoteLoRAFunction(torch.autograd.Function):
@@ -117,6 +144,7 @@ class LoRARemoteSequential(RemoteSequential):
                 config=self.lora_config.to_dict(),
                 training=self.training,
                 seed=int(torch.randint(0, 2**31, (), device="cpu")),
+                **request_metadata(),
             )
             inputs = _RemoteLoRAFunction.apply(inputs, self.sequence_manager, span, metadata, *parameters)
         return inputs

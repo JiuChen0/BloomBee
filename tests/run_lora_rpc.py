@@ -140,6 +140,7 @@ def main():
     parser.add_argument("--steps", type=int, default=25)
     parser.add_argument("--check-resume", action="store_true")
     parser.add_argument("--check-merged", action="store_true")
+    parser.add_argument("--check-profile", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not torch.cuda.is_available():
@@ -405,6 +406,42 @@ def main():
                 assert torch.equal(p, base_snapshot[k])
         if args.check_resume:
             report["cli_resume"] = check_cli_resume(base_dir, peers, prefix, args.output)
+        if args.check_profile:
+            profile_path = args.output / "profile.json"
+            with (args.output / "profile-cli.log").open("w") as log:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "benchmarks/profile_lora_training.py",
+                        "--model",
+                        str(base_dir.resolve()),
+                        "--initial-peers",
+                        *peers,
+                        "--dht-prefix",
+                        prefix,
+                        "--output",
+                        str(profile_path),
+                        "--sequence-length",
+                        "8",
+                        "--accumulation",
+                        "2",
+                        "--warmup",
+                        "1",
+                        "--steps",
+                        "2",
+                    ],
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    check=True,
+                    timeout=180,
+                )
+            profile = json.loads(profile_path.read_text())
+            assert len(profile["samples"]) == 3 and profile["effective_batch_size"] == 2
+            assert profile["samples"][0]["cuda_peak_allocated_since_reset_bytes"] > 0
+            report["profiling_cli"] = {
+                key: profile[key]
+                for key in ("steady_median_step_s", "effective_tokens_per_second", "trainable_parameters")
+            }
         if args.check_merged:
             merged_dir = args.output / "merged-model"
             with (args.output / "merge.log").open("w") as log:

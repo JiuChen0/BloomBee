@@ -12,6 +12,7 @@ from hivemind.utils.streaming import split_for_streaming
 
 from bloombee.utils.hivemind_compat import MSGPackSerializer, P2PContext, ServicerBase
 from bloombee.utils.lora import LORA_NAMESPACE, LORA_PROTOCOL_VERSION, LoRAConfig, lora_context, projection_shapes
+from bloombee.utils.lora_profile import measure
 from bloombee.utils.lossless_transport import serialize_torch_tensor
 
 
@@ -59,14 +60,28 @@ def run_lora_block(backend, inputs, grad_outputs, metadata, *parameters):
         else nullcontext()
     )
     # Override any outer runtime no_grad. Base parameters remain frozen.
+    policy = getattr(getattr(backend, "cache_manager", None), "offloading_policy", None)
     with saved_weights, torch.set_grad_enabled(backward), lora_context(
         config, params, training=metadata["training"], seed=metadata["seed"]
     ):
-        output = backend.module(x)
+        with measure(
+            metadata,
+            "recompute" if backward else "forward",
+            x.device,
+            layer=getattr(backend, "name", "unknown"),
+            rank=config.r,
+            input_shape=list(x.shape),
+            input_dtype=str(x.dtype),
+            model_type=backend.config.model_type,
+            weight_gpu_percent=getattr(policy, "w_gpu_percent", None),
+            rpc_phase="backward" if metadata.get("backward") else "forward",
+        ):
+            output = backend.module(x)
         output = output[0] if isinstance(output, tuple) else output
         if not backward:
             return (output.detach().to(dtype=inputs.dtype),)
-        gradients = torch.autograd.grad(output, (x, *params), grad_outputs.to(output), allow_unused=False)
+        with measure(metadata, "backward", x.device, layer=getattr(backend, "name", "unknown"), rank=config.r):
+            gradients = torch.autograd.grad(output, (x, *params), grad_outputs.to(output), allow_unused=False)
     return (gradients[0].detach().to(dtype=inputs.dtype), *(g.detach() for g in gradients[1:]))
 
 

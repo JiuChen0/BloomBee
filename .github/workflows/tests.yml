@@ -56,6 +56,7 @@ jobs:
       - name: Run CPU unit tests
         run: |
           pytest -v \
+            tests/test_lora_profile.py \
             tests/test_standard_lora.py \
             tests/test_llama_task_metadata.py \
             tests/test_cache.py \
