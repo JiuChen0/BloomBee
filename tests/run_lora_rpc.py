@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -23,7 +24,8 @@ from bloombee import AutoDistributedModelForCausalLM, DistributedLoRA, LoRAConfi
 from bloombee.data_structures import ServerState
 from bloombee.utils.dht import get_remote_module_infos
 from bloombee.utils.hivemind_compat import DHT
-from bloombee.utils.lora import PROJECTIONS
+from bloombee.utils.lora import PROJECTIONS, projection_shapes
+from bloombee.utils.training_plan import StageChoice, TrainingPlan, TrainingWorkload
 
 
 def save_tiny_tokenizer(base_dir):
@@ -41,7 +43,7 @@ def save_tiny_tokenizer(base_dir):
     ).save_pretrained(base_dir)
 
 
-def check_cli_resume(base_dir, peers, prefix, output):
+def check_cli_resume(base_dir, peers, prefix, output, plan=None, worker_peers=None):
     from safetensors.torch import load_file
 
     data = output / "train.jsonl"
@@ -75,6 +77,16 @@ def check_cli_resume(base_dir, peers, prefix, output):
         "--lr",
         ".01",
     ]
+    if plan:
+        plan = replace(
+            plan,
+            workload=replace(plan.workload, batch_size=1, accumulation=2),
+            base_lora=replace(plan.base_lora, lora_dropout=0.3),
+        )
+        plan_path, binding_path = output / "resume-plan.json", output / "worker-peers.json"
+        plan.save(plan_path)
+        binding_path.write_text(json.dumps(worker_peers))
+        command += ["--plan", str(plan_path), "--worker_peers", str(binding_path)]
     for name, steps, resume in (
         ("continuous", 4, None),
         ("interrupted", 2, None),
@@ -141,6 +153,7 @@ def main():
     parser.add_argument("--check-resume", action="store_true")
     parser.add_argument("--check-merged", action="store_true")
     parser.add_argument("--check-profile", action="store_true")
+    parser.add_argument("--check-plan", action="store_true", help="Mixed ranks, fixed peers and offload enforcement")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not torch.cuda.is_available():
@@ -288,7 +301,43 @@ def main():
         ids = torch.tensor([[1, 5, 9, 13, 17, 21, 25, 29], [1, 6, 10, 14, 18, 22, 26, 30]], device="cuda")
         with torch.no_grad():
             base_logits = client(ids).logits.clone()
-        model = DistributedLoRA(client, BBLoRAConfig(r=4, lora_alpha=8, target_modules=PROJECTIONS)).cuda()
+        lora_config = BBLoRAConfig(r=4, lora_alpha=8, target_modules=PROJECTIONS)
+        plan, worker_peers = None, None
+        if args.check_plan:
+            infos = get_remote_module_infos(dht, [f"{prefix}.{i}" for i in range(2)], latest=True)
+            stages, worker_peers = [], {}
+            for index in range(args.stages):
+                start, end = (0, 2) if args.stages == 1 else (index, index + 1)
+                worker = f"worker-{index}"
+                peer = next(peer for peer, info in infos[start].servers.items() if info.state == ServerState.ONLINE)
+                worker_peers[worker] = str(peer)
+                # Synthetic reservations/costs exercise execution only, not performance prediction.
+                stages.append(
+                    StageChoice(
+                        worker,
+                        start,
+                        end,
+                        (2, 8)[start:end],
+                        args.weight_gpu_percent,
+                        1.0,
+                        {"shared_gpu": 1},
+                        end - start,
+                        "synthetic-correctness-only",
+                    )
+                )
+            plan = TrainingPlan(
+                TrainingWorkload(
+                    str(base_dir.resolve()), 2, 2, 8, sum(sum(s) for s in projection_shapes(config).values())
+                ),
+                lora_config,
+                tuple(stages),
+                {"shared_gpu": 2},
+                2,
+                100000,
+            )
+            plan.save(args.output / "plan.json")
+            lora_config = plan.lora_config
+        model = DistributedLoRA(client, lora_config).cuda()
         model.save_pretrained(args.output / "initial-adapter")
         reference = PeftModel.from_pretrained(
             AutoModelForCausalLM.from_pretrained(base_dir, dtype=torch.float16, attn_implementation="eager").cuda(),
@@ -312,7 +361,7 @@ def main():
         actual.loss.backward()
         expected.loss.backward()
         ref_params = dict(reference.named_parameters())
-        grad_errors = {}
+        grad_errors, grad_relative_norm_errors, grad_failures, grad_atols = {}, {}, [], {}
         for key, parameter in model._adapter_state().items():
             ref_key = key.replace(".lora_A.weight", ".lora_A.default.weight").replace(
                 ".lora_B.weight", ".lora_B.default.weight"
@@ -320,9 +369,23 @@ def main():
             target = ref_params[ref_key]
             assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
             grad_errors[key] = float((parameter.grad - target.grad).abs().max())
-            torch.testing.assert_close(parameter.grad, target.grad, rtol=0.05, atol=5e-6)
+            grad_relative_norm_errors[key] = float(
+                (parameter.grad - target.grad).norm() / target.grad.norm().clamp_min(1e-12)
+            )
+            # Separate-block FP16 backward can round accumulation differently
+            # from a full HF graph. Near cancellation, element-relative error
+            # is unstable: bound it by one FP16 epsilon at this tensor's scale,
+            # and additionally require <0.1% whole-tensor relative L2 error.
+            grad_atols[key] = max(5e-6, torch.finfo(torch.float16).eps * float(target.grad.abs().max()))
+            try:
+                torch.testing.assert_close(parameter.grad, target.grad, rtol=0.05, atol=grad_atols[key])
+                assert grad_relative_norm_errors[key] < 0.001, "Gradient relative L2 error exceeds 0.1%"
+            except AssertionError as error:
+                grad_failures.append(f"{key}: {error}")
         report["lora_gradient_max_error"] = max(grad_errors.values())
         report["gradient_errors"] = grad_errors
+        report["gradient_relative_norm_errors"] = grad_relative_norm_errors
+        assert not grad_failures, "\n".join(grad_failures)
         params = [p for p in model.parameters() if p.requires_grad]
         report["trainable_parameters"] = sum(p.numel() for p in params)
         report["route"] = [
@@ -339,7 +402,7 @@ def main():
             ref_key = key.replace(".lora_A.weight", ".lora_A.default.weight").replace(
                 ".lora_B.weight", ".lora_B.default.weight"
             )
-            torch.testing.assert_close(p, ref_params[ref_key], rtol=0.01, atol=2e-6)
+            torch.testing.assert_close(p, ref_params[ref_key], rtol=0.01, atol=max(2e-6, 0.3 * grad_atols[key]))
         opt.zero_grad(set_to_none=True)
         ref_opt.zero_grad(set_to_none=True)
 
@@ -357,6 +420,20 @@ def main():
             torch.testing.assert_close(p.grad, g, rtol=0.08, atol=1e-5)
         opt.zero_grad(set_to_none=True)
         optimizer = torch.optim.AdamW(params, lr=0.015, weight_decay=0.0)
+        if plan:
+            model.remote_layers.set_training_plan(plan, worker_peers)
+            # A planned job must never call the adaptive/random route selector.
+            def unexpected_route(*args, **kwargs):
+                raise AssertionError("Planned training unexpectedly selected a new route")
+
+            model.remote_layers.sequence_manager.make_sequence = unexpected_route
+            with torch.no_grad():
+                try:
+                    model(ids[:1])
+                except ValueError as error:
+                    assert "profiled training workload" in str(error)
+                else:
+                    raise AssertionError("Planned shape mismatch was not rejected")
         losses = []
         for step in range(args.steps):
             output = model(ids, labels=ids)
@@ -405,9 +482,41 @@ def main():
             if not p.requires_grad:
                 assert torch.equal(p, base_snapshot[k])
         if args.check_resume:
-            report["cli_resume"] = check_cli_resume(base_dir, peers, prefix, args.output)
+            report["cli_resume"] = check_cli_resume(base_dir, peers, prefix, args.output, plan, worker_peers)
+        if plan:
+            report["joint_plan"] = dict(
+                ranks=[2, 8],
+                fixed_route=True,
+                shape_mismatch_rejected=True,
+                performance_claim=False,
+                worker_peers=worker_peers,
+            )
+            bad = replace(
+                plan,
+                stages=tuple(replace(s, weight_gpu_percent=(args.weight_gpu_percent + 50) % 101) for s in plan.stages),
+            )
+            model.remote_layers.set_training_plan(bad, worker_peers)
+            try:
+                model(ids)
+            except Exception as error:
+                assert "offload policy" in str(error), str(error)
+            else:
+                raise AssertionError("Worker accepted a mismatched offload plan")
+            model.remote_layers.set_training_plan(plan, worker_peers)
+            report["joint_plan"]["offload_mismatch_rejected"] = True
         if args.check_profile:
             profile_path = args.output / "profile.json"
+            profile_args = []
+            if plan:
+                profile_plan = replace(plan, workload=replace(plan.workload, batch_size=1, accumulation=2))
+                profile_plan.save(args.output / "profile-plan.json")
+                (args.output / "profile-peers.json").write_text(json.dumps(worker_peers))
+                profile_args = [
+                    "--plan",
+                    str(args.output / "profile-plan.json"),
+                    "--worker-peers",
+                    str(args.output / "profile-peers.json"),
+                ]
             with (args.output / "profile-cli.log").open("w") as log:
                 subprocess.run(
                     [
@@ -429,6 +538,7 @@ def main():
                         "1",
                         "--steps",
                         "2",
+                        *profile_args,
                     ],
                     stdout=log,
                     stderr=subprocess.STDOUT,
@@ -438,6 +548,7 @@ def main():
             profile = json.loads(profile_path.read_text())
             assert len(profile["samples"]) == 3 and profile["effective_batch_size"] == 2
             assert profile["samples"][0]["cuda_peak_allocated_since_reset_bytes"] > 0
+            assert profile["stage_profiles"] and all(s["samples"] == 4 for s in profile["stage_profiles"])
             report["profiling_cli"] = {
                 key: profile[key]
                 for key in ("steady_median_step_s", "effective_tokens_per_second", "trainable_parameters")

@@ -18,12 +18,47 @@ import socket
 import statistics
 import subprocess
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import torch
 
 from bloombee import AutoDistributedModelForCausalLM, DistributedLoRA, LoRAConfig
 from bloombee.utils.lora_profile import memory_snapshot, profile_step, synchronize
+from bloombee.utils.training_plan import TrainingPlan
+
+
+def summarize_stage_profiles(events, config):
+    """Matched steady-state RPC pairs; these costs can populate StageChoice.rpc_seconds.
+
+    Keep each actual peer/span separate. A deployment operator must still provide
+    shared-resource reservations and calibrated rank utility before planning.
+    """
+    pairs, samples = defaultdict(dict), defaultdict(list)
+    for event in events:
+        if event["kind"] == "rpc" and event.get("warmup") is False:
+            if event["phase"] in pairs[event["id"]]:
+                raise ValueError("Duplicate profiling RPC phase")
+            pairs[event["id"]][event["phase"]] = event
+    for pair in pairs.values():
+        if set(pair) != {"forward", "backward"}:
+            raise ValueError("Incomplete training profile RPC pair")
+        f, b = pair["forward"], pair["backward"]
+        key = tuple(f[k] for k in ("peer", "start", "end"))
+        if key != tuple(b[k] for k in ("peer", "start", "end")):
+            raise ValueError("Forward/backward profile route differs")
+        samples[key].append(f["total_s"] + b["total_s"])
+    return [
+        dict(
+            peer=peer,
+            start=start,
+            end=end,
+            samples=len(values),
+            median_forward_backward_rpc_s=statistics.median(values),
+            rank_by_layer=[{t: config.rank_for(i, t) for t in config.target_modules} for i in range(start, end)],
+        )
+        for (peer, start, end), values in sorted(samples.items())
+    ]
 
 
 def run_profile(model, batches, optimizer, *, warmup, steps):
@@ -88,6 +123,9 @@ def main():
     parser.add_argument("--r", type=int, default=8)
     parser.add_argument("--alpha", type=float, default=16)
     parser.add_argument("--target-modules", nargs="+", default=["q_proj", "v_proj"])
+    parser.add_argument("--lora-config", type=Path, help="LoRAConfig JSON with optional rank/alpha patterns")
+    parser.add_argument("--plan", type=Path, help="Static training plan to measure on deployed workers")
+    parser.add_argument("--worker-peers", type=Path, help="JSON mapping planned workers to peer IDs")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--sequence-length", type=int, default=128)
     parser.add_argument("--accumulation", type=int, default=1)
@@ -95,6 +133,16 @@ def main():
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    if bool(args.plan) != bool(args.worker_peers) or (args.plan and args.lora_config):
+        parser.error("--plan requires --worker-peers and supplies its own adapter config")
+    plan = TrainingPlan.load(args.plan) if args.plan else None
+    if plan and (args.model, args.batch_size, args.sequence_length, args.accumulation) != (
+        plan.workload.model,
+        plan.workload.batch_size,
+        plan.workload.sequence_length,
+        plan.workload.accumulation,
+    ):
+        parser.error("Profile settings must match the plan workload")
     if min(args.batch_size, args.accumulation, args.steps) < 1 or args.sequence_length < 2 or args.warmup < 1:
         parser.error("batch-size, accumulation, steps, warmup must be positive; sequence-length >=2")
     if args.output.exists() or args.output.with_suffix(".traces").exists():
@@ -112,8 +160,17 @@ def main():
         connect_timeout=30,
         max_retries=1,
     ).to(args.device)
+    config = (
+        plan.lora_config
+        if plan
+        else LoRAConfig(**json.loads(args.lora_config.read_text()))
+        if args.lora_config
+        else LoRAConfig(args.r, args.alpha, target_modules=tuple(args.target_modules))
+    )
     model = (
-        DistributedLoRA(base, LoRAConfig(args.r, args.alpha, target_modules=tuple(args.target_modules)))
+        DistributedLoRA(
+            base, config, plan=plan, worker_peers=json.loads(args.worker_peers.read_text()) if plan else None
+        )
         .to(args.device)
         .train()
     )
@@ -127,6 +184,10 @@ def main():
         revision = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
         dirty = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
         report.update(
+            execution_mode="stateless_lora_v2"
+            if config.rank_pattern or config.alpha_pattern or plan
+            else "stateless_lora_v1",
+            training_plan=plan.to_dict() if plan else None,
             model=args.model,
             model_config=base.config.to_dict(),
             adapter_config=model.lora_config.to_dict(),
@@ -147,6 +208,12 @@ def main():
                 "RPC time includes serialization, server work, queues and network; not a bandwidth measurement.",
             ],
         )
+        events = [
+            json.loads(line)
+            for path in args.output.with_suffix(".traces").glob("lora-*.jsonl")
+            for line in path.read_text().splitlines()
+        ]
+        report["stage_profiles"] = summarize_stage_profiles(events, config)
         args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
         print(
             json.dumps(

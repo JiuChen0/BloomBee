@@ -14,6 +14,7 @@ import torch
 from transformers import AutoTokenizer
 
 from bloombee import AutoDistributedModelForCausalLM, DistributedLoRA, LoRAConfig
+from bloombee.utils.training_plan import TrainingPlan
 
 
 def main():
@@ -37,8 +38,23 @@ def main():
     parser.add_argument("--lora_alpha", type=float, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.0)
     parser.add_argument("--target_modules", nargs="+", default=["q_proj", "v_proj"])
+    parser.add_argument("--lora_config", type=Path, help="LoRAConfig JSON, including exact rank/alpha patterns")
+    parser.add_argument("--plan", type=Path, help="Static joint training plan JSON")
+    parser.add_argument("--worker_peers", type=Path, help="JSON mapping planned worker names to live peer IDs")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    if bool(args.plan) != bool(args.worker_peers) or (args.plan and args.lora_config):
+        parser.error("--plan requires --worker_peers and supplies its own LoRA configuration")
+    if args.lora_config and (args.resume_adapter or args.resume_checkpoint):
+        parser.error("Resume loads LoRA configuration from the saved adapter")
+    plan = TrainingPlan.load(args.plan) if args.plan else None
+    if plan and (args.model, args.batch_size, args.seq_len, args.gradient_accumulation_steps) != (
+        plan.workload.model,
+        plan.workload.batch_size,
+        plan.workload.sequence_length,
+        plan.workload.accumulation,
+    ):
+        parser.error("Training settings must match the plan workload")
     if min(args.steps, args.batch_size, args.gradient_accumulation_steps) < 1 or args.seq_len < 2:
         raise ValueError("steps, batch and accumulation must be positive; seq_len must be >=2")
     if args.checkpoint_every < 0:
@@ -66,6 +82,8 @@ def main():
         lr=args.lr,
         tokens_sha256=hashlib.sha256(chunks.numpy().tobytes()).hexdigest(),
     )
+    if plan:
+        training_config["plan"] = plan.to_dict()
     losses, start_step = [], 0
     if args.resume_checkpoint:
         saved = torch.load(args.resume_checkpoint / "training_state.pt", map_location="cpu", weights_only=True)
@@ -90,9 +108,16 @@ def main():
     if args.resume_adapter or args.resume_checkpoint:
         model = DistributedLoRA.from_pretrained(base, args.resume_adapter or args.resume_checkpoint)
     else:
-        model = DistributedLoRA(
-            base, LoRAConfig(args.r, args.lora_alpha, args.lora_dropout, tuple(args.target_modules))
+        config = (
+            plan.lora_config
+            if plan
+            else LoRAConfig(**json.loads(args.lora_config.read_text()))
+            if args.lora_config
+            else LoRAConfig(args.r, args.lora_alpha, args.lora_dropout, tuple(args.target_modules))
         )
+        model = DistributedLoRA(base, config)
+    if plan:
+        model.remote_layers.set_training_plan(plan, json.loads(args.worker_peers.read_text()))
     model.to(args.device).train()
     parameters = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(parameters, lr=args.lr)

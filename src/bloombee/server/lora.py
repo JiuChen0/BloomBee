@@ -11,7 +11,7 @@ from hivemind.proto import runtime_pb2
 from hivemind.utils.streaming import split_for_streaming
 
 from bloombee.utils.hivemind_compat import MSGPackSerializer, P2PContext, ServicerBase
-from bloombee.utils.lora import LORA_NAMESPACE, LORA_PROTOCOL_VERSION, LoRAConfig, lora_context, projection_shapes
+from bloombee.utils.lora import LORA_NAMESPACES, LoRAConfig, lora_context, projection_shapes
 from bloombee.utils.lora_profile import measure
 from bloombee.utils.lossless_transport import serialize_torch_tensor
 
@@ -23,6 +23,8 @@ def lora_enabled():
 def run_lora_block(backend, inputs, grad_outputs, metadata, *parameters):
     """Recompute a frozen block and return dX, dA, dB without accumulating worker .grad."""
     config = LoRAConfig(**metadata["config"])
+    layer_index = metadata.get("layer_index", 0)
+    config.validate_layers(backend.config.num_hidden_layers)
     shapes = projection_shapes(backend.config)
     if len(parameters) != 2 * len(config.target_modules):
         raise ValueError("LoRA parameter count mismatch")
@@ -31,7 +33,8 @@ def run_lora_block(backend, inputs, grad_outputs, metadata, *parameters):
     for j, target in enumerate(config.target_modules):
         out_features, in_features = shapes[target]
         a, b = parameters[2 * j : 2 * j + 2]
-        if a.shape != (config.r, in_features) or b.shape != (out_features, config.r):
+        rank = config.rank_for(layer_index, target)
+        if a.shape != (rank, in_features) or b.shape != (out_features, rank):
             raise ValueError(f"Invalid LoRA A/B shapes for {target}")
         if a.dtype != torch.float32 or b.dtype != torch.float32:
             raise ValueError("LoRA optimizer/master parameters must be float32")
@@ -42,12 +45,18 @@ def run_lora_block(backend, inputs, grad_outputs, metadata, *parameters):
     backward = grad_outputs.numel() != 0
     if backward and grad_outputs.shape != inputs.shape:
         raise ValueError("LoRA output gradient shape mismatch")
+    policy = getattr(getattr(backend, "cache_manager", None), "offloading_policy", None)
+    expected_percent = metadata.get("weight_gpu_percent")
+    if expected_percent is not None and getattr(policy, "w_gpu_percent", None) != expected_percent:
+        raise ValueError("Worker weight offload policy does not match the training plan")
     backend._ensure_model_on_device()
     block = backend.module.module_shards[0]
     if backend.config.model_type == "llama":
         compute_dtype = block.weight_home[0].val[0].dtype
     else:
         compute_dtype = next(block.parameters()).dtype
+    if "compute_dtype" in metadata and metadata["compute_dtype"] != str(compute_dtype):
+        raise ValueError("Worker compute dtype does not match the training plan")
     # Wire/client precision is independent of the actual frozen projection dtype.
     x = inputs.detach().to(dtype=compute_dtype).requires_grad_(backward)
     params = tuple(p.detach().requires_grad_(backward) for p in parameters)
@@ -60,9 +69,8 @@ def run_lora_block(backend, inputs, grad_outputs, metadata, *parameters):
         else nullcontext()
     )
     # Override any outer runtime no_grad. Base parameters remain frozen.
-    policy = getattr(getattr(backend, "cache_manager", None), "offloading_policy", None)
     with saved_weights, torch.set_grad_enabled(backward), lora_context(
-        config, params, training=metadata["training"], seed=metadata["seed"]
+        config, params, training=metadata["training"], seed=metadata["seed"], layer_index=layer_index
     ):
         with measure(
             metadata,
@@ -70,6 +78,7 @@ def run_lora_block(backend, inputs, grad_outputs, metadata, *parameters):
             x.device,
             layer=getattr(backend, "name", "unknown"),
             rank=config.r,
+            ranks={target: config.rank_for(layer_index, target) for target in config.target_modules},
             input_shape=list(x.shape),
             input_dtype=str(x.dtype),
             model_type=backend.config.model_type,
@@ -96,15 +105,28 @@ class LoRAService(ServicerBase):
     ) -> AsyncIterator[runtime_pb2.ExpertResponse]:
         async with timeout(self.handler.request_timeout):
             uid, tensors, metadata = await self.handler._gather_inputs(requests, context)
-            if metadata.get("version") != LORA_PROTOCOL_VERSION:
+            version = metadata.get("version")
+            if version not in LORA_NAMESPACES:
                 raise ValueError("Unsupported LoRA protocol")
             config = LoRAConfig(**metadata["config"])
+            if version == 1 and (
+                config.rank_pattern
+                or config.alpha_pattern
+                or "weight_gpu_percent" in metadata
+                or "planned_span" in metadata
+            ):
+                raise ValueError("Layer patterns and planned offloading require LoRA protocol v2")
             names = uid.split(" ")
             if not names or len(set(names)) != len(names):
                 raise ValueError("Invalid LoRA layer chain")
             indices = [int(name.rsplit(".", 1)[1]) for name in names]
             if indices != list(range(indices[0], indices[0] + len(indices))):
                 raise ValueError("LoRA layers must be a contiguous ordered span")
+            if "planned_span" in metadata and (
+                metadata["planned_span"] != [indices[0], indices[-1] + 1]
+                or set(names) != set(self.handler.module_backends)
+            ):
+                raise ValueError("Worker layer placement does not match the training plan")
             backends = [self.handler.module_backends[name] for name in names]
             if any(not hasattr(b, "lora_pool") for b in backends):
                 raise RuntimeError("Enable BLOOMBEE_ENABLE_LORA=1 on every worker")
@@ -124,7 +146,7 @@ class LoRAService(ServicerBase):
             inputs = [x]
             # During backward, recompute each layer input using the exact saved parameters and seeds.
             for j, backend in enumerate(backends[: len(backends) - int(backward)]):
-                meta = {**metadata, "seed": seed + j}
+                meta = {**metadata, "seed": seed + j, "layer_index": indices[j]}
                 result = await backend.lora_pool.submit_task(
                     inputs[-1], empty, meta, *parameters[j * width : (j + 1) * width], priority=2.0
                 )
@@ -136,7 +158,7 @@ class LoRAService(ServicerBase):
                     result = await backends[j].lora_pool.submit_task(
                         inputs[j],
                         grad,
-                        {**metadata, "seed": seed + j},
+                        {**metadata, "seed": seed + j, "layer_index": indices[j]},
                         *parameters[j * width : (j + 1) * width],
                         priority=2.0,
                     )
@@ -148,5 +170,5 @@ class LoRAService(ServicerBase):
                 wire = serialize_torch_tensor(tensor.detach().cpu().contiguous(), runtime_pb2.CompressionType.NONE)
                 for part in split_for_streaming(wire, DEFAULT_MAX_MSG_SIZE):
                     yield runtime_pb2.ExpertResponse(
-                        tensors=[part], metadata=MSGPackSerializer.dumps({"version": LORA_PROTOCOL_VERSION})
+                        tensors=[part], metadata=MSGPackSerializer.dumps({"version": version})
                     )

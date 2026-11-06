@@ -96,3 +96,37 @@ def test_profile_run_measures_first_optimizer_allocation(monkeypatch, tmp_path):
     assert report["effective_batch_size"] == 2
     assert report["steady_median_step_s"] > 0 and report["effective_tokens_per_second"] > 0
     assert optimizer.state
+
+
+def test_stage_profile_cost_uses_matched_steady_pairs_and_physical_ranks():
+    import importlib.util
+    from pathlib import Path
+
+    from bloombee.utils.lora import LoRAConfig
+
+    spec = importlib.util.spec_from_file_location(
+        "profile_lora_training", Path(__file__).parents[1] / "benchmarks/profile_lora_training.py"
+    )
+    benchmark = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(benchmark)
+    events = [
+        dict(
+            kind="rpc",
+            id=str(i),
+            phase=phase,
+            warmup=i == 0,
+            peer="worker-a",
+            start=0,
+            end=2,
+            total_s=100 if i == 0 else i,
+        )
+        for i in range(3)
+        for phase in ("forward", "backward")
+    ]
+    config = LoRAConfig(rank_pattern={"layers.1.self_attn.q_proj": 2})
+    result = benchmark.summarize_stage_profiles(events, config)
+    assert len(result) == 1 and result[0]["samples"] == 2
+    assert result[0]["median_forward_backward_rpc_s"] == 3
+    assert result[0]["rank_by_layer"] == [{"q_proj": 8, "v_proj": 8}, {"q_proj": 2, "v_proj": 8}]
+    with pytest.raises(ValueError, match="Incomplete"):
+        benchmark.summarize_stage_profiles(events[:-1], config)

@@ -16,9 +16,10 @@ from torch import nn
 from torch.autograd.function import once_differentiable
 
 from bloombee.client.remote_sequential import RemoteSequential
+from bloombee.data_structures import RemoteSpanInfo, ServerState
 from bloombee.server.lora import LoRAService
-from bloombee.utils.hivemind_compat import MSGPackSerializer
-from bloombee.utils.lora import LORA_NAMESPACE, LORA_PROTOCOL_VERSION, LoRAConfig, LoRAProjection, projection_shapes
+from bloombee.utils.hivemind_compat import MSGPackSerializer, PeerID
+from bloombee.utils.lora import LORA_NAMESPACES, LoRAConfig, LoRAProjection, projection_shapes
 from bloombee.utils.lora_profile import profile_fields, request_metadata, tensor_bytes, write_event
 from bloombee.utils.lossless_transport import deserialize_tensor_stream, serialize_torch_tensor
 
@@ -26,7 +27,7 @@ from bloombee.utils.lossless_transport import deserialize_tensor_stream, seriali
 async def _call_lora(manager, span, inputs, metadata):
     profile = profile_fields(metadata)
     started = time.perf_counter() if profile else 0.0
-    stub = LoRAService.get_stub(manager.state.p2p, span.peer_id, namespace=LORA_NAMESPACE)
+    stub = LoRAService.get_stub(manager.state.p2p, span.peer_id, namespace=LORA_NAMESPACES[metadata["version"]])
     uid = " ".join(manager.block_uids[span.start : span.end])
     parts = []
     for tensor in inputs:
@@ -44,8 +45,8 @@ async def _call_lora(manager, span, inputs, metadata):
     async def checked():
         nonlocal response_proto_bytes
         async for response in aiter_with_timeout(responses, manager.config.request_timeout):
-            if MSGPackSerializer.loads(response.metadata).get("version") != LORA_PROTOCOL_VERSION:
-                raise RuntimeError("Worker did not acknowledge LoRA protocol v1")
+            if MSGPackSerializer.loads(response.metadata).get("version") != metadata["version"]:
+                raise RuntimeError("Worker did not acknowledge the requested LoRA protocol")
             if profile:
                 response_proto_bytes += response.ByteSize()
             yield response.tensors
@@ -105,18 +106,58 @@ class LoRARemoteSequential(RemoteSequential):
     def __init__(self, original, lora_config):
         super().__init__(original.config, sequence_manager=original.sequence_manager)
         self.lora_config = lora_config
+        self.training_plan = None
+        self.worker_peers = None
+        lora_config.validate_layers(len(original))
         shapes = projection_shapes(original.config)
         self.adapters = nn.ModuleList(
             [
                 nn.ModuleDict(
                     {
-                        name: LoRAProjection(shapes[name][1], shapes[name][0], lora_config.r)
+                        name: LoRAProjection(shapes[name][1], shapes[name][0], lora_config.rank_for(index, name))
                         for name in lora_config.target_modules
                     }
                 )
-                for _ in range(len(original))
+                for index in range(len(original))
             ]
         )
+
+    def set_training_plan(self, plan, worker_peers):
+        """Bind logical workers to explicit peer IDs; a failed worker never triggers rerouting."""
+        plan.workload.validate_model(self.config, self.lora_config)
+        if plan.lora_config != self.lora_config:
+            raise ValueError("Plan ranks/scaling differ from the allocated adapter")
+        if set(worker_peers) != {stage.worker for stage in plan.stages}:
+            raise ValueError("Bind every planned worker exactly once")
+        peers = {worker: PeerID.from_base58(str(peer)) for worker, peer in worker_peers.items()}
+        if len(set(peers.values())) != len(peers):
+            raise ValueError("Planned workers must bind to distinct peers")
+        self.training_plan, self.worker_peers = plan, peers
+
+    def _planned_route(self, inputs):
+        plan, manager = self.training_plan, self.sequence_manager
+        workload = plan.workload
+        if (
+            tuple(inputs.shape[:2]) != (workload.batch_size, workload.sequence_length)
+            or str(inputs.dtype) != workload.input_dtype
+        ):
+            raise ValueError("Input shape/dtype differs from the profiled training workload")
+        with manager._thread_start_lock:
+            if not manager.is_alive():
+                manager._thread.start()
+        if not manager.ready.is_set():
+            manager.update(wait=True)
+        route = []
+        with manager.lock_changes:
+            for stage in plan.stages:
+                peer = self.worker_peers[stage.worker]
+                infos = [
+                    manager.state.sequence_info.block_infos[i].servers.get(peer) for i in range(stage.start, stage.end)
+                ]
+                if any(info is None or info.state != ServerState.ONLINE for info in infos):
+                    raise RuntimeError(f"Planned worker {stage.worker} is unavailable; explicit replanning is required")
+                route.append(RemoteSpanInfo(peer, stage.start, stage.end, infos[0]))
+        return route
 
     def forward(self, inputs, prompts=None, **kwargs):
         if self.active_session is not None:
@@ -131,8 +172,15 @@ class LoRARemoteSequential(RemoteSequential):
                 raise ValueError(f"LoRA does not support {name}")
         if inputs.ndim != 3 or inputs.shape[-1] != self.config.hidden_size:
             raise ValueError("LoRA expects [batch, sequence, hidden_size]")
-        route = self.sequence_manager.make_sequence(mode="max_throughput")
-        for span in route:
+        route = (
+            self._planned_route(inputs)
+            if self.training_plan
+            else self.sequence_manager.make_sequence(mode="max_throughput")
+        )
+        version = 2 if self.training_plan or self.lora_config.rank_pattern or self.lora_config.alpha_pattern else 1
+        # v2 consumes one root seed, independent of placement/span boundaries.
+        root_seed = int(torch.randint(0, 2**31, (), device="cpu")) if version == 2 else None
+        for stage_index, span in enumerate(route):
             parameters = tuple(
                 p
                 for layer in self.adapters[span.start : span.end]
@@ -140,12 +188,16 @@ class LoRARemoteSequential(RemoteSequential):
                 for p in (layer[name].lora_A, layer[name].lora_B)
             )
             metadata = dict(
-                version=LORA_PROTOCOL_VERSION,
+                version=version,
                 config=self.lora_config.to_dict(),
                 training=self.training,
-                seed=int(torch.randint(0, 2**31, (), device="cpu")),
+                seed=root_seed + span.start if version == 2 else int(torch.randint(0, 2**31, (), device="cpu")),
                 **request_metadata(),
             )
+            if self.training_plan:
+                metadata["weight_gpu_percent"] = self.training_plan.stages[stage_index].weight_gpu_percent
+                metadata["planned_span"] = [span.start, span.end]
+                metadata["compute_dtype"] = self.training_plan.workload.input_dtype
             inputs = _RemoteLoRAFunction.apply(inputs, self.sequence_manager, span, metadata, *parameters)
         return inputs
 
@@ -164,9 +216,9 @@ class DistributedLoRA(nn.Module):
     weights are sent again at backward; there is no worker-side optimizer step.
     """
 
-    def __init__(self, model, config=None):
+    def __init__(self, model, config=None, *, plan=None, worker_peers=None):
         super().__init__()
-        self.lora_config = config or LoRAConfig()
+        self.lora_config = config or (plan.lora_config if plan is not None else LoRAConfig())
         if not isinstance(self.lora_config, LoRAConfig):
             raise TypeError("Use bloombee.LoRAConfig for DistributedLoRA")
         projection_shapes(model.config)
@@ -180,9 +232,11 @@ class DistributedLoRA(nn.Module):
         name, original = modules[0]
         if len(original) != model.config.num_hidden_layers:
             raise ValueError("Attach LoRA to the complete model layer sequence")
-        model.requires_grad_(False)
         parent_path, _, attribute = name.rpartition(".")
         sequence = LoRARemoteSequential(original, self.lora_config)
+        if plan is not None:
+            sequence.set_training_plan(plan, worker_peers or {})
+        model.requires_grad_(False)
         setattr(model.get_submodule(parent_path), attribute, sequence)
         self.model = model
         self._sequence_path = name
@@ -331,13 +385,12 @@ class DistributedLoRA(nn.Module):
             or config.get("fan_in_fan_out", False)
             or config.get("use_rslora", False)
             or config.get("use_dora", False)
-            or config.get("rank_pattern")
-            or config.get("alpha_pattern")
             or config.get("modules_to_save")
             or config.get("lora_bias", False)
         ):
             raise ValueError("Only standard bias-free alpha/r LoRA adapters are supported")
-        result = cls(model, LoRAConfig(**{k: config[k] for k in ("r", "lora_alpha", "lora_dropout", "target_modules")}))
+        fields = ("r", "lora_alpha", "lora_dropout", "target_modules", "rank_pattern", "alpha_pattern")
+        result = cls(model, LoRAConfig(**{k: config[k] for k in fields if k in config}))
         expected, state = result._adapter_state(), load_file(str(path / "adapter_model.safetensors"))
         if set(expected) != set(state) or any(expected[k].shape != state[k].shape for k in expected):
             raise ValueError("LoRA checkpoint keys/shapes do not match this model")
