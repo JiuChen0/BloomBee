@@ -927,6 +927,11 @@ class ModuleContainer(threading.Thread):
         logger.debug(f"Shutting down runtime")
         self.runtime.shutdown()
 
+        from bloombee.server.lora_execution import LoRASpanExecutor
+        for pool in self.runtime.pools:
+            if isinstance(pool.process_func, LoRASpanExecutor):
+                pool.process_func.clear_cache()
+
         logger.debug("Shutting down backends")
         for backend in self.module_backends.values():
             backend.shutdown()

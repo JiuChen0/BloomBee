@@ -217,6 +217,8 @@ def main():
         report["stage_profiles"] = summarize_stage_profiles(events, config)
         if plan and any(s.execution_mode != "block" for s in plan.stages):
             report["execution_mode"] = "stateless_lora_span_v3"
+        if plan and any(s.execution_mode.startswith("span_cached_") for s in plan.stages):
+            report["execution_mode"] = "cached_lora_span_v4"
         args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
         print(
             json.dumps(

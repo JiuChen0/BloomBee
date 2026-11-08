@@ -1,6 +1,7 @@
 """Serial span tasks: GPU layer boundaries, per-block graphs and bounded checkpoints.
 
-State is request-local in this executor. CPU checkpoints use blocking copies,
+Protocol v3 uses request-local state; v4 delegates retention to bounded caches.
+CPU checkpoints use blocking copies,
 so no pinned-buffer lifetime or asynchronous reuse is assumed. The worker's
 BLOOMBEE_LORA_SPAN_CHECKPOINT_BYTES limit (default 256 MiB) bounds additional
 detached layer boundaries, not total model/working/gradient memory. A planner
@@ -52,7 +53,25 @@ class LoRASpanExecutor:
             raise ValueError("A LoRA span executor requires a single compute device")
         self.device = devices.pop()
 
+    def clear_cache(self):
+        """Release retained tensors after the Runtime has stopped processing requests."""
+        if hasattr(self, "cache"):
+            self.cache.adapters.entries.clear()
+            self.cache.adapters.bytes = 0
+            self.cache.activations.entries.clear()
+            self.cache.activations.bytes = 0
+            del self.cache
+
     def __call__(self, inputs, grad_outputs, metadata, *parameters):
+        if metadata.get("version") == 4:
+            from bloombee.server.lora_cache import CachedLoRASpan
+
+            if not hasattr(self, "cache"):
+                self.cache = CachedLoRASpan(self)
+            return self.cache(inputs, grad_outputs, metadata, parameters)
+        return self.run(inputs, grad_outputs, metadata, parameters)
+
+    def run(self, inputs, grad_outputs, metadata, parameters, *, checkpoints=None, save_forward=False):
         from bloombee.server.lora import run_lora_block
 
         names = metadata["span_uids"]
@@ -61,13 +80,15 @@ class LoRASpanExecutor:
         if not indices or indices != list(range(indices[0], indices[0] + len(indices))):
             raise ValueError("Span layers must be contiguous")
         mode = metadata["execution_mode"]
-        if mode not in LORA_EXECUTION_MODES[1:]:
+        if mode not in LORA_EXECUTION_MODES[1:4]:
             raise ValueError("Unsupported span execution mode")
         width = 2 * len(LoRAConfig(**metadata["config"]).target_modules)
         if len(parameters) != width * len(names):
             raise ValueError("Span parameter count mismatch")
         backward = metadata["backward"]
-        required = (len(names) - 1) * tensor_bytes((inputs,)) if backward and mode != "span_recompute" else 0
+        required = (
+            (len(names) - 1) * tensor_bytes((inputs,)) if (backward or save_forward) and mode != "span_recompute" else 0
+        )
         if required > self.checkpoint_bytes:
             raise RuntimeError("Span activation checkpoint budget exceeded; reprofile/replan or use span_recompute")
         empty = torch.empty(0, device=self.device)
@@ -79,18 +100,18 @@ class LoRASpanExecutor:
             )
 
         def prefix(end, checkpoints=None):
-            x = move_tensor(inputs, self.device, metadata, "input")
+            first = checkpoints[0] if checkpoints is not None and checkpoints[0] is not None else inputs
+            x = move_tensor(first, self.device, metadata, "input")
             for j in range(end):
                 x = block(j, x, empty)[0]
-                if checkpoints is not None:
+                if checkpoints is not None and j + 1 < len(names):
                     device = "cpu" if mode == "span_cpu" else self.device
                     checkpoints[j + 1] = move_tensor(x, device, metadata, "checkpoint_save")
             return x
 
         if not backward:
-            return (prefix(len(names)),)
-        checkpoints = None
-        if mode != "span_recompute":
+            return (prefix(len(names), checkpoints if save_forward else None),)
+        if checkpoints is None and mode != "span_recompute":
             checkpoints = [inputs] + [None] * (len(names) - 1)
             prefix(len(names) - 1, checkpoints)
         grad = move_tensor(grad_outputs, self.device, metadata, "output_gradient")

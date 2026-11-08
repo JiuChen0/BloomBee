@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+import uuid
 from pathlib import Path
 
 import torch
@@ -24,7 +25,55 @@ from bloombee.utils.lora_profile import profile_fields, request_metadata, tensor
 from bloombee.utils.lossless_transport import deserialize_tensor_stream, serialize_torch_tensor
 
 
+class _LoRACacheMiss(RuntimeError):
+    pass
+
+
 async def _call_lora(manager, span, inputs, metadata):
+    if metadata["version"] != 4:
+        return await _call_lora_once(manager, span, inputs, metadata)
+    if not hasattr(manager, "_lora_cache_ready"):
+        manager._lora_cache_ready = {}
+    ready = manager._lora_cache_ready
+    key = (metadata["cache_job"], str(span.peer_id), span.start, span.end)
+    backward = metadata["backward"]
+    parameters = inputs[1:-1] if backward else inputs[1:]
+    sent = ready.get(key) != metadata["adapter_version"]
+    retry_seconds = 0.0
+    for attempt in range(2):
+        wire = inputs if sent else ((inputs[0], inputs[-1]) if backward else (inputs[0],))
+        started = time.perf_counter()
+        try:
+            return await _call_lora_once(
+                manager,
+                span,
+                wire,
+                {
+                    **metadata,
+                    "parameters_sent": sent,
+                    "adapter_tensor_bytes": tensor_bytes(parameters),
+                    "cache_retry_s": retry_seconds,
+                },
+            )
+        except _LoRACacheMiss as error:
+            ready.pop(key, None)
+            if sent or attempt:
+                raise RuntimeError("Worker rejected a full adapter cache refill")
+            retry_seconds = time.perf_counter() - started
+            fields = profile_fields(metadata)
+            if fields:
+                write_event(
+                    "cache_retry",
+                    **fields,
+                    seconds=retry_seconds,
+                    request_tensor_bytes=tensor_bytes(wire),
+                    request_protobuf_bytes=error.args[0],
+                    response_protobuf_bytes=error.args[1],
+                )
+            sent = True
+
+
+async def _call_lora_once(manager, span, inputs, metadata):
     profile = profile_fields(metadata)
     started = time.perf_counter() if profile else 0.0
     stub = LoRAService.get_stub(manager.state.p2p, span.peer_id, namespace=LORA_NAMESPACES[metadata["version"]])
@@ -38,20 +87,35 @@ async def _call_lora(manager, span, inputs, metadata):
         )
     serialized = time.perf_counter() if profile else 0.0
     response_proto_bytes = 0
+    response_metadata = {}
     responses = await asyncio.wait_for(
         stub.rpc_lora_stream(iter_as_aiter(parts)), timeout=manager.config.connect_timeout
     )
 
     async def checked():
-        nonlocal response_proto_bytes
+        nonlocal response_proto_bytes, response_metadata
         async for response in aiter_with_timeout(responses, manager.config.request_timeout):
-            if MSGPackSerializer.loads(response.metadata).get("version") != metadata["version"]:
+            response_metadata = MSGPackSerializer.loads(response.metadata)
+            if response_metadata.get("version") != metadata["version"]:
                 raise RuntimeError("Worker did not acknowledge the requested LoRA protocol")
+            if response_metadata.get("cache_miss"):
+                raise _LoRACacheMiss(
+                    sum(part.ByteSize() for part in parts) if profile else 0, response.ByteSize() if profile else 0
+                )
             if profile:
                 response_proto_bytes += response.ByteSize()
             yield response.tensors
 
     result = await deserialize_tensor_stream(checked())
+    if metadata["version"] == 4:
+        key = (metadata["cache_job"], str(span.peer_id), span.start, span.end)
+        ready = manager._lora_cache_ready
+        if response_metadata.get("adapter_cached"):
+            if len(ready) >= 256 and key not in ready:
+                ready.pop(next(iter(ready)))
+            ready[key] = metadata["adapter_version"]
+        else:
+            ready.pop(key, None)
     if profile:
         finished = time.perf_counter()
         write_event(
@@ -59,12 +123,16 @@ async def _call_lora(manager, span, inputs, metadata):
             **profile,
             phase="backward" if metadata["backward"] else "forward",
             execution_mode=metadata.get("execution_mode", "block"),
+            adapter_tensor_bytes=metadata.get("adapter_tensor_bytes"),
+            parameters_sent=metadata.get("parameters_sent", True),
+            checkpoint_hit=response_metadata.get("checkpoint_hit", False),
+            cache_retry_s=metadata.get("cache_retry_s", 0.0),
             peer=str(span.peer_id),
             start=span.start,
             end=span.end,
             serialize_s=serialized - started,
             rpc_and_deserialize_s=finished - serialized,
-            total_s=finished - started,
+            total_s=finished - started + metadata.get("cache_retry_s", 0.0),
             request_tensor_bytes=tensor_bytes(inputs),
             response_tensor_bytes=tensor_bytes(result),
             request_protobuf_bytes=sum(part.ByteSize() for part in parts),
@@ -109,6 +177,9 @@ class LoRARemoteSequential(RemoteSequential):
         self.lora_config = lora_config
         self.training_plan = None
         self.worker_peers = None
+        self._cache_job = uuid.uuid4().hex
+        self._cache_parameter_versions = None
+        self._cache_adapter_version = 0
         lora_config.validate_layers(len(original))
         shapes = projection_shapes(original.config)
         self.adapters = nn.ModuleList(
@@ -134,6 +205,10 @@ class LoRARemoteSequential(RemoteSequential):
         if len(set(peers.values())) != len(peers):
             raise ValueError("Planned workers must bind to distinct peers")
         self.training_plan, self.worker_peers = plan, peers
+
+    def invalidate_adapter_cache(self):
+        """Call after external .data writes; standard optimizers invalidate via tensor versions automatically."""
+        self._cache_parameter_versions = None
 
     def _planned_route(self, inputs):
         plan, manager = self.training_plan, self.sequence_manager
@@ -202,6 +277,18 @@ class LoRARemoteSequential(RemoteSequential):
                 metadata["compute_dtype"] = self.training_plan.workload.input_dtype
                 if stage.execution_mode != "block":
                     metadata.update(version=3, execution_mode=stage.execution_mode)
+                if stage.execution_mode.startswith("span_cached_"):
+                    versions = tuple((id(p), p._version) for p in self.adapters.parameters())
+                    if versions != self._cache_parameter_versions:
+                        self._cache_adapter_version += 1
+                        self._cache_parameter_versions = versions
+                    metadata.update(
+                        version=4,
+                        cache_job=self._cache_job,
+                        cache_request=uuid.uuid4().hex,
+                        adapter_version=self._cache_adapter_version,
+                        cache_requires_backward=torch.is_grad_enabled() and any(p.requires_grad for p in parameters),
+                    )
             inputs = _RemoteLoRAFunction.apply(inputs, self.sequence_manager, span, metadata, *parameters)
         return inputs
 
@@ -216,8 +303,9 @@ class DistributedLoRA(nn.Module):
     """Attach standard LoRA to a loaded BloomBee LLaMA/Qwen3 causal model.
 
     A/B and optimizer state live on the client; workers receive immutable copies
-    per RPC and compute their gradients. This favors correctness over bandwidth:
-    weights are sent again at backward; there is no worker-side optimizer step.
+    per RPC and compute their gradients. Planned protocol v4 can reuse immutable
+    adapter versions and detached activations in bounded worker caches. Cache
+    loss triggers refill/recompute; there is no worker-side optimizer step.
     """
 
     def __init__(self, model, config=None, *, plan=None, worker_peers=None):

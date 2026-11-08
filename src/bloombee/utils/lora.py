@@ -16,8 +16,8 @@ from torch.nn import functional as F
 
 LORA_PROTOCOL_VERSION = 1
 LORA_NAMESPACE = "lora-v1"
-LORA_NAMESPACES = {1: LORA_NAMESPACE, 2: "lora-v2", 3: "lora-v3"}
-LORA_EXECUTION_MODES = ("block", "span_cpu", "span_gpu", "span_recompute")
+LORA_NAMESPACES = {1: LORA_NAMESPACE, 2: "lora-v2", 3: "lora-v3", 4: "lora-v4"}
+LORA_EXECUTION_MODES = ("block", "span_cpu", "span_gpu", "span_recompute", "span_cached_cpu", "span_cached_gpu")
 PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 _ACTIVE_LORA = ContextVar("bloombee_request_lora", default=None)
 

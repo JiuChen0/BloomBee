@@ -24,7 +24,7 @@ from bloombee import AutoDistributedModelForCausalLM, DistributedLoRA, LoRAConfi
 from bloombee.data_structures import ServerState
 from bloombee.utils.dht import get_remote_module_infos
 from bloombee.utils.hivemind_compat import DHT
-from bloombee.utils.lora import PROJECTIONS, projection_shapes
+from bloombee.utils.lora import LORA_EXECUTION_MODES, PROJECTIONS, projection_shapes
 from bloombee.utils.training_plan import StageChoice, TrainingPlan, TrainingWorkload
 
 
@@ -155,12 +155,17 @@ def main():
     parser.add_argument("--check-profile", action="store_true")
     parser.add_argument("--check-plan", action="store_true", help="Mixed ranks, fixed peers and offload enforcement")
     parser.add_argument(
-        "--execution-mode", choices=("block", "span_cpu", "span_gpu", "span_recompute"), default="block"
+        "--check-cache-recovery", action="store_true", help="Expire cached state between forward and backward"
     )
+    parser.add_argument("--execution-mode", choices=LORA_EXECUTION_MODES, default="block")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.execution_mode != "block" and not args.check_plan:
         parser.error("Span tests require --check-plan")
+    if args.check_cache_recovery and (
+        not args.execution_mode.startswith("span_cached_") or os.getenv("BLOOMBEE_LORA_CACHE_TTL") != "1"
+    ):
+        parser.error("Cache recovery requires a cached mode and BLOOMBEE_LORA_CACHE_TTL=1")
     if not torch.cuda.is_available():
         raise RuntimeError("This integration test requires a CUDA GPU")
     torch.set_num_threads(2)
@@ -441,6 +446,14 @@ def main():
                     torch.testing.assert_close(parameter.grad, gradient, rtol=0, atol=0)
                 optimizer.zero_grad(set_to_none=True)
                 report["span_block_gradient_parity_exact"] = True
+                if args.check_cache_recovery:
+                    delayed = model(ids, labels=ids)
+                    time.sleep(1.2)
+                    delayed.loss.backward()
+                    for parameter, gradient in zip(params, baseline_grads):
+                        torch.testing.assert_close(parameter.grad, gradient, rtol=0, atol=0)
+                    optimizer.zero_grad(set_to_none=True)
+                    report["cache_expiry_recovery_exact"] = True
             # A planned job must never call the adaptive/random route selector.
             def unexpected_route(*args, **kwargs):
                 raise AssertionError("Planned training unexpectedly selected a new route")

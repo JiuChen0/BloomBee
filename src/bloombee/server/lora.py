@@ -1,4 +1,4 @@
-"""Opt-in stateless LoRA RPCs, executed on the existing serial worker Runtime."""
+"""Opt-in LoRA RPCs on the serial Runtime; v4 adds bounded, disposable caches."""
 
 import os
 from contextlib import nullcontext
@@ -95,7 +95,7 @@ def run_lora_block(backend, inputs, grad_outputs, metadata, *parameters):
 
 
 class LoRAService(ServicerBase):
-    """No server-side adapter state: duplicate/retried calls cannot double-apply an update."""
+    """Immutable adapter snapshots; duplicate/retried calls never apply optimizer updates."""
 
     def __init__(self, handler):
         self.handler = handler
@@ -110,7 +110,11 @@ class LoRAService(ServicerBase):
                 raise ValueError("Unsupported LoRA protocol")
             config = LoRAConfig(**metadata["config"])
             mode = metadata.get("execution_mode", "block")
-            if (version == 3 and mode not in LORA_EXECUTION_MODES[1:]) or (version < 3 and mode != "block"):
+            if (
+                (version == 3 and mode not in LORA_EXECUTION_MODES[1:4])
+                or (version == 4 and mode not in LORA_EXECUTION_MODES[4:])
+                or (version < 3 and mode != "block")
+            ):
                 raise ValueError("LoRA execution mode requires the matching protocol version")
             if version == 1 and (
                 config.rank_pattern
@@ -140,19 +144,37 @@ class LoRAService(ServicerBase):
             if not isinstance(seed, int) or not 0 <= seed < 2**63:
                 raise ValueError("Invalid LoRA recompute seed")
             width = 2 * len(config.target_modules)
-            if len(tensors) != 1 + width * len(names) + int(backward):
+            sent = metadata.get("parameters_sent", True) if version == 4 else True
+            if not isinstance(sent, bool):
+                raise ValueError("parameters_sent must be boolean")
+            parameter_count = width * len(names) if sent else 0
+            if len(tensors) != 1 + parameter_count + int(backward):
                 raise ValueError("LoRA request tensor count mismatch")
-            x, parameters = tensors[0], tensors[1 : 1 + width * len(names)]
+            x, parameters = tensors[0], tensors[1 : 1 + parameter_count]
             if x.ndim != 3 or min(x.shape) < 1 or (backward and tensors[-1].shape != x.shape):
                 raise ValueError("LoRA requires nonempty [batch, sequence, hidden] inputs and matching gradients")
             empty = torch.empty(0)
-            if version == 3:
+            response_metadata = {"version": version}
+            if version >= 3:
                 pool = getattr(backends[0], "lora_span_pool", None)
                 if pool is None or any(getattr(b, "lora_span_pool", None) is not pool for b in backends):
                     raise RuntimeError("Worker has no common LoRA span executor")
                 outputs = await pool.submit_task(
-                    x, tensors[-1] if backward else empty, {**metadata, "span_uids": names}, *parameters, priority=2.0
+                    x,
+                    tensors[-1] if backward else empty,
+                    {**metadata, "span_uids": names, "cache_owner": str(context.remote_id)},
+                    *parameters,
+                    priority=2.0,
                 )
+                if version == 4:
+                    *outputs, control = outputs
+                    cached, hit = control.tolist()
+                    response_metadata.update(adapter_cached=cached == 1, checkpoint_hit=bool(hit))
+                    if cached == -1:
+                        yield runtime_pb2.ExpertResponse(
+                            metadata=MSGPackSerializer.dumps({**response_metadata, "cache_miss": True})
+                        )
+                        return
             else:
                 outputs = await self._run_block_tasks(
                     backends, indices, x, tensors[-1] if backward else empty, metadata, parameters, width
@@ -161,7 +183,7 @@ class LoRAService(ServicerBase):
                 wire = serialize_torch_tensor(tensor.detach().cpu().contiguous(), runtime_pb2.CompressionType.NONE)
                 for part in split_for_streaming(wire, DEFAULT_MAX_MSG_SIZE):
                     yield runtime_pb2.ExpertResponse(
-                        tensors=[part], metadata=MSGPackSerializer.dumps({"version": version})
+                        tensors=[part], metadata=MSGPackSerializer.dumps(response_metadata)
                     )
 
     @staticmethod
