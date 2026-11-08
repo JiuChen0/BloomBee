@@ -1856,7 +1856,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
     def get_pools(self) -> Sequence[PrioritizedTaskPool]:
         pools = self.forward_pool, self.backward_pool, self.inference_pool
-        return (*pools, self.lora_pool) if hasattr(self, "lora_pool") else pools
+        return (*pools, *(getattr(self, name) for name in ("lora_pool", "lora_span_pool") if hasattr(self, name)))
 
     def get_info(self) -> Dict[str, Any]:
         """Get module parameters and stats. Used by RemoteExpert to check shapes and for DMoE orchestration."""
@@ -1867,6 +1867,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         self.forward_pool = self.backward_pool = self.inference_pool = None
         if hasattr(self, "lora_pool"):
             self.lora_pool = None
+        if hasattr(self, "lora_span_pool"):
+            self.lora_span_pool = None
 
         # Explicitly free the GPU memory. This is not necessary at the time this code is written,
         # but may help to avoid future issues when the module is not garbage-collected for some reasons

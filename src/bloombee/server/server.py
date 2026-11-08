@@ -830,6 +830,8 @@ class ModuleContainer(threading.Thread):
 
         self.dht, self.module_backends = dht, module_backends
         self.server_info, self.update_period, self.expiration = server_info, update_period, expiration
+        from bloombee.server.lora_execution import attach_lora_span_pool
+        attach_lora_span_pool(self.module_backends)
 
         # Optimize shared memory usage: limit Queue maxsize to reduce /dev/shm peak usage
         # Default Queue maxsize is unlimited, which can cause high /dev/shm usage during warmup

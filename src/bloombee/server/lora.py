@@ -11,7 +11,7 @@ from hivemind.proto import runtime_pb2
 from hivemind.utils.streaming import split_for_streaming
 
 from bloombee.utils.hivemind_compat import MSGPackSerializer, P2PContext, ServicerBase
-from bloombee.utils.lora import LORA_NAMESPACES, LoRAConfig, lora_context, projection_shapes
+from bloombee.utils.lora import LORA_EXECUTION_MODES, LORA_NAMESPACES, LoRAConfig, lora_context, projection_shapes
 from bloombee.utils.lora_profile import measure
 from bloombee.utils.lossless_transport import serialize_torch_tensor
 
@@ -109,6 +109,9 @@ class LoRAService(ServicerBase):
             if version not in LORA_NAMESPACES:
                 raise ValueError("Unsupported LoRA protocol")
             config = LoRAConfig(**metadata["config"])
+            mode = metadata.get("execution_mode", "block")
+            if (version == 3 and mode not in LORA_EXECUTION_MODES[1:]) or (version < 3 and mode != "block"):
+                raise ValueError("LoRA execution mode requires the matching protocol version")
             if version == 1 and (
                 config.rank_pattern
                 or config.alpha_pattern
@@ -143,32 +146,49 @@ class LoRAService(ServicerBase):
             if x.ndim != 3 or min(x.shape) < 1 or (backward and tensors[-1].shape != x.shape):
                 raise ValueError("LoRA requires nonempty [batch, sequence, hidden] inputs and matching gradients")
             empty = torch.empty(0)
-            inputs = [x]
-            # During backward, recompute each layer input using the exact saved parameters and seeds.
-            for j, backend in enumerate(backends[: len(backends) - int(backward)]):
-                meta = {**metadata, "seed": seed + j, "layer_index": indices[j]}
-                result = await backend.lora_pool.submit_task(
-                    inputs[-1], empty, meta, *parameters[j * width : (j + 1) * width], priority=2.0
+            if version == 3:
+                pool = getattr(backends[0], "lora_span_pool", None)
+                if pool is None or any(getattr(b, "lora_span_pool", None) is not pool for b in backends):
+                    raise RuntimeError("Worker has no common LoRA span executor")
+                outputs = await pool.submit_task(
+                    x, tensors[-1] if backward else empty, {**metadata, "span_uids": names}, *parameters, priority=2.0
                 )
-                inputs.append(result[0])
-            if backward:
-                grad = tensors[-1]
-                parameter_grads = [None] * len(backends)
-                for j in reversed(range(len(backends))):
-                    result = await backends[j].lora_pool.submit_task(
-                        inputs[j],
-                        grad,
-                        {**metadata, "seed": seed + j, "layer_index": indices[j]},
-                        *parameters[j * width : (j + 1) * width],
-                        priority=2.0,
-                    )
-                    grad, parameter_grads[j] = result[0], result[1:]
-                outputs = (grad, *(g for layer in parameter_grads for g in layer))
             else:
-                outputs = (inputs[-1],)
+                outputs = await self._run_block_tasks(
+                    backends, indices, x, tensors[-1] if backward else empty, metadata, parameters, width
+                )
             for tensor in outputs:
                 wire = serialize_torch_tensor(tensor.detach().cpu().contiguous(), runtime_pb2.CompressionType.NONE)
                 for part in split_for_streaming(wire, DEFAULT_MAX_MSG_SIZE):
                     yield runtime_pb2.ExpertResponse(
                         tensors=[part], metadata=MSGPackSerializer.dumps({"version": version})
                     )
+
+    @staticmethod
+    async def _run_block_tasks(backends, indices, x, grad_outputs, metadata, parameters, width):
+        backward, seed = metadata["backward"], metadata["seed"]
+        empty = torch.empty(0)
+        inputs = [x]
+        # During backward, recompute each layer input using the exact saved parameters and seeds.
+        for j, backend in enumerate(backends[: len(backends) - int(backward)]):
+            meta = {**metadata, "seed": seed + j, "layer_index": indices[j]}
+            result = await backend.lora_pool.submit_task(
+                inputs[-1], empty, meta, *parameters[j * width : (j + 1) * width], priority=2.0
+            )
+            inputs.append(result[0])
+        if backward:
+            grad = grad_outputs
+            parameter_grads = [None] * len(backends)
+            for j in reversed(range(len(backends))):
+                result = await backends[j].lora_pool.submit_task(
+                    inputs[j],
+                    grad,
+                    {**metadata, "seed": seed + j, "layer_index": indices[j]},
+                    *parameters[j * width : (j + 1) * width],
+                    priority=2.0,
+                )
+                grad, parameter_grads[j] = result[0], result[1:]
+            outputs = (grad, *(g for layer in parameter_grads for g in layer))
+        else:
+            outputs = (inputs[-1],)
+        return outputs

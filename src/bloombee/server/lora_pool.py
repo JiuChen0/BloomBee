@@ -12,18 +12,24 @@ _RESET_DEVICES = set()
 
 
 class LoRATaskPool(PrioritizedTaskPool):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, profile_device=None, **kwargs):
         super().__init__(*args, **kwargs)
+        self.profile_device = profile_device
         self._profiles = {}
 
     def load_batch_to_runtime(self, timeout=None, device=None):
         target = device if device is not None else self.device
+        measurement_device = self.profile_device if self.profile_device is not None else target
         profiling = enabled()
         if profiling:
-            synchronize(target)
-            key = (os.getpid(), str(target))
-            if target is not None and torch.device(target).type == "cuda" and key not in _RESET_DEVICES:
-                torch.cuda.reset_peak_memory_stats(target)
+            synchronize(measurement_device)
+            key = (os.getpid(), str(measurement_device))
+            if (
+                measurement_device is not None
+                and torch.device(measurement_device).type == "cuda"
+                and key not in _RESET_DEVICES
+            ):
+                torch.cuda.reset_peak_memory_stats(measurement_device)
                 _RESET_DEVICES.add(key)
         start = time.monotonic()
         uid, inputs = super().load_batch_to_runtime(timeout=timeout, device=device)
@@ -31,7 +37,7 @@ class LoRATaskPool(PrioritizedTaskPool):
         metadata = task.args[2] if len(task.args) > 2 and isinstance(task.args[2], dict) else {}
         fields = profile_fields(metadata)
         if fields:
-            synchronize(target)
+            synchronize(measurement_device)
             self._profiles[uid] = dict(
                 **fields,
                 pool=self.name,
@@ -44,7 +50,7 @@ class LoRATaskPool(PrioritizedTaskPool):
                     for a, b in zip(task.args, inputs)
                     if isinstance(a, torch.Tensor) and a.device.type == "cpu" and b.device.type == "cuda"
                 ),
-                target=target,
+                target=measurement_device,
             )
         return uid, inputs
 

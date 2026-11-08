@@ -18,7 +18,7 @@ import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from bloombee.utils.lora import LoRAConfig, projection_key, projection_shapes
+from bloombee.utils.lora import LORA_EXECUTION_MODES, LoRAConfig, projection_key, projection_shapes
 
 
 def _integer(value, minimum=0):
@@ -69,9 +69,12 @@ class StageChoice:
     resource_bytes: dict
     utility: float
     profile_id: str
+    execution_mode: str = "block"
 
     def __post_init__(self):
         object.__setattr__(self, "ranks", tuple(self.ranks))
+        if self.execution_mode not in LORA_EXECUTION_MODES:
+            raise ValueError("Unsupported LoRA execution mode")
         if not self.worker or not self.profile_id or not _integer(self.start) or not _integer(self.end, self.start + 1):
             raise ValueError("Invalid worker, profile or layer span")
         if len(self.ranks) != self.end - self.start or any(not _integer(r, 1) or r > 256 for r in self.ranks):
@@ -162,6 +165,10 @@ class TrainingPlan:
     def to_dict(self):
         result = asdict(self)
         result["base_lora"] = self.base_lora.to_dict()
+        # Preserve M1 plan/checkpoint serialization for the default executor.
+        for stage in result["stages"]:
+            if stage["execution_mode"] == "block":
+                del stage["execution_mode"]
         return result
 
     @classmethod

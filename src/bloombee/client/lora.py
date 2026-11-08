@@ -58,6 +58,7 @@ async def _call_lora(manager, span, inputs, metadata):
             "rpc",
             **profile,
             phase="backward" if metadata["backward"] else "forward",
+            execution_mode=metadata.get("execution_mode", "block"),
             peer=str(span.peer_id),
             start=span.start,
             end=span.end,
@@ -195,9 +196,12 @@ class LoRARemoteSequential(RemoteSequential):
                 **request_metadata(),
             )
             if self.training_plan:
-                metadata["weight_gpu_percent"] = self.training_plan.stages[stage_index].weight_gpu_percent
+                stage = self.training_plan.stages[stage_index]
+                metadata["weight_gpu_percent"] = stage.weight_gpu_percent
                 metadata["planned_span"] = [span.start, span.end]
                 metadata["compute_dtype"] = self.training_plan.workload.input_dtype
+                if stage.execution_mode != "block":
+                    metadata.update(version=3, execution_mode=stage.execution_mode)
             inputs = _RemoteLoRAFunction.apply(inputs, self.sequence_manager, span, metadata, *parameters)
         return inputs
 

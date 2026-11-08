@@ -44,20 +44,21 @@ def summarize_stage_profiles(events, config):
         if set(pair) != {"forward", "backward"}:
             raise ValueError("Incomplete training profile RPC pair")
         f, b = pair["forward"], pair["backward"]
-        key = tuple(f[k] for k in ("peer", "start", "end"))
-        if key != tuple(b[k] for k in ("peer", "start", "end")):
+        key = (*[f[k] for k in ("peer", "start", "end")], f.get("execution_mode", "block"))
+        if key != (*[b[k] for k in ("peer", "start", "end")], b.get("execution_mode", "block")):
             raise ValueError("Forward/backward profile route differs")
         samples[key].append(f["total_s"] + b["total_s"])
     return [
         dict(
             peer=peer,
+            execution_mode=mode,
             start=start,
             end=end,
             samples=len(values),
             median_forward_backward_rpc_s=statistics.median(values),
             rank_by_layer=[{t: config.rank_for(i, t) for t in config.target_modules} for i in range(start, end)],
         )
-        for (peer, start, end), values in sorted(samples.items())
+        for (peer, start, end, mode), values in sorted(samples.items())
     ]
 
 
@@ -214,6 +215,8 @@ def main():
             for line in path.read_text().splitlines()
         ]
         report["stage_profiles"] = summarize_stage_profiles(events, config)
+        if plan and any(s.execution_mode != "block" for s in plan.stages):
+            report["execution_mode"] = "stateless_lora_span_v3"
         args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
         print(
             json.dumps(

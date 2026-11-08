@@ -154,8 +154,13 @@ def main():
     parser.add_argument("--check-merged", action="store_true")
     parser.add_argument("--check-profile", action="store_true")
     parser.add_argument("--check-plan", action="store_true", help="Mixed ranks, fixed peers and offload enforcement")
+    parser.add_argument(
+        "--execution-mode", choices=("block", "span_cpu", "span_gpu", "span_recompute"), default="block"
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.execution_mode != "block" and not args.check_plan:
+        parser.error("Span tests require --check-plan")
     if not torch.cuda.is_available():
         raise RuntimeError("This integration test requires a CUDA GPU")
     torch.set_num_threads(2)
@@ -335,6 +340,7 @@ def main():
                 2,
                 100000,
             )
+            plan = replace(plan, stages=tuple(replace(s, execution_mode=args.execution_mode) for s in plan.stages))
             plan.save(args.output / "plan.json")
             lora_config = plan.lora_config
         model = DistributedLoRA(client, lora_config).cuda()
@@ -421,7 +427,20 @@ def main():
         opt.zero_grad(set_to_none=True)
         optimizer = torch.optim.AdamW(params, lr=0.015, weight_decay=0.0)
         if plan:
+            if args.execution_mode != "block":
+                baseline = model(ids, labels=ids)
+                baseline.loss.backward()
+                baseline_grads = [p.grad.clone() for p in params]
+                optimizer.zero_grad(set_to_none=True)
             model.remote_layers.set_training_plan(plan, worker_peers)
+            if args.execution_mode != "block":
+                planned = model(ids, labels=ids)
+                planned.loss.backward()
+                torch.testing.assert_close(planned.logits, baseline.logits, rtol=0, atol=0)
+                for parameter, gradient in zip(params, baseline_grads):
+                    torch.testing.assert_close(parameter.grad, gradient, rtol=0, atol=0)
+                optimizer.zero_grad(set_to_none=True)
+                report["span_block_gradient_parity_exact"] = True
             # A planned job must never call the adaptive/random route selector.
             def unexpected_route(*args, **kwargs):
                 raise AssertionError("Planned training unexpectedly selected a new route")
@@ -485,6 +504,7 @@ def main():
             report["cli_resume"] = check_cli_resume(base_dir, peers, prefix, args.output, plan, worker_peers)
         if plan:
             report["joint_plan"] = dict(
+                execution_mode=args.execution_mode,
                 ranks=[2, 8],
                 fixed_route=True,
                 shape_mismatch_rejected=True,

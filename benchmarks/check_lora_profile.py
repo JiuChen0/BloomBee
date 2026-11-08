@@ -35,6 +35,12 @@ def audit_events(events, require_workers=False):
         boundary = f["response_tensor_bytes"]
         adapter = f["request_tensor_bytes"] - boundary
         expected = expected_stateless_cost(f["end"] - f["start"], boundary, adapter)
+        mode = f.get("execution_mode", "block")
+        if mode != b.get("execution_mode", "block"):
+            errors.append(f"{request_id}: forward/backward execution mode differs")
+        if mode == "span_recompute":
+            n = f["end"] - f["start"]
+            expected["forward_calls"] = 2 * n + n * (n - 1) // 2
         for direction in ("request_tensor_bytes", "response_tensor_bytes"):
             measured = f[direction] + b[direction]
             totals[direction] += measured
@@ -48,13 +54,17 @@ def audit_events(events, require_workers=False):
             if nf != expected["forward_calls"] or nb != expected["backward_calls"]:
                 errors.append(f"{request_id}: block calls F={nf}, B={nb} disagree with span size")
             transfers = [r for r in records if r["kind"] == "runtime_transfer"]
-            if len(transfers) != expected["forward_calls"]:
+            if len(transfers) != (expected["forward_calls"] if mode == "block" else 2):
                 errors.append(f"{request_id}: incomplete runtime transfer records")
             durations["worker_block_s_including_weight_staging"] += sum(r["seconds"] for r in blocks)
             durations["worker_task_transfer_s"] += sum(
                 r["input_transfer_s"] + r["output_transfer_s"] for r in transfers
             )
             durations["worker_queue_s"] += sum(r["queue_wait_s"] for r in transfers)
+            durations["worker_task_transfer_s"] += sum(r["seconds"] for r in records if r["kind"] == "span_transfer")
+            for record in records:
+                if record["kind"] == "span_execution" and record["checkpoint_bytes"] > record["checkpoint_limit_bytes"]:
+                    errors.append(f"{request_id}: span checkpoint reservation exceeded its limit")
         elif require_workers:
             errors.append(f"{request_id}: missing worker events")
     if not pairs:
