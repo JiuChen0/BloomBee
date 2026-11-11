@@ -18,8 +18,25 @@ LORA_PROTOCOL_VERSION = 1
 LORA_NAMESPACE = "lora-v1"
 LORA_NAMESPACES = {1: LORA_NAMESPACE, 2: "lora-v2", 3: "lora-v3", 4: "lora-v4"}
 LORA_EXECUTION_MODES = ("block", "span_cpu", "span_gpu", "span_recompute", "span_cached_cpu", "span_cached_gpu")
+LORA_CACHED_MODES = LORA_EXECUTION_MODES[4:]
+LORA_CHECKPOINT_MODES = ("span_cpu", "span_gpu", *LORA_CACHED_MODES)
+DEFAULT_LORA_CHECKPOINT_BYTES = 256 * 2**20
+DEFAULT_LORA_ACTIVATION_CACHE_BYTES = 256 * 2**20
 PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 _ACTIVE_LORA = ContextVar("bloombee_request_lora", default=None)
+
+
+def checkpoint_budget_error(mode, layers, boundary_bytes, checkpoint_limit, activation_limit=None):
+    if mode not in LORA_CHECKPOINT_MODES:
+        return None
+    required = (layers - 1) * boundary_bytes
+    if required > checkpoint_limit:
+        return f"Span activation checkpoint budget exceeded: need {required} bytes, limit is {checkpoint_limit}"
+    if mode in LORA_CACHED_MODES and activation_limit and layers * boundary_bytes > activation_limit:
+        return (
+            f"Span activation cache budget exceeded: need {layers * boundary_bytes} bytes, limit is {activation_limit}"
+        )
+    return None
 
 
 @dataclass(frozen=True)

@@ -11,7 +11,17 @@ from hivemind.proto import runtime_pb2
 from hivemind.utils.streaming import split_for_streaming
 
 from bloombee.utils.hivemind_compat import MSGPackSerializer, P2PContext, ServicerBase
-from bloombee.utils.lora import LORA_EXECUTION_MODES, LORA_NAMESPACES, LoRAConfig, lora_context, projection_shapes
+from bloombee.utils.lora import (
+    DEFAULT_LORA_ACTIVATION_CACHE_BYTES,
+    LORA_CHECKPOINT_MODES,
+    LORA_EXECUTION_MODES,
+    LORA_NAMESPACES,
+    LoRAConfig,
+    checkpoint_budget_error,
+    lora_context,
+    projection_shapes,
+)
+from bloombee.utils.lora_model_revision import valid_model_revision
 from bloombee.utils.lora_profile import measure
 from bloombee.utils.lossless_transport import serialize_torch_tensor
 
@@ -137,6 +147,14 @@ class LoRAService(ServicerBase):
             backends = [self.handler.module_backends[name] for name in names]
             if any(not hasattr(b, "lora_pool") for b in backends):
                 raise RuntimeError("Enable BLOOMBEE_ENABLE_LORA=1 on every worker")
+            response_metadata = {"version": version}
+            if "model_revision" in metadata:
+                revision = metadata["model_revision"]
+                if not valid_model_revision(revision) or any(
+                    getattr(b.config, "_bloombee_lora_model_revision", None) != revision for b in backends
+                ):
+                    raise ValueError("Worker base model revision does not match the training plan")
+                response_metadata["model_revision"] = revision
             backward = metadata.get("backward")
             if not isinstance(backward, bool) or not isinstance(metadata.get("training"), bool):
                 raise ValueError("LoRA phase and training must be booleans")
@@ -154,11 +172,23 @@ class LoRAService(ServicerBase):
             if x.ndim != 3 or min(x.shape) < 1 or (backward and tensors[-1].shape != x.shape):
                 raise ValueError("LoRA requires nonempty [batch, sequence, hidden] inputs and matching gradients")
             empty = torch.empty(0)
-            response_metadata = {"version": version}
             if version >= 3:
                 pool = getattr(backends[0], "lora_span_pool", None)
                 if pool is None or any(getattr(b, "lora_span_pool", None) is not pool for b in backends):
                     raise RuntimeError("Worker has no common LoRA span executor")
+                if "planned_span" in metadata and mode in LORA_CHECKPOINT_MODES:
+                    limit = pool.process_func.checkpoint_bytes
+                    if metadata.get("checkpoint_limit_bytes", limit) != limit:
+                        raise ValueError("Worker checkpoint limit does not match the training plan")
+                    activation_limit = metadata.get("activation_cache_limit_bytes")
+                    if activation_limit is not None and activation_limit != int(
+                        os.getenv("BLOOMBEE_LORA_ACTIVATION_CACHE_BYTES", DEFAULT_LORA_ACTIVATION_CACHE_BYTES)
+                    ):
+                        raise ValueError("Worker activation cache limit does not match the training plan")
+                    if error := checkpoint_budget_error(
+                        mode, len(names), x.numel() * x.element_size(), limit, activation_limit
+                    ):
+                        raise ValueError(error)
                 outputs = await pool.submit_task(
                     x,
                     tensors[-1] if backward else empty,

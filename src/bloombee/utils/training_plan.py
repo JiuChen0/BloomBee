@@ -1,7 +1,7 @@
 """Static planning for the existing serial, client-relayed LoRA execution path.
 
-Costs are measured forward+backward RPC seconds per microbatch, including the
-client/worker link. They are NOT pipeline stage times or full optimizer steps.
+Costs are measured RPC seconds per optimizer step divided by accumulation,
+including the client/worker link. They exclude client compute and optimization.
 Candidates must come from the same workload and execution mode. Resource bytes
 are conservative peak reservations (including cold allocations and headroom),
 not just parameter sizes. Use the SAME resource key for workers sharing a GPU
@@ -15,10 +15,24 @@ or online rank/optimizer-state migration is performed.
 
 import json
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from typing import Optional
 
-from bloombee.utils.lora import LORA_EXECUTION_MODES, LoRAConfig, projection_key, projection_shapes
+from bloombee.utils.lora import (
+    DEFAULT_LORA_ACTIVATION_CACHE_BYTES,
+    DEFAULT_LORA_CHECKPOINT_BYTES,
+    LORA_CACHED_MODES,
+    LORA_CHECKPOINT_MODES,
+    LORA_EXECUTION_MODES,
+    LoRAConfig,
+    checkpoint_budget_error,
+    projection_key,
+    projection_shapes,
+)
+from bloombee.utils.lora_model_revision import valid_model_revision
+
+_DTYPE_BYTES = {"torch.float16": 2, "torch.bfloat16": 2, "torch.float32": 4}
 
 
 def _integer(value, minimum=0):
@@ -34,6 +48,8 @@ class TrainingWorkload:
     parameters_per_rank: int
     input_dtype: str = "torch.float16"
     accumulation: int = 1
+    hidden_size: Optional[int] = None
+    model_revision: Optional[str] = None
 
     def __post_init__(self):
         if (
@@ -45,14 +61,19 @@ class TrainingWorkload:
             or not _integer(self.sequence_length, 2)
         ):
             raise ValueError("Invalid training workload")
-        if self.input_dtype not in ("torch.float16", "torch.bfloat16", "torch.float32"):
+        if self.input_dtype not in _DTYPE_BYTES:
             raise ValueError("Unsupported training input dtype")
+        if self.hidden_size is not None and not _integer(self.hidden_size, 1):
+            raise ValueError("Training workload hidden_size must be a positive integer")
+        if self.model_revision is not None and not valid_model_revision(self.model_revision):
+            raise ValueError("Training workload model_revision must be an immutable Hub commit or local SHA-256")
 
     def validate_model(self, config, lora):
         shapes = projection_shapes(config)
         if (
             config._name_or_path != self.model
             or config.num_hidden_layers != self.num_layers
+            or (self.hidden_size is not None and config.hidden_size != self.hidden_size)
             or sum(sum(shapes[t]) for t in lora.target_modules) != self.parameters_per_rank
         ):
             raise ValueError("Training plan model or projection dimensions do not match")
@@ -70,11 +91,19 @@ class StageChoice:
     utility: float
     profile_id: str
     execution_mode: str = "block"
+    checkpoint_limit_bytes: Optional[int] = None
+    activation_cache_limit_bytes: Optional[int] = None
 
     def __post_init__(self):
         object.__setattr__(self, "ranks", tuple(self.ranks))
         if self.execution_mode not in LORA_EXECUTION_MODES:
             raise ValueError("Unsupported LoRA execution mode")
+        for limit, modes in (
+            (self.checkpoint_limit_bytes, LORA_CHECKPOINT_MODES),
+            (self.activation_cache_limit_bytes, LORA_CACHED_MODES),
+        ):
+            if limit is not None and (not _integer(limit) or self.execution_mode not in modes):
+                raise ValueError("Invalid checkpoint or activation cache limit for the execution mode")
         if not self.worker or not self.profile_id or not _integer(self.start) or not _integer(self.end, self.start + 1):
             raise ValueError("Invalid worker, profile or layer span")
         if len(self.ranks) != self.end - self.start or any(not _integer(r, 1) or r > 256 for r in self.ranks):
@@ -88,6 +117,20 @@ class StageChoice:
         if not self.resource_bytes or any(not k or not _integer(v) for k, v in self.resource_bytes.items()):
             raise ValueError("Candidates require resource peak reservations")
         object.__setattr__(self, "resource_bytes", dict(self.resource_bytes))
+
+    def checkpoint_error(self, workload):
+        if self.execution_mode not in LORA_CHECKPOINT_MODES or workload.hidden_size is None:
+            return None
+        boundary_bytes = (
+            workload.batch_size * workload.sequence_length * workload.hidden_size * _DTYPE_BYTES[workload.input_dtype]
+        )
+        return checkpoint_budget_error(
+            self.execution_mode,
+            self.end - self.start,
+            boundary_bytes,
+            DEFAULT_LORA_CHECKPOINT_BYTES if self.checkpoint_limit_bytes is None else self.checkpoint_limit_bytes,
+            self.activation_cache_limit_bytes,
+        )
 
     def worker_args(self):
         """Deployment hints; the caller supplies model, DHT and device arguments."""
@@ -121,6 +164,8 @@ class TrainingPlan:
         for stage in self.stages:
             if stage.start != end or stage.worker in workers:
                 raise ValueError("Plan must cover ordered layers once and use each worker at most once")
+            if error := stage.checkpoint_error(self.workload):
+                raise ValueError(f"{stage.worker}: {error}")
             end = stage.end
             workers.add(stage.worker)
         if end != self.workload.num_layers:
@@ -165,10 +210,16 @@ class TrainingPlan:
     def to_dict(self):
         result = asdict(self)
         result["base_lora"] = self.base_lora.to_dict()
+        for key in ("hidden_size", "model_revision"):
+            if result["workload"][key] is None:
+                del result["workload"][key]
         # Preserve M1 plan/checkpoint serialization for the default executor.
         for stage in result["stages"]:
             if stage["execution_mode"] == "block":
                 del stage["execution_mode"]
+            for key in ("checkpoint_limit_bytes", "activation_cache_limit_bytes"):
+                if stage[key] is None:
+                    del stage[key]
         return result
 
     @classmethod
@@ -207,12 +258,22 @@ def solve_training_plan(
     baseline_resources = dict(baseline_resources or {})
     if not _integer(max_states, 1):
         raise ValueError("max_states must be positive")
-    by_start = {}
+    by_start, checkpoint_rejections = {}, []
     for candidate in candidates:
         if candidate.end > workload.num_layers:
             raise ValueError("Candidate exceeds model layer count")
         if any(key not in resource_budgets for key in candidate.resource_bytes):
             raise ValueError("Missing resource budget for candidate")
+        if candidate.execution_mode in LORA_CHECKPOINT_MODES:
+            if workload.hidden_size is None:
+                raise ValueError("Span checkpoint planning requires workload.hidden_size")
+            if candidate.checkpoint_limit_bytes is None:
+                candidate = replace(candidate, checkpoint_limit_bytes=DEFAULT_LORA_CHECKPOINT_BYTES)
+            if candidate.execution_mode in LORA_CACHED_MODES and candidate.activation_cache_limit_bytes is None:
+                candidate = replace(candidate, activation_cache_limit_bytes=DEFAULT_LORA_ACTIVATION_CACHE_BYTES)
+            if error := candidate.checkpoint_error(workload):
+                checkpoint_rejections.append(f"{candidate.worker}[{candidate.start}:{candidate.end}]: {error}")
+                continue
         by_start.setdefault(candidate.start, []).append(candidate)
     if any(k not in resource_budgets or v > resource_budgets[k] for k, v in baseline_resources.items()):
         raise ValueError("Baseline exceeds resource budget")
@@ -252,7 +313,12 @@ def solve_training_plan(
 
     visit(0, (), set(), baseline_resources, 0, 0.0, 0.0)
     if best is None:
-        raise ValueError("No feasible joint training plan in the supplied candidate catalogue")
+        detail = (
+            f"; excluded {len(checkpoint_rejections)} span choices, e.g. {checkpoint_rejections[0]}"
+            if checkpoint_rejections
+            else ""
+        )
+        raise ValueError(f"No feasible joint training plan in the supplied candidate catalogue{detail}")
     return TrainingPlan(
         workload, base_lora, best, resource_budgets, minimum_utility, max_parameters, baseline_resources
     )

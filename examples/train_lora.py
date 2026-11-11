@@ -60,7 +60,9 @@ def main():
     if args.checkpoint_every < 0:
         raise ValueError("checkpoint_every must be nonnegative")
     torch.manual_seed(args.seed)
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    revision = plan.workload.model_revision if plan else None
+    hub_revision = revision[3:] if revision and revision.startswith("hf:") else None
+    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=hub_revision)
     tokens = []
     for line in args.data.read_text().splitlines():
         if not line.strip():
@@ -97,6 +99,7 @@ def main():
         raise FileExistsError("Use a fresh output directory; final checkpoint already exists")
     kwargs = dict(
         initial_peers=args.initial_peers,
+        revision=hub_revision,
         torch_dtype=torch.float16,
         request_timeout=300,
         connect_timeout=30,

@@ -170,6 +170,18 @@ class Server:
             use_auth_token=token,
             revision=revision,
         )
+        from bloombee.server.lora import lora_enabled
+
+        if lora_enabled() and self.block_config.model_type in ("llama", "qwen3"):
+            from bloombee.utils.lora_model_revision import model_revision
+
+            identity = model_revision(converted_model_name_or_path, self.block_config)
+            self.block_config._bloombee_lora_model_revision = identity
+            self.block_config._name_or_path = converted_model_name_or_path
+            if identity.startswith("hf:") or self.block_config.model_type == "llama":
+                # Pin Hub weight loading and invalidate a local FlexGen conversion
+                # when the checkpoint at the same filesystem path changes.
+                self.revision = revision = identity.split(":", 1)[1]
 
         if dht_prefix is None:
             dht_prefix = self.block_config.dht_prefix

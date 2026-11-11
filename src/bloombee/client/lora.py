@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 import uuid
+from functools import cached_property
 from pathlib import Path
 
 import torch
@@ -21,6 +22,7 @@ from bloombee.data_structures import RemoteSpanInfo, ServerState
 from bloombee.server.lora import LoRAService
 from bloombee.utils.hivemind_compat import MSGPackSerializer, PeerID
 from bloombee.utils.lora import LORA_NAMESPACES, LoRAConfig, LoRAProjection, projection_shapes
+from bloombee.utils.lora_model_revision import model_revision
 from bloombee.utils.lora_profile import profile_fields, request_metadata, tensor_bytes, write_event
 from bloombee.utils.lossless_transport import deserialize_tensor_stream, serialize_torch_tensor
 
@@ -98,6 +100,8 @@ async def _call_lora_once(manager, span, inputs, metadata):
             response_metadata = MSGPackSerializer.loads(response.metadata)
             if response_metadata.get("version") != metadata["version"]:
                 raise RuntimeError("Worker did not acknowledge the requested LoRA protocol")
+            if "model_revision" in metadata and response_metadata.get("model_revision") != metadata["model_revision"]:
+                raise RuntimeError("Worker did not verify the LoRA base model revision")
             if response_metadata.get("cache_miss"):
                 raise _LoRACacheMiss(
                     sum(part.ByteSize() for part in parts) if profile else 0, response.ByteSize() if profile else 0
@@ -194,9 +198,15 @@ class LoRARemoteSequential(RemoteSequential):
             ]
         )
 
+    @cached_property
+    def base_model_revision(self):
+        return model_revision(self.config._name_or_path, self.config)
+
     def set_training_plan(self, plan, worker_peers):
         """Bind logical workers to explicit peer IDs; a failed worker never triggers rerouting."""
         plan.workload.validate_model(self.config, self.lora_config)
+        if plan.workload.model_revision is not None and plan.workload.model_revision != self.base_model_revision:
+            raise ValueError("Client base model revision does not match the training plan")
         if plan.lora_config != self.lora_config:
             raise ValueError("Plan ranks/scaling differ from the allocated adapter")
         if set(worker_peers) != {stage.worker for stage in plan.stages}:
@@ -204,6 +214,8 @@ class LoRARemoteSequential(RemoteSequential):
         peers = {worker: PeerID.from_base58(str(peer)) for worker, peer in worker_peers.items()}
         if len(set(peers.values())) != len(peers):
             raise ValueError("Planned workers must bind to distinct peers")
+        # Also resolve the local identity for legacy plans without a stored revision.
+        _ = self.base_model_revision
         self.training_plan, self.worker_peers = plan, peers
 
     def invalidate_adapter_cache(self):
@@ -275,8 +287,13 @@ class LoRARemoteSequential(RemoteSequential):
                 metadata["weight_gpu_percent"] = stage.weight_gpu_percent
                 metadata["planned_span"] = [span.start, span.end]
                 metadata["compute_dtype"] = self.training_plan.workload.input_dtype
+                metadata["model_revision"] = self.base_model_revision
                 if stage.execution_mode != "block":
                     metadata.update(version=3, execution_mode=stage.execution_mode)
+                    if stage.checkpoint_limit_bytes is not None:
+                        metadata["checkpoint_limit_bytes"] = stage.checkpoint_limit_bytes
+                    if stage.activation_cache_limit_bytes is not None:
+                        metadata["activation_cache_limit_bytes"] = stage.activation_cache_limit_bytes
                 if stage.execution_mode.startswith("span_cached_"):
                     versions = tuple((id(p), p._version) for p in self.adapters.parameters())
                     if versions != self._cache_parameter_versions:

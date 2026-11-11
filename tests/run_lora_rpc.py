@@ -25,6 +25,7 @@ from bloombee.data_structures import ServerState
 from bloombee.utils.dht import get_remote_module_infos
 from bloombee.utils.hivemind_compat import DHT
 from bloombee.utils.lora import LORA_EXECUTION_MODES, PROJECTIONS, projection_shapes
+from bloombee.utils.lora_model_revision import model_revision
 from bloombee.utils.training_plan import StageChoice, TrainingPlan, TrainingWorkload
 
 
@@ -337,7 +338,13 @@ def main():
                 )
             plan = TrainingPlan(
                 TrainingWorkload(
-                    str(base_dir.resolve()), 2, 2, 8, sum(sum(s) for s in projection_shapes(config).values())
+                    str(base_dir.resolve()),
+                    2,
+                    2,
+                    8,
+                    sum(sum(s) for s in projection_shapes(config).values()),
+                    hidden_size=config.hidden_size,
+                    model_revision=model_revision(base_dir, config),
                 ),
                 lora_config,
                 tuple(stages),
@@ -537,11 +544,24 @@ def main():
                 raise AssertionError("Worker accepted a mismatched offload plan")
             model.remote_layers.set_training_plan(plan, worker_peers)
             report["joint_plan"]["offload_mismatch_rejected"] = True
+            # Exercise the worker's revision check with a different immutable
+            # ID but identical peer, layer placement, shape and precision.
+            revision = model.remote_layers.base_model_revision
+            model.remote_layers.base_model_revision = "sha256:" + "0" * 64
+            try:
+                model(ids)
+            except Exception as error:
+                assert "base model revision" in str(error), str(error)
+            else:
+                raise AssertionError("Worker accepted a mismatched base model revision")
+            finally:
+                model.remote_layers.base_model_revision = revision
+            report["joint_plan"]["base_model_revision_mismatch_rejected"] = True
         if args.check_profile:
             profile_path = args.output / "profile.json"
             profile_args = []
             if plan:
-                profile_plan = replace(plan, workload=replace(plan.workload, batch_size=1, accumulation=2))
+                profile_plan = replace(plan, workload=replace(plan.workload, batch_size=1, accumulation=3))
                 profile_plan.save(args.output / "profile-plan.json")
                 (args.output / "profile-peers.json").write_text(json.dumps(worker_peers))
                 profile_args = [
@@ -566,7 +586,7 @@ def main():
                         "--sequence-length",
                         "8",
                         "--accumulation",
-                        "2",
+                        "3",
                         "--warmup",
                         "1",
                         "--steps",
@@ -579,9 +599,12 @@ def main():
                     timeout=180,
                 )
             profile = json.loads(profile_path.read_text())
-            assert len(profile["samples"]) == 3 and profile["effective_batch_size"] == 2
+            assert len(profile["samples"]) == 3 and profile["effective_batch_size"] == 3
             assert profile["samples"][0]["cuda_peak_allocated_since_reset_bytes"] > 0
-            assert profile["stage_profiles"] and all(s["samples"] == 4 for s in profile["stage_profiles"])
+            assert profile["stage_profiles"] and all(
+                s["samples"] == 6 and s["optimizer_step_samples"] == 2 and s["rpc_seconds"] > 0
+                for s in profile["stage_profiles"]
+            )
             report["profiling_cli"] = {
                 key: profile[key]
                 for key in ("steady_median_step_s", "effective_tokens_per_second", "trainable_parameters")

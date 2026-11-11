@@ -17,7 +17,7 @@ from collections import OrderedDict
 
 import torch
 
-from bloombee.utils.lora import LoRAConfig, projection_shapes
+from bloombee.utils.lora import DEFAULT_LORA_ACTIVATION_CACHE_BYTES, LoRAConfig, projection_shapes
 from bloombee.utils.lora_profile import profile_fields, tensor_bytes, write_event
 
 
@@ -79,7 +79,7 @@ class CachedLoRASpan:
             ttl,
         )
         self.activations = TensorLRU(
-            int(os.getenv("BLOOMBEE_LORA_ACTIVATION_CACHE_BYTES", 256 * 2**20))
+            int(os.getenv("BLOOMBEE_LORA_ACTIVATION_CACHE_BYTES", DEFAULT_LORA_ACTIVATION_CACHE_BYTES))
             if activation_bytes is None
             else activation_bytes,
             ttl,

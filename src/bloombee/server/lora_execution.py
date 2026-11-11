@@ -15,7 +15,7 @@ import time
 import torch
 
 from bloombee.server.lora_pool import LoRATaskPool
-from bloombee.utils.lora import LORA_EXECUTION_MODES, LoRAConfig
+from bloombee.utils.lora import DEFAULT_LORA_CHECKPOINT_BYTES, LORA_EXECUTION_MODES, LoRAConfig
 from bloombee.utils.lora_profile import profile_fields, synchronize, tensor_bytes, write_event
 
 
@@ -142,7 +142,7 @@ def attach_lora_span_pool(backends):
     if not backends or not all(hasattr(b, "lora_pool") for b in backends.values()):
         return
     executor = LoRASpanExecutor(
-        backends, checkpoint_bytes=int(os.getenv("BLOOMBEE_LORA_SPAN_CHECKPOINT_BYTES", 256 * 2**20))
+        backends, checkpoint_bytes=int(os.getenv("BLOOMBEE_LORA_SPAN_CHECKPOINT_BYTES", DEFAULT_LORA_CHECKPOINT_BYTES))
     )
     pool = LoRATaskPool(
         executor,

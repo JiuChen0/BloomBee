@@ -28,13 +28,15 @@ from bloombee.utils.lora_profile import memory_snapshot, profile_step, synchroni
 from bloombee.utils.training_plan import TrainingPlan
 
 
-def summarize_stage_profiles(events, config):
-    """Matched steady-state RPC pairs; these costs can populate StageChoice.rpc_seconds.
+def summarize_stage_profiles(events, config, *, accumulation=1):
+    """Keep per-microbatch diagnostics and estimate cost from complete optimizer steps.
 
     Keep each actual peer/span separate. A deployment operator must still provide
     shared-resource reservations and calibrated rank utility before planning.
     """
-    pairs, samples = defaultdict(dict), defaultdict(list)
+    pairs = defaultdict(dict)
+    samples = defaultdict(lambda: defaultdict(dict))
+    steps = set()
     for event in events:
         if event["kind"] == "rpc" and event.get("warmup") is False:
             if event["phase"] in pairs[event["id"]]:
@@ -47,19 +49,35 @@ def summarize_stage_profiles(events, config):
         key = (*[f[k] for k in ("peer", "start", "end")], f.get("execution_mode", "block"))
         if key != (*[b[k] for k in ("peer", "start", "end")], b.get("execution_mode", "block")):
             raise ValueError("Forward/backward profile route differs")
-        samples[key].append(f["total_s"] + b["total_s"])
-    return [
-        dict(
-            peer=peer,
-            execution_mode=mode,
-            start=start,
-            end=end,
-            samples=len(values),
-            median_forward_backward_rpc_s=statistics.median(values),
-            rank_by_layer=[{t: config.rank_for(i, t) for t in config.target_modules} for i in range(start, end)],
+        step, microbatch = f["step"], f["microbatch"]
+        if (step, microbatch) != (b["step"], b["microbatch"]) or not 0 <= microbatch < accumulation:
+            raise ValueError("Invalid forward/backward profile step or microbatch")
+        if microbatch in samples[key][step]:
+            raise ValueError("Duplicate span profile within a microbatch")
+        samples[key][step][microbatch] = f["total_s"] + b["total_s"]
+        steps.add(step)
+    profiles = []
+    for (peer, start, end, mode), by_step in sorted(samples.items()):
+        values = [seconds for batch in by_step.values() for seconds in batch.values()]
+        complete = [sum(batch.values()) for batch in by_step.values() if len(batch) == accumulation]
+        # Adaptive routes can measure a span in only part of a step. Such
+        # samples are useful diagnostics, but cannot cost a fixed-stage plan.
+        step_cost = statistics.median(complete) if len(complete) == len(steps) else None
+        profiles.append(
+            dict(
+                peer=peer,
+                execution_mode=mode,
+                start=start,
+                end=end,
+                samples=len(values),
+                median_forward_backward_rpc_s=statistics.median(values),
+                optimizer_step_samples=len(complete),
+                median_step_rpc_s=step_cost,
+                rpc_seconds=step_cost / accumulation if step_cost is not None else None,
+                rank_by_layer=[{t: config.rank_for(i, t) for t in config.target_modules} for i in range(start, end)],
+            )
         )
-        for (peer, start, end, mode), values in sorted(samples.items())
-    ]
+    return profiles
 
 
 def run_profile(model, batches, optimizer, *, warmup, steps):
@@ -152,10 +170,12 @@ def main():
     os.environ["BLOOMBEE_LORA_PROFILE_DIR"] = str(args.output.with_suffix(".traces").resolve())
     torch.manual_seed(args.seed)
     torch.set_num_threads(2)
+    revision = plan.workload.model_revision if plan else None
     base = AutoDistributedModelForCausalLM.from_pretrained(
         args.model,
         initial_peers=args.initial_peers,
         dht_prefix=args.dht_prefix,
+        revision=revision[3:] if revision and revision.startswith("hf:") else None,
         torch_dtype=torch.float16,
         request_timeout=300,
         connect_timeout=30,
@@ -190,6 +210,7 @@ def main():
             else "stateless_lora_v1",
             training_plan=plan.to_dict() if plan else None,
             model=args.model,
+            model_revision=model.remote_layers.base_model_revision,
             model_config=base.config.to_dict(),
             adapter_config=model.lora_config.to_dict(),
             host=socket.gethostname(),
@@ -214,7 +235,7 @@ def main():
             for path in args.output.with_suffix(".traces").glob("lora-*.jsonl")
             for line in path.read_text().splitlines()
         ]
-        report["stage_profiles"] = summarize_stage_profiles(events, config)
+        report["stage_profiles"] = summarize_stage_profiles(events, config, accumulation=args.accumulation)
         if plan and any(s.execution_mode != "block" for s in plan.stages):
             report["execution_mode"] = "stateless_lora_span_v3"
         if plan and any(s.execution_mode.startswith("span_cached_") for s in plan.stages):

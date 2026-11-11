@@ -105,6 +105,48 @@ def test_search_budget_is_explicit_and_invalid_plans_are_rejected():
         replace(plan.stages[0], weight_gpu_percent=50.5)
 
 
+def test_planner_excludes_spans_over_checkpoint_or_activation_cache_limits():
+    args = problem()
+    args.update(
+        workload=replace(args["workload"], hidden_size=4),
+        minimum_utility=0,
+        resource_budgets={"shared_gpu": 20},
+        max_parameters=1024,
+    )
+    stage = replace(args["candidates"][-1], execution_mode="span_cached_gpu")
+    # A boundary is 64 bytes. Backward reconstruction needs 64, retention 128.
+    backward_over_limit = replace(stage, checkpoint_limit_bytes=63)
+    retention_over_limit = replace(stage, activation_cache_limit_bytes=127)
+    recompute = replace(stage, execution_mode="span_recompute", rpc_seconds=10)
+    args["candidates"] = [backward_over_limit, retention_over_limit, recompute]
+    assert solve_training_plan(**args).stages == (recompute,)
+    with pytest.raises(ValueError, match="checkpoint budget exceeded"):
+        solve_training_plan(**{**args, "candidates": [backward_over_limit]})
+    with pytest.raises(ValueError, match="activation cache budget exceeded"):
+        solve_training_plan(**{**args, "candidates": [retention_over_limit]})
+    zero = replace(stage, checkpoint_limit_bytes=64, activation_cache_limit_bytes=0)
+    assert solve_training_plan(**{**args, "candidates": [zero]}).stages == (zero,)
+
+
+def test_local_base_revision_matches_copied_files_and_detects_changed_weights(tmp_path):
+    from types import SimpleNamespace
+
+    from bloombee.utils.lora_model_revision import model_revision
+
+    first, second = (tmp_path / name for name in ("first", "second"))
+    config = SimpleNamespace(_commit_hash="a" * 40)
+    for root in (first, second):
+        root.mkdir()
+        (root / "config.json").write_text("{}")
+        (root / "model.safetensors").write_bytes(b"weights-a")
+    assert model_revision(first, config) == model_revision(second, config)
+    (second / "model.safetensors").write_bytes(b"weights-b")
+    assert model_revision(first, config) != model_revision(second, config)
+    assert model_revision("org/model", config) == "hf:" + "a" * 40
+    with pytest.raises(ValueError, match="pinned Hub commit"):
+        model_revision("org/model", SimpleNamespace())
+
+
 @pytest.mark.parametrize(
     "patterns",
     [
@@ -147,6 +189,62 @@ def test_worker_rejects_deployment_with_extra_unplanned_layers():
             pytest.fail("Mismatched placement was accepted")
 
     with pytest.raises(ValueError, match="layer placement"):
+        asyncio.run(call())
+
+
+@pytest.mark.parametrize(
+    "overrides, match",
+    [
+        ({"model_revision": "sha256:" + "b" * 64}, "base model revision"),
+        ({"checkpoint_limit_bytes": 64}, "checkpoint limit does not match"),
+        ({}, "checkpoint budget exceeded"),
+    ],
+)
+def test_worker_rejects_incompatible_plan_before_forward_runtime_task(overrides, match):
+    import asyncio
+    from types import SimpleNamespace
+
+    from bloombee.server.lora import LoRAService
+
+    revision = "sha256:" + "a" * 64
+    x = torch.zeros(1, 8, 4, dtype=torch.float16)
+
+    async def gather(requests, context):
+        return (
+            "model.0 model.1",
+            [x, *([torch.empty(0)] * 8)],
+            dict(
+                version=3,
+                config=LoRAConfig().to_dict(),
+                planned_span=[0, 2],
+                execution_mode="span_gpu",
+                backward=False,
+                training=True,
+                seed=1,
+                **{"model_revision": revision, **overrides},
+            ),
+        )
+
+    async def submit_task(*args, **kwargs):
+        pytest.fail("An incompatible plan reached Runtime")
+
+    span_pool = SimpleNamespace(process_func=SimpleNamespace(checkpoint_bytes=63), submit_task=submit_task)
+    backend = SimpleNamespace(
+        config=SimpleNamespace(_bloombee_lora_model_revision=revision),
+        lora_pool=object(),
+        lora_span_pool=span_pool,
+    )
+    service = LoRAService(
+        SimpleNamespace(
+            request_timeout=5, _gather_inputs=gather, module_backends={"model.0": backend, "model.1": backend}
+        )
+    )
+
+    async def call():
+        async for _ in service.rpc_lora_stream(None, SimpleNamespace(remote_id="test-peer")):
+            pytest.fail("An incompatible plan received a response")
+
+    with pytest.raises(ValueError, match=match):
         asyncio.run(call())
 
 

@@ -5,8 +5,14 @@ Input JSON keys: workload (TrainingWorkload), base_lora (LoRAConfig), candidates
 baseline_resources and max_states. See these dataclasses for the strict schema.
 Every candidate must describe the SAME model, precision, targets, dropout,
 microbatch shape and serial execution mode. Utility is a supplied quality proxy.
+Use each stage profile's rpc_seconds field (derived from complete optimizer
+steps), not median_forward_backward_rpc_s. Checkpoint modes need workload.hidden_size.
+Candidate checkpoint_limit_bytes and activation_cache_limit_bytes default to
+the worker defaults. Explicitly set the activation limit to 0 to plan a
+cached adapter mode with activation storage disabled.
+Set workload.model_revision from the profile report to pin the measured base.
 
-Launch workers using printed deployment hints, then pass --plan and a
+Launch workers using the printed arguments and environment, then pass --plan and a
 --worker_peers JSON mapping to examples/train_lora.py. Worker startup is explicit;
 this command does not kill or reconfigure an existing swarm.
 """
@@ -30,6 +36,8 @@ def main():
     data["candidates"] = [StageChoice(**s) for s in data["candidates"]]
     plan = solve_training_plan(**data)
     plan.save(args.output)
+    revision = plan.workload.model_revision
+    revision_args = ["--revision", revision[3:]] if revision and revision.startswith("hf:") else []
     print(
         json.dumps(
             dict(
@@ -37,7 +45,18 @@ def main():
                 parameters=plan.parameters,
                 utility=plan.utility,
                 resources=plan.resources,
-                worker_args={s.worker: s.worker_args() for s in plan.stages},
+                worker_args={s.worker: s.worker_args() + revision_args for s in plan.stages},
+                worker_env={
+                    s.worker: {
+                        name: str(limit)
+                        for name, limit in (
+                            ("BLOOMBEE_LORA_SPAN_CHECKPOINT_BYTES", s.checkpoint_limit_bytes),
+                            ("BLOOMBEE_LORA_ACTIVATION_CACHE_BYTES", s.activation_cache_limit_bytes),
+                        )
+                        if limit is not None
+                    }
+                    for s in plan.stages
+                },
             ),
             indent=2,
         )

@@ -115,6 +115,8 @@ def test_stage_profile_cost_uses_matched_steady_pairs_and_physical_ranks():
             id=str(i),
             phase=phase,
             warmup=i == 0,
+            step=i,
+            microbatch=0,
             peer="worker-a",
             start=0,
             end=2,
@@ -127,6 +129,28 @@ def test_stage_profile_cost_uses_matched_steady_pairs_and_physical_ranks():
     result = benchmark.summarize_stage_profiles(events, config)
     assert len(result) == 1 and result[0]["samples"] == 2
     assert result[0]["median_forward_backward_rpc_s"] == 3
+    assert result[0]["median_step_rpc_s"] == 3
     assert result[0]["rank_by_layer"] == [{"q_proj": 8, "v_proj": 8}, {"q_proj": 2, "v_proj": 8}]
     with pytest.raises(ValueError, match="Incomplete"):
         benchmark.summarize_stage_profiles(events[:-1], config)
+
+    cached = [
+        {
+            **events[2],
+            "id": f"{step}:{microbatch}",
+            "phase": phase,
+            "step": step,
+            "microbatch": microbatch,
+            "execution_mode": "span_cached_gpu",
+            "total_s": seconds if phase == "forward" else 0,
+        }
+        for step, costs in enumerate(((14, 5, 5), (17, 5, 5), (14, 5, 5)))
+        for microbatch, seconds in enumerate(costs)
+        for phase in ("forward", "backward")
+    ]
+    (profile,) = benchmark.summarize_stage_profiles(cached, config, accumulation=3)
+    assert profile["median_forward_backward_rpc_s"] == 5
+    assert profile["optimizer_step_samples"] == 3
+    assert profile["median_step_rpc_s"] == 24 and profile["rpc_seconds"] == 8
+    (incomplete,) = benchmark.summarize_stage_profiles(cached[:-2], config, accumulation=3)
+    assert incomplete["rpc_seconds"] is None
