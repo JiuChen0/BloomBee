@@ -100,7 +100,7 @@ def main():
     kwargs = dict(
         initial_peers=args.initial_peers,
         revision=hub_revision,
-        torch_dtype=torch.float16,
+        torch_dtype=plan.workload.torch_dtype if plan else torch.float16,
         request_timeout=300,
         connect_timeout=30,
         max_retries=1,

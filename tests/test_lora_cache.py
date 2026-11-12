@@ -32,11 +32,16 @@ def test_cached_forward_backward_duplicate_and_fallback_match_block(mode, monkey
     calls = []
     original = lora.run_lora_block
 
-    def counted(*args):
+    def counted(*args, **kwargs):
         calls.append(1)
-        return original(*args)
+        return original(*args, **kwargs)
 
     monkeypatch.setattr(lora, "run_lora_block", counted)
+
+    def unexpected_block_validation(*args):
+        pytest.fail("A validated adapter snapshot was rescanned by block execution")
+
+    monkeypatch.setattr(lora, "validate_lora_parameters", unexpected_block_validation)
     out = cache(x, torch.empty(0), {**meta, "backward": False}, params)
     assert out[-1].tolist() == [1, 0]
     torch.testing.assert_close(out[0], expected, rtol=0, atol=0)

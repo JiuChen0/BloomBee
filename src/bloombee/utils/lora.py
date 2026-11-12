@@ -17,11 +17,27 @@ from torch.nn import functional as F
 LORA_PROTOCOL_VERSION = 1
 LORA_NAMESPACE = "lora-v1"
 LORA_NAMESPACES = {1: LORA_NAMESPACE, 2: "lora-v2", 3: "lora-v3", 4: "lora-v4"}
-LORA_EXECUTION_MODES = ("block", "span_cpu", "span_gpu", "span_recompute", "span_cached_cpu", "span_cached_gpu")
-LORA_CACHED_MODES = LORA_EXECUTION_MODES[4:]
-LORA_CHECKPOINT_MODES = ("span_cpu", "span_gpu", *LORA_CACHED_MODES)
+LORA_MODES = {
+    "block": (2, "block"),
+    "span_cpu": (3, "span_cpu"),
+    "span_gpu": (3, "span_gpu"),
+    "span_recompute": (3, "span_recompute"),
+    "span_cached_cpu": (4, "span_cpu"),
+    "span_cached_gpu": (4, "span_gpu"),
+}
+LORA_EXECUTION_MODES = tuple(LORA_MODES)
+LORA_SPAN_MODES = tuple(mode for mode, (version, _) in LORA_MODES.items() if version == 3)
+LORA_CACHED_MODES = tuple(mode for mode, (version, _) in LORA_MODES.items() if version == 4)
+LORA_CHECKPOINT_MODES = tuple(
+    mode for mode, (_, executor) in LORA_MODES.items() if executor in ("span_cpu", "span_gpu")
+)
 DEFAULT_LORA_CHECKPOINT_BYTES = 256 * 2**20
 DEFAULT_LORA_ACTIVATION_CACHE_BYTES = 256 * 2**20
+LORA_CACHE_ENV = {
+    "activation_cache_limit_bytes": ("BLOOMBEE_LORA_ACTIVATION_CACHE_BYTES", DEFAULT_LORA_ACTIVATION_CACHE_BYTES),
+    "adapter_cache_limit_bytes": ("BLOOMBEE_LORA_ADAPTER_CACHE_BYTES", 256 * 2**20),
+    "cache_ttl_seconds": ("BLOOMBEE_LORA_CACHE_TTL", 300.0),
+}
 PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 _ACTIVE_LORA = ContextVar("bloombee_request_lora", default=None)
 
@@ -117,6 +133,23 @@ def projection_shapes(config):
     }
 
 
+def validate_lora_parameters(config, model_config, layer, parameters):
+    config.validate_layers(model_config.num_hidden_layers)
+    if len(parameters) != 2 * len(config.target_modules):
+        raise ValueError("LoRA parameter count mismatch")
+    shapes = projection_shapes(model_config)
+    for index, target in enumerate(config.target_modules):
+        out_features, in_features = shapes[target]
+        a, b = parameters[2 * index : 2 * index + 2]
+        rank = config.rank_for(layer, target)
+        if a.shape != (rank, in_features) or b.shape != (out_features, rank):
+            raise ValueError(f"Invalid LoRA A/B shapes for {target}")
+        if a.dtype != torch.float32 or b.dtype != torch.float32:
+            raise ValueError("LoRA optimizer/master parameters must be float32")
+        if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+            raise ValueError("LoRA parameters must be finite")
+
+
 class LoRAProjection(nn.Module):
     def __init__(self, in_features, out_features, rank, *, device=None):
         super().__init__()
@@ -166,13 +199,16 @@ def lora_delta(inputs, projection):
     return F.linear(F.linear(hidden, a), b) * (config.alpha_for(layer, projection) / config.rank_for(layer, projection))
 
 
-def lora_linear(inputs, weight, projection):
-    output = F.linear(inputs, weight)
+def _add_lora_delta(output, inputs, projection):
     delta = lora_delta(inputs, projection)
     # Add in the adapter's master precision, then round once to the base dtype,
     # matching PEFT's mixed-dtype in-place addition. Rounding delta first changes
     # nonzero adapters in FP16/BF16, particularly near cancellation.
     return output if delta is None else (output + delta).to(output.dtype)
+
+
+def lora_linear(inputs, weight, projection):
+    return _add_lora_delta(F.linear(inputs, weight), inputs, projection)
 
 
 def install_lora_hooks(module):
@@ -182,8 +218,7 @@ def install_lora_hooks(module):
         if target in PROJECTIONS and isinstance(child, nn.Linear) and not getattr(child, "_bb_lora_hook", False):
 
             def add_delta(linear, args, output, projection=target):
-                delta = lora_delta(args[0], projection)
-                return output if delta is None else (output + delta).to(output.dtype)
+                return _add_lora_delta(output, args[0], projection)
 
             child.register_forward_hook(add_delta)
             child._bb_lora_hook = True

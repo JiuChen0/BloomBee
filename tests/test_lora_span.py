@@ -85,9 +85,9 @@ def test_span_matches_block_outputs_gradients_dropout_and_base_weights(mode, dev
     calls = []
     original = lora.run_lora_block
 
-    def counted(backend, inputs, gradient, metadata, *parameters):
+    def counted(backend, inputs, gradient, metadata, *parameters, **kwargs):
         calls.append(bool(gradient.numel()))
-        return original(backend, inputs, gradient, metadata, *parameters)
+        return original(backend, inputs, gradient, metadata, *parameters, **kwargs)
 
     monkeypatch.setattr(lora, "run_lora_block", counted)
     executor = LoRASpanExecutor(backends, checkpoint_bytes=2 * x.numel() * x.element_size())

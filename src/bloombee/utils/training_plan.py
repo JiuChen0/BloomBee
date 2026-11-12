@@ -19,9 +19,11 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
+from bloombee.constants import DTYPE_MAP
 from bloombee.utils.lora import (
     DEFAULT_LORA_ACTIVATION_CACHE_BYTES,
     DEFAULT_LORA_CHECKPOINT_BYTES,
+    LORA_CACHE_ENV,
     LORA_CACHED_MODES,
     LORA_CHECKPOINT_MODES,
     LORA_EXECUTION_MODES,
@@ -50,6 +52,7 @@ class TrainingWorkload:
     accumulation: int = 1
     hidden_size: Optional[int] = None
     model_revision: Optional[str] = None
+    model_type: Optional[str] = None
 
     def __post_init__(self):
         if (
@@ -63,6 +66,10 @@ class TrainingWorkload:
             raise ValueError("Invalid training workload")
         if self.input_dtype not in _DTYPE_BYTES:
             raise ValueError("Unsupported training input dtype")
+        if self.model_type is not None and self.model_type not in ("llama", "qwen3"):
+            raise ValueError("Unsupported LoRA training model type")
+        if self.model_type == "llama" and self.input_dtype != "torch.float16":
+            raise ValueError("FlexGen LLaMA training plans require FP16")
         if self.hidden_size is not None and not _integer(self.hidden_size, 1):
             raise ValueError("Training workload hidden_size must be a positive integer")
         if self.model_revision is not None and not valid_model_revision(self.model_revision):
@@ -73,10 +80,21 @@ class TrainingWorkload:
         if (
             config._name_or_path != self.model
             or config.num_hidden_layers != self.num_layers
+            or (self.model_type is not None and config.model_type != self.model_type)
             or (self.hidden_size is not None and config.hidden_size != self.hidden_size)
             or sum(sum(shapes[t]) for t in lora.target_modules) != self.parameters_per_rank
         ):
             raise ValueError("Training plan model or projection dimensions do not match")
+        if config.model_type == "llama" and self.input_dtype != "torch.float16":
+            raise ValueError("FlexGen LLaMA training plans require FP16")
+
+    @property
+    def dtype_name(self):
+        return self.input_dtype.split(".")[-1]
+
+    @property
+    def torch_dtype(self):
+        return DTYPE_MAP[self.dtype_name]
 
 
 @dataclass(frozen=True)
@@ -93,6 +111,8 @@ class StageChoice:
     execution_mode: str = "block"
     checkpoint_limit_bytes: Optional[int] = None
     activation_cache_limit_bytes: Optional[int] = None
+    adapter_cache_limit_bytes: Optional[int] = None
+    cache_ttl_seconds: Optional[float] = None
 
     def __post_init__(self):
         object.__setattr__(self, "ranks", tuple(self.ranks))
@@ -101,9 +121,18 @@ class StageChoice:
         for limit, modes in (
             (self.checkpoint_limit_bytes, LORA_CHECKPOINT_MODES),
             (self.activation_cache_limit_bytes, LORA_CACHED_MODES),
+            (self.adapter_cache_limit_bytes, LORA_CACHED_MODES),
         ):
             if limit is not None and (not _integer(limit) or self.execution_mode not in modes):
-                raise ValueError("Invalid checkpoint or activation cache limit for the execution mode")
+                raise ValueError("Invalid checkpoint or cache limit for the execution mode")
+        if self.cache_ttl_seconds is not None and (
+            self.execution_mode not in LORA_CACHED_MODES
+            or isinstance(self.cache_ttl_seconds, bool)
+            or not isinstance(self.cache_ttl_seconds, (int, float))
+            or not math.isfinite(self.cache_ttl_seconds)
+            or self.cache_ttl_seconds <= 0
+        ):
+            raise ValueError("Invalid adapter cache TTL for the execution mode")
         if not self.worker or not self.profile_id or not _integer(self.start) or not _integer(self.end, self.start + 1):
             raise ValueError("Invalid worker, profile or layer span")
         if len(self.ranks) != self.end - self.start or any(not _integer(r, 1) or r > 256 for r in self.ranks):
@@ -210,14 +239,14 @@ class TrainingPlan:
     def to_dict(self):
         result = asdict(self)
         result["base_lora"] = self.base_lora.to_dict()
-        for key in ("hidden_size", "model_revision"):
+        for key in ("hidden_size", "model_revision", "model_type"):
             if result["workload"][key] is None:
                 del result["workload"][key]
         # Preserve M1 plan/checkpoint serialization for the default executor.
         for stage in result["stages"]:
             if stage["execution_mode"] == "block":
                 del stage["execution_mode"]
-            for key in ("checkpoint_limit_bytes", "activation_cache_limit_bytes"):
+            for key in ("checkpoint_limit_bytes", *LORA_CACHE_ENV):
                 if stage[key] is None:
                     del stage[key]
         return result
@@ -256,6 +285,10 @@ def solve_training_plan(
     client-relayed RPC, so no fictitious worker-to-worker edge cost is added.
     """
     baseline_resources = dict(baseline_resources or {})
+    if workload.model_revision is None:
+        raise ValueError("New training plans require workload.model_revision from the profile")
+    if workload.input_dtype != "torch.float16" and workload.model_type != "qwen3":
+        raise ValueError("Non-FP16 LoRA planning requires workload.model_type='qwen3'")
     if not _integer(max_states, 1):
         raise ValueError("max_states must be positive")
     by_start, checkpoint_rejections = {}, []
@@ -264,6 +297,10 @@ def solve_training_plan(
             raise ValueError("Candidate exceeds model layer count")
         if any(key not in resource_budgets for key in candidate.resource_bytes):
             raise ValueError("Missing resource budget for candidate")
+        if candidate.execution_mode in LORA_CACHED_MODES and (
+            candidate.adapter_cache_limit_bytes is None or candidate.cache_ttl_seconds is None
+        ):
+            raise ValueError("Cached stage candidates require measured adapter_cache_limit_bytes and cache_ttl_seconds")
         if candidate.execution_mode in LORA_CHECKPOINT_MODES:
             if workload.hidden_size is None:
                 raise ValueError("Span checkpoint planning requires workload.hidden_size")

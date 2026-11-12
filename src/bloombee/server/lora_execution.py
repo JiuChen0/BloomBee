@@ -14,8 +14,9 @@ import time
 
 import torch
 
+from bloombee.server.lora_cache import CachedLoRASpan, configured_cache_settings
 from bloombee.server.lora_pool import LoRATaskPool
-from bloombee.utils.lora import DEFAULT_LORA_CHECKPOINT_BYTES, LORA_EXECUTION_MODES, LoRAConfig
+from bloombee.utils.lora import DEFAULT_LORA_CHECKPOINT_BYTES, LORA_SPAN_MODES, LoRAConfig
 from bloombee.utils.lora_profile import profile_fields, synchronize, tensor_bytes, write_event
 
 
@@ -38,7 +39,7 @@ def move_tensor(tensor, device, metadata, purpose):
             seconds=time.perf_counter() - started,
             source=str(tensor.device),
             destination=str(device),
-            tensor_bytes=tensor_bytes((tensor,))
+            tensor_bytes=tensor_bytes((tensor,)),
         )
     return result
 
@@ -48,6 +49,7 @@ class LoRASpanExecutor:
         if isinstance(checkpoint_bytes, bool) or not isinstance(checkpoint_bytes, int) or checkpoint_bytes < 0:
             raise ValueError("Span checkpoint budget must be a nonnegative byte count")
         self.backends, self.checkpoint_bytes = dict(backends), checkpoint_bytes
+        self.cache_settings = configured_cache_settings()
         devices = {torch.device(b.lora_pool.device) for b in backends.values()}
         if len(devices) != 1:
             raise ValueError("A LoRA span executor requires a single compute device")
@@ -64,14 +66,22 @@ class LoRASpanExecutor:
 
     def __call__(self, inputs, grad_outputs, metadata, *parameters):
         if metadata.get("version") == 4:
-            from bloombee.server.lora_cache import CachedLoRASpan
-
             if not hasattr(self, "cache"):
                 self.cache = CachedLoRASpan(self)
             return self.cache(inputs, grad_outputs, metadata, parameters)
         return self.run(inputs, grad_outputs, metadata, parameters)
 
-    def run(self, inputs, grad_outputs, metadata, parameters, *, checkpoints=None, save_forward=False):
+    def run(
+        self,
+        inputs,
+        grad_outputs,
+        metadata,
+        parameters,
+        *,
+        checkpoints=None,
+        save_forward=False,
+        parameters_validated=False
+    ):
         from bloombee.server.lora import run_lora_block
 
         names = metadata["span_uids"]
@@ -80,7 +90,7 @@ class LoRASpanExecutor:
         if not indices or indices != list(range(indices[0], indices[0] + len(indices))):
             raise ValueError("Span layers must be contiguous")
         mode = metadata["execution_mode"]
-        if mode not in LORA_EXECUTION_MODES[1:4]:
+        if mode not in LORA_SPAN_MODES:
             raise ValueError("Unsupported span execution mode")
         width = 2 * len(LoRAConfig(**metadata["config"]).target_modules)
         if len(parameters) != width * len(names):
@@ -96,7 +106,12 @@ class LoRASpanExecutor:
         def block(j, x, grad):
             params = [move_tensor(p, self.device, metadata, "adapter") for p in parameters[j * width : (j + 1) * width]]
             return run_lora_block(
-                backends[j], x, grad, {**metadata, "seed": metadata["seed"] + j, "layer_index": indices[j]}, *params
+                backends[j],
+                x,
+                grad,
+                {**metadata, "seed": metadata["seed"] + j, "layer_index": indices[j]},
+                *params,
+                parameters_validated=parameters_validated,
             )
 
         def prefix(end, checkpoints=None):
@@ -133,7 +148,7 @@ class LoRASpanExecutor:
                 **fields,
                 execution_mode=mode,
                 checkpoint_bytes=required,
-                checkpoint_limit_bytes=self.checkpoint_bytes
+                checkpoint_limit_bytes=self.checkpoint_bytes,
             )
         return (grad, *(g for layer in parameter_grads for g in layer))
 

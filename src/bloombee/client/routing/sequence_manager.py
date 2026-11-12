@@ -156,6 +156,26 @@ class RemoteSequenceManager:
                 )
         return result
 
+    def _ensure_routing_ready(self):
+        with self._thread_start_lock:
+            if not self.is_alive():
+                self._thread.start()
+        if not self.ready.is_set():
+            self.update(wait=True)
+
+    def make_fixed_sequence(self, placements) -> List[RemoteSpanInfo]:
+        """Resolve (worker name, peer, start, end) assignments without rerouting."""
+        self._ensure_routing_ready()
+        route = []
+        with self.lock_changes:
+            blocks = self.state.sequence_info.block_infos
+            for worker, peer, start, end in placements:
+                infos = [blocks[i].servers.get(peer) for i in range(start, end)]
+                if any(info is None or info.state != ServerState.ONLINE for info in infos):
+                    raise RuntimeError(f"Planned worker {worker} is unavailable; explicit replanning is required")
+                route.append(RemoteSpanInfo(peer, start, end, infos[0]))
+        return route
+
     def make_sequence(
         self,
         start_index: int = 0,
@@ -171,11 +191,7 @@ class RemoteSequenceManager:
         :param end_index: optional index of the last module (non-inclusive), default = after last of block uids
         :param mode: one of ["max_throughput", "min_latency"]
         """
-        with self._thread_start_lock:
-            if not self.is_alive():
-                self._thread.start()
-        if not self.ready.is_set():
-            self.update(wait=True)  # this will await an existing update or trigger a new one (if not updating)
+        self._ensure_routing_ready()
 
         end_index = end_index if end_index is not None else len(self)
 

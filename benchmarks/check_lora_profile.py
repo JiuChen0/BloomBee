@@ -9,6 +9,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
+from bloombee.utils.lora import LORA_CACHED_MODES
 from bloombee.utils.lora_profile import expected_stateless_cost
 
 
@@ -33,7 +34,7 @@ def audit_events(events, require_workers=False):
         pairs += 1
         durations["client_rpc_s"] += f["total_s"] + b["total_s"]
         boundary = f["response_tensor_bytes"]
-        cached = f.get("execution_mode", "").startswith("span_cached_")
+        cached = f.get("execution_mode") in LORA_CACHED_MODES
         adapter = f["adapter_tensor_bytes"] if cached else f["request_tensor_bytes"] - boundary
         expected = expected_stateless_cost(f["end"] - f["start"], boundary, adapter)
         mode = f.get("execution_mode", "block")

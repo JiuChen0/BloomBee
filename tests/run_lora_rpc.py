@@ -22,9 +22,10 @@ from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM, Qw
 
 from bloombee import AutoDistributedModelForCausalLM, DistributedLoRA, LoRAConfig as BBLoRAConfig
 from bloombee.data_structures import ServerState
+from bloombee.server.lora_cache import configured_cache_settings
 from bloombee.utils.dht import get_remote_module_infos
 from bloombee.utils.hivemind_compat import DHT
-from bloombee.utils.lora import LORA_EXECUTION_MODES, PROJECTIONS, projection_shapes
+from bloombee.utils.lora import LORA_CACHED_MODES, LORA_EXECUTION_MODES, PROJECTIONS, projection_shapes
 from bloombee.utils.lora_model_revision import model_revision
 from bloombee.utils.training_plan import StageChoice, TrainingPlan, TrainingWorkload
 
@@ -147,6 +148,7 @@ def check_cli_resume(base_dir, peers, prefix, output, plan=None, worker_peers=No
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--family", choices=("llama", "qwen3"), default="llama")
+    parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="float16")
     parser.add_argument("--stages", type=int, choices=(1, 2), default=2)
     parser.add_argument("--weight-gpu-percent", type=int, default=100)
     parser.add_argument("--cache-gpu-percent", type=int, default=100)
@@ -161,10 +163,13 @@ def main():
     parser.add_argument("--execution-mode", choices=LORA_EXECUTION_MODES, default="block")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.dtype != "float16" and (args.family != "qwen3" or not args.check_plan):
+        parser.error("Non-FP16 tests require Qwen3 and --check-plan")
+    dtype = getattr(torch, args.dtype)
     if args.execution_mode != "block" and not args.check_plan:
         parser.error("Span tests require --check-plan")
     if args.check_cache_recovery and (
-        not args.execution_mode.startswith("span_cached_") or os.getenv("BLOOMBEE_LORA_CACHE_TTL") != "1"
+        args.execution_mode not in LORA_CACHED_MODES or os.getenv("BLOOMBEE_LORA_CACHE_TTL") != "1"
     ):
         parser.error("Cache recovery requires a cached mode and BLOOMBEE_LORA_CACHE_TTL=1")
     if not torch.cuda.is_available():
@@ -191,7 +196,7 @@ def main():
     )
     config._attn_implementation = "eager"
     # FP16 on disk: FlexGen's canonical conversion stores FP16 base weights.
-    klass(config).half().save_pretrained(base_dir)
+    klass(config).to(dtype=dtype).save_pretrained(base_dir)
     save_tiny_tokenizer(base_dir)
     prefix = "lora_" + uuid.uuid4().hex[:12]
     dht = DHT(start=True, host_maddrs=["/ip4/127.0.0.1/tcp/0"], use_relay=False)
@@ -202,7 +207,7 @@ def main():
         "stages": args.stages,
         "weight_gpu_percent": args.weight_gpu_percent,
         "cache_gpu_percent": args.cache_gpu_percent,
-        "dtype": "float16 base / float32 LoRA",
+        "dtype": f"{args.dtype} base / float32 LoRA",
         "device": torch.cuda.get_device_name(),
         "checkpoint": "deterministic random tiny model, 2 layers, hidden=32, GQA 4/2",
         "seed": 173,
@@ -248,7 +253,7 @@ def main():
                 "--batch_size",
                 "2",
                 "--torch_dtype",
-                "float16",
+                args.dtype,
                 "--throughput",
                 "100",
                 "--update_period",
@@ -298,7 +303,7 @@ def main():
                 str(model_dir.resolve()),
                 dht_prefix=model_prefix,
                 initial_peers=peers,
-                torch_dtype=torch.float16,
+                torch_dtype=dtype,
                 connect_timeout=30,
                 request_timeout=60,
                 max_retries=1,
@@ -317,6 +322,7 @@ def main():
         if args.check_plan:
             infos = get_remote_module_infos(dht, [f"{prefix}.{i}" for i in range(2)], latest=True)
             stages, worker_peers = [], {}
+            cache_settings = configured_cache_settings() if args.execution_mode in LORA_CACHED_MODES else {}
             for index in range(args.stages):
                 start, end = (0, 2) if args.stages == 1 else (index, index + 1)
                 worker = f"worker-{index}"
@@ -334,6 +340,8 @@ def main():
                         {"shared_gpu": 1},
                         end - start,
                         "synthetic-correctness-only",
+                        execution_mode=args.execution_mode,
+                        **cache_settings,
                     )
                 )
             plan = TrainingPlan(
@@ -343,8 +351,10 @@ def main():
                     2,
                     8,
                     sum(sum(s) for s in projection_shapes(config).values()),
+                    input_dtype=str(dtype),
                     hidden_size=config.hidden_size,
                     model_revision=model_revision(base_dir, config),
+                    model_type=config.model_type,
                 ),
                 lora_config,
                 tuple(stages),
@@ -352,13 +362,12 @@ def main():
                 2,
                 100000,
             )
-            plan = replace(plan, stages=tuple(replace(s, execution_mode=args.execution_mode) for s in plan.stages))
             plan.save(args.output / "plan.json")
             lora_config = plan.lora_config
         model = DistributedLoRA(client, lora_config).cuda()
         model.save_pretrained(args.output / "initial-adapter")
         reference = PeftModel.from_pretrained(
-            AutoModelForCausalLM.from_pretrained(base_dir, dtype=torch.float16, attn_implementation="eager").cuda(),
+            AutoModelForCausalLM.from_pretrained(base_dir, dtype=dtype, attn_implementation="eager").cuda(),
             args.output / "initial-adapter",
             is_trainable=True,
         )
@@ -394,7 +403,7 @@ def main():
             # from a full HF graph. Near cancellation, element-relative error
             # is unstable: bound it by one FP16 epsilon at this tensor's scale,
             # and additionally require <0.1% whole-tensor relative L2 error.
-            grad_atols[key] = max(5e-6, torch.finfo(torch.float16).eps * float(target.grad.abs().max()))
+            grad_atols[key] = max(5e-6, torch.finfo(dtype).eps * float(target.grad.abs().max()))
             try:
                 torch.testing.assert_close(parameter.grad, target.grad, rtol=0.05, atol=grad_atols[key])
                 assert grad_relative_norm_errors[key] < 0.001, "Gradient relative L2 error exceeds 0.1%"
@@ -499,7 +508,7 @@ def main():
             reloaded = loaded(ids).logits
         torch.testing.assert_close(final.logits, reloaded, rtol=0, atol=0)
         peft_loaded = PeftModel.from_pretrained(
-            AutoModelForCausalLM.from_pretrained(base_dir, dtype=torch.float16, attn_implementation="eager").cuda(),
+            AutoModelForCausalLM.from_pretrained(base_dir, dtype=dtype, attn_implementation="eager").cuda(),
             args.output / "adapter",
         ).eval()
         for name, parameter in peft_loaded.named_parameters():
@@ -605,6 +614,11 @@ def main():
                 s["samples"] == 6 and s["optimizer_step_samples"] == 2 and s["rpc_seconds"] > 0
                 for s in profile["stage_profiles"]
             )
+            if args.execution_mode in LORA_CACHED_MODES:
+                assert all(
+                    all(stage[key] == value for key, value in cache_settings.items())
+                    for stage in profile["stage_profiles"]
+                )
             report["profiling_cli"] = {
                 key: profile[key]
                 for key in ("steady_median_step_s", "effective_tokens_per_second", "trainable_parameters")
@@ -632,9 +646,7 @@ def main():
             start_workers(merged_dir, merged_prefix, pipeline=True)
             merged = load_client(merged_dir, merged_prefix).eval()
             merged_reference = (
-                AutoModelForCausalLM.from_pretrained(merged_dir, dtype=torch.float16, attn_implementation="eager")
-                .cuda()
-                .eval()
+                AutoModelForCausalLM.from_pretrained(merged_dir, dtype=dtype, attn_implementation="eager").cuda().eval()
             )
             cache_errors, cache_positions = [], []
             # Ordinary BloomBee KV session: prefill 5 tokens, then 3 decode steps.

@@ -12,14 +12,13 @@ from hivemind.utils.streaming import split_for_streaming
 
 from bloombee.utils.hivemind_compat import MSGPackSerializer, P2PContext, ServicerBase
 from bloombee.utils.lora import (
-    DEFAULT_LORA_ACTIVATION_CACHE_BYTES,
     LORA_CHECKPOINT_MODES,
-    LORA_EXECUTION_MODES,
+    LORA_MODES,
     LORA_NAMESPACES,
     LoRAConfig,
     checkpoint_budget_error,
     lora_context,
-    projection_shapes,
+    validate_lora_parameters,
 )
 from bloombee.utils.lora_model_revision import valid_model_revision
 from bloombee.utils.lora_profile import measure
@@ -30,26 +29,14 @@ def lora_enabled():
     return os.getenv("BLOOMBEE_ENABLE_LORA", "0") == "1"
 
 
-def run_lora_block(backend, inputs, grad_outputs, metadata, *parameters):
+def run_lora_block(backend, inputs, grad_outputs, metadata, *parameters, parameters_validated=False):
     """Recompute a frozen block and return dX, dA, dB without accumulating worker .grad."""
     config = LoRAConfig(**metadata["config"])
     layer_index = metadata.get("layer_index", 0)
-    config.validate_layers(backend.config.num_hidden_layers)
-    shapes = projection_shapes(backend.config)
-    if len(parameters) != 2 * len(config.target_modules):
-        raise ValueError("LoRA parameter count mismatch")
     if len(backend.module.module_shards) != 1:
         raise ValueError("LoRA does not yet support tensor-parallel blocks")
-    for j, target in enumerate(config.target_modules):
-        out_features, in_features = shapes[target]
-        a, b = parameters[2 * j : 2 * j + 2]
-        rank = config.rank_for(layer_index, target)
-        if a.shape != (rank, in_features) or b.shape != (out_features, rank):
-            raise ValueError(f"Invalid LoRA A/B shapes for {target}")
-        if a.dtype != torch.float32 or b.dtype != torch.float32:
-            raise ValueError("LoRA optimizer/master parameters must be float32")
-        if not torch.isfinite(a).all() or not torch.isfinite(b).all():
-            raise ValueError("LoRA parameters must be finite")
+    if not parameters_validated:
+        validate_lora_parameters(config, backend.config, layer_index, parameters)
     if inputs.ndim != 3 or inputs.shape[-1] != backend.config.hidden_size or not inputs.is_floating_point():
         raise ValueError("LoRA inputs must be [batch, sequence, hidden_size]")
     backward = grad_outputs.numel() != 0
@@ -120,11 +107,7 @@ class LoRAService(ServicerBase):
                 raise ValueError("Unsupported LoRA protocol")
             config = LoRAConfig(**metadata["config"])
             mode = metadata.get("execution_mode", "block")
-            if (
-                (version == 3 and mode not in LORA_EXECUTION_MODES[1:4])
-                or (version == 4 and mode not in LORA_EXECUTION_MODES[4:])
-                or (version < 3 and mode != "block")
-            ):
+            if not isinstance(mode, str) or mode not in LORA_MODES or LORA_MODES[mode][0] != max(version, 2):
                 raise ValueError("LoRA execution mode requires the matching protocol version")
             if version == 1 and (
                 config.rank_pattern
@@ -176,15 +159,17 @@ class LoRAService(ServicerBase):
                 pool = getattr(backends[0], "lora_span_pool", None)
                 if pool is None or any(getattr(b, "lora_span_pool", None) is not pool for b in backends):
                     raise RuntimeError("Worker has no common LoRA span executor")
+                if version == 4:
+                    cache_settings = pool.process_func.cache_settings
+                    for key, actual in cache_settings.items():
+                        if key in metadata and metadata[key] != actual:
+                            raise ValueError(f"Worker {key} does not match the training plan")
+                    response_metadata["cache_settings"] = cache_settings
                 if "planned_span" in metadata and mode in LORA_CHECKPOINT_MODES:
                     limit = pool.process_func.checkpoint_bytes
                     if metadata.get("checkpoint_limit_bytes", limit) != limit:
                         raise ValueError("Worker checkpoint limit does not match the training plan")
                     activation_limit = metadata.get("activation_cache_limit_bytes")
-                    if activation_limit is not None and activation_limit != int(
-                        os.getenv("BLOOMBEE_LORA_ACTIVATION_CACHE_BYTES", DEFAULT_LORA_ACTIVATION_CACHE_BYTES)
-                    ):
-                        raise ValueError("Worker activation cache limit does not match the training plan")
                     if error := checkpoint_budget_error(
                         mode, len(names), x.numel() * x.element_size(), limit, activation_limit
                     ):

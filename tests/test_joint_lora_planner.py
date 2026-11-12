@@ -26,7 +26,7 @@ def candidate(worker, start, end, rank, cost, memory, utility, percent=100):
 
 def problem():
     return dict(
-        workload=TrainingWorkload("test", 2, 1, 8, 64, accumulation=2),
+        workload=TrainingWorkload("test", 2, 1, 8, 64, accumulation=2, model_revision="hf:" + "a" * 40),
         base_lora=LoRAConfig(r=4, lora_alpha=8),
         candidates=[
             candidate("a", 0, 1, 2, 1, 3, 1),
@@ -105,6 +105,30 @@ def test_search_budget_is_explicit_and_invalid_plans_are_rejected():
         replace(plan.stages[0], weight_gpu_percent=50.5)
 
 
+def test_new_plan_requires_revision_but_can_read_legacy_plan():
+    args = problem()
+    plan = solve_training_plan(**args)
+    old = plan.to_dict()
+    del old["workload"]["model_revision"]
+    legacy = TrainingPlan.from_dict(old)
+    assert legacy.to_dict() == old
+    with pytest.raises(ValueError, match="model_revision"):
+        solve_training_plan(**{**args, "workload": legacy.workload})
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_non_fp16_planning_requires_a_supported_model_family(dtype):
+    args = problem()
+    workload = replace(args["workload"], input_dtype=str(dtype))
+    with pytest.raises(ValueError, match="model_type"):
+        solve_training_plan(**{**args, "workload": workload})
+    with pytest.raises(ValueError, match="LLaMA.*FP16"):
+        replace(workload, model_type="llama")
+    assert (
+        solve_training_plan(**{**args, "workload": replace(workload, model_type="qwen3")}).workload.torch_dtype == dtype
+    )
+
+
 def test_planner_excludes_spans_over_checkpoint_or_activation_cache_limits():
     args = problem()
     args.update(
@@ -114,10 +138,13 @@ def test_planner_excludes_spans_over_checkpoint_or_activation_cache_limits():
         max_parameters=1024,
     )
     stage = replace(args["candidates"][-1], execution_mode="span_cached_gpu")
+    with pytest.raises(ValueError, match="measured adapter_cache_limit_bytes"):
+        solve_training_plan(**{**args, "candidates": [stage]})
+    stage = replace(stage, adapter_cache_limit_bytes=256, cache_ttl_seconds=12)
     # A boundary is 64 bytes. Backward reconstruction needs 64, retention 128.
     backward_over_limit = replace(stage, checkpoint_limit_bytes=63)
     retention_over_limit = replace(stage, activation_cache_limit_bytes=127)
-    recompute = replace(stage, execution_mode="span_recompute", rpc_seconds=10)
+    recompute = replace(args["candidates"][-1], execution_mode="span_recompute", rpc_seconds=10)
     args["candidates"] = [backward_over_limit, retention_over_limit, recompute]
     assert solve_training_plan(**args).stages == (recompute,)
     with pytest.raises(ValueError, match="checkpoint budget exceeded"):
@@ -197,6 +224,8 @@ def test_worker_rejects_deployment_with_extra_unplanned_layers():
     [
         ({"model_revision": "sha256:" + "b" * 64}, "base model revision"),
         ({"checkpoint_limit_bytes": 64}, "checkpoint limit does not match"),
+        ({"version": 4, "execution_mode": "span_cached_gpu", "adapter_cache_limit_bytes": 0}, "adapter_cache_limit"),
+        ({"version": 4, "execution_mode": "span_cached_gpu", "cache_ttl_seconds": 1}, "cache_ttl_seconds"),
         ({}, "checkpoint budget exceeded"),
     ],
 )
@@ -214,21 +243,24 @@ def test_worker_rejects_incompatible_plan_before_forward_runtime_task(overrides,
             "model.0 model.1",
             [x, *([torch.empty(0)] * 8)],
             dict(
-                version=3,
                 config=LoRAConfig().to_dict(),
                 planned_span=[0, 2],
-                execution_mode="span_gpu",
                 backward=False,
                 training=True,
                 seed=1,
-                **{"model_revision": revision, **overrides},
+                **{"version": 3, "execution_mode": "span_gpu", "model_revision": revision, **overrides},
             ),
         )
 
     async def submit_task(*args, **kwargs):
         pytest.fail("An incompatible plan reached Runtime")
 
-    span_pool = SimpleNamespace(process_func=SimpleNamespace(checkpoint_bytes=63), submit_task=submit_task)
+    span_pool = SimpleNamespace(
+        process_func=SimpleNamespace(
+            checkpoint_bytes=63, cache_settings={"adapter_cache_limit_bytes": 256, "cache_ttl_seconds": 300}
+        ),
+        submit_task=submit_task,
+    )
     backend = SimpleNamespace(
         config=SimpleNamespace(_bloombee_lora_model_revision=revision),
         lora_pool=object(),
@@ -250,9 +282,10 @@ def test_worker_rejects_incompatible_plan_before_forward_runtime_task(overrides,
 
 def test_planned_route_never_falls_back_when_a_peer_disappears():
     import threading
-    from types import SimpleNamespace
+    from types import MethodType, SimpleNamespace
 
     from bloombee.client.lora import LoRARemoteSequential
+    from bloombee.client.routing.sequence_manager import RemoteSequenceManager
     from bloombee.data_structures import ServerState
 
     plan = solve_training_plan(**problem())
@@ -267,6 +300,8 @@ def test_planned_route_never_falls_back_when_a_peer_disappears():
         lock_changes=threading.Lock(),
         state=SimpleNamespace(sequence_info=SimpleNamespace(block_infos=blocks)),
     )
+    manager._ensure_routing_ready = MethodType(RemoteSequenceManager._ensure_routing_ready, manager)
+    manager.make_fixed_sequence = MethodType(RemoteSequenceManager.make_fixed_sequence, manager)
     sequence = SimpleNamespace(
         training_plan=plan, sequence_manager=manager, worker_peers={"a": "peer-a", "b": "peer-b"}
     )

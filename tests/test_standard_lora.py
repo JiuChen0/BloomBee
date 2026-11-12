@@ -239,6 +239,7 @@ def checkpoint_model():
     model.model = nn.Module()
     model.model.config = SimpleNamespace(_name_or_path="test")
     model.model.layers = nn.Module()
+    model.model.layers.training_plan = None
     model.model.layers.adapters = nn.ModuleList([nn.ModuleDict({"q_proj": LoRAProjection(4, 4, 2)})])
     model._sequence_path = "layers"
     return model
@@ -282,6 +283,32 @@ def test_training_checkpoint_resumes_adamw_sampling_and_dropout_exactly(tmp_path
     for actual, expected in zip(restored_opt.state.values(), optimizer.state.values()):
         for key in actual:
             torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+
+
+def test_planned_checkpoint_refuses_changed_or_unrecorded_base_revision(tmp_path):
+    model = checkpoint_model()
+    optimizer = torch.optim.AdamW(model.parameters())
+    model.remote_layers.training_plan = object()
+    original = "hf:" + "a" * 40
+    model.remote_layers.base_model_revision = original
+    path = tmp_path / "checkpoint"
+    model.save_training_checkpoint(path, optimizer, step=0)
+    assert model.load_training_state(path, optimizer)["step"] == 0
+
+    model.remote_layers.base_model_revision = "hf:" + "b" * 40
+    with pytest.raises(ValueError, match="base model revision does not match"):
+        model.load_training_state(path, optimizer)
+
+    state_path = path / "training_state.pt"
+    legacy = torch.load(state_path, weights_only=True)
+    del legacy["base_model_revision"]
+    torch.save(legacy, state_path)
+    with pytest.raises(ValueError, match="has no base model revision"):
+        model.load_training_state(path, optimizer)
+    legacy["metadata"] = {"training_config": {"plan": {"workload": {"model_revision": original}}}}
+    torch.save(legacy, state_path)
+    model.remote_layers.base_model_revision = original
+    assert model.load_training_state(path, optimizer)["step"] == 0
 
 
 def test_training_checkpoint_rejects_wrong_optimizer_pending_grads_and_mixed_weights(tmp_path):

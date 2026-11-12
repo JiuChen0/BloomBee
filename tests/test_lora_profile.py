@@ -142,6 +142,7 @@ def test_stage_profile_cost_uses_matched_steady_pairs_and_physical_ranks():
             "step": step,
             "microbatch": microbatch,
             "execution_mode": "span_cached_gpu",
+            "cache_settings": {"adapter_cache_limit_bytes": 256, "cache_ttl_seconds": 300.0},
             "total_s": seconds if phase == "forward" else 0,
         }
         for step, costs in enumerate(((14, 5, 5), (17, 5, 5), (14, 5, 5)))
@@ -152,5 +153,9 @@ def test_stage_profile_cost_uses_matched_steady_pairs_and_physical_ranks():
     assert profile["median_forward_backward_rpc_s"] == 5
     assert profile["optimizer_step_samples"] == 3
     assert profile["median_step_rpc_s"] == 24 and profile["rpc_seconds"] == 8
+    assert profile["adapter_cache_limit_bytes"] == 256 and profile["cache_ttl_seconds"] == 300.0
     (incomplete,) = benchmark.summarize_stage_profiles(cached[:-2], config, accumulation=3)
     assert incomplete["rpc_seconds"] is None
+    cached[-1]["cache_settings"] = {"adapter_cache_limit_bytes": 0, "cache_ttl_seconds": 300.0}
+    with pytest.raises(ValueError, match="cache settings changed"):
+        benchmark.summarize_stage_profiles(cached, config, accumulation=3)

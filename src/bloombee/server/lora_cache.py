@@ -17,7 +17,7 @@ from collections import OrderedDict
 
 import torch
 
-from bloombee.utils.lora import DEFAULT_LORA_ACTIVATION_CACHE_BYTES, LoRAConfig, projection_shapes
+from bloombee.utils.lora import LORA_CACHE_ENV, LORA_MODES, LoRAConfig, validate_lora_parameters
 from bloombee.utils.lora_profile import profile_fields, tensor_bytes, write_event
 
 
@@ -68,20 +68,21 @@ def tensor_digest(tensors, description):
     return digest.hexdigest()
 
 
+def configured_cache_settings():
+    return {key: type(default)(os.getenv(env, default)) for key, (env, default) in LORA_CACHE_ENV.items()}
+
+
 class CachedLoRASpan:
     def __init__(self, executor, *, adapter_bytes=None, activation_bytes=None, ttl=None):
         self.executor = executor
-        ttl = float(os.getenv("BLOOMBEE_LORA_CACHE_TTL", "300")) if ttl is None else ttl
+        settings = executor.cache_settings
+        ttl = settings["cache_ttl_seconds"] if ttl is None else ttl
         self.adapters = TensorLRU(
-            int(os.getenv("BLOOMBEE_LORA_ADAPTER_CACHE_BYTES", 256 * 2**20))
-            if adapter_bytes is None
-            else adapter_bytes,
+            settings["adapter_cache_limit_bytes"] if adapter_bytes is None else adapter_bytes,
             ttl,
         )
         self.activations = TensorLRU(
-            int(os.getenv("BLOOMBEE_LORA_ACTIVATION_CACHE_BYTES", DEFAULT_LORA_ACTIVATION_CACHE_BYTES))
-            if activation_bytes is None
-            else activation_bytes,
+            settings["activation_cache_limit_bytes"] if activation_bytes is None else activation_bytes,
             ttl,
         )
 
@@ -107,18 +108,12 @@ class CachedLoRASpan:
             if len(parameters) != len(names) * width:
                 raise ValueError("Cached adapter parameter count mismatch")
             for j, name in enumerate(names):
-                backend = self.executor.backends[name]
-                config.validate_layers(backend.config.num_hidden_layers)
-                shapes, layer = projection_shapes(backend.config), int(name.rsplit(".", 1)[-1])
-                for k, target in enumerate(config.target_modules):
-                    out_features, in_features = shapes[target]
-                    rank = config.rank_for(layer, target)
-                    for tensor, shape in zip(
-                        parameters[j * width + 2 * k : j * width + 2 * k + 2],
-                        ((rank, in_features), (out_features, rank)),
-                    ):
-                        if tensor.shape != shape or tensor.dtype != torch.float32 or not torch.isfinite(tensor).all():
-                            raise ValueError("Invalid cached adapter shape/dtype/value")
+                validate_lora_parameters(
+                    config,
+                    self.executor.backends[name].config,
+                    int(name.rsplit(".", 1)[-1]),
+                    parameters[j * width : (j + 1) * width],
+                )
             fingerprint = tensor_digest(parameters, description)
             if adapter is not None and (adapter[0] != description or adapter[1] != fingerprint):
                 raise ValueError("Adapter version reused with different parameters/configuration")
@@ -130,7 +125,7 @@ class CachedLoRASpan:
             return (torch.tensor([-1, 0], dtype=torch.int64),)
         if adapter[0] != description:
             raise ValueError("Cached adapter configuration does not match")
-        mode = metadata["execution_mode"].replace("span_cached_", "span_")
+        mode = LORA_MODES[metadata["execution_mode"]][1]
         signature = (adapter[1], metadata["seed"], metadata["training"], mode, tensor_digest((inputs,), "activation"))
         saved = self.activations.get(checkpoint_key)
         if saved is not None and saved[0] != signature:
@@ -160,6 +155,7 @@ class CachedLoRASpan:
             adapter[2],
             checkpoints=checkpoints,
             save_forward=save_forward,
+            parameters_validated=True,
         )
         if save_forward:
             self.activations.put(checkpoint_key, (signature, tuple(checkpoints)), tensor_bytes(checkpoints))

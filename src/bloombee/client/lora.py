@@ -18,10 +18,16 @@ from torch import nn
 from torch.autograd.function import once_differentiable
 
 from bloombee.client.remote_sequential import RemoteSequential
-from bloombee.data_structures import RemoteSpanInfo, ServerState
 from bloombee.server.lora import LoRAService
 from bloombee.utils.hivemind_compat import MSGPackSerializer, PeerID
-from bloombee.utils.lora import LORA_NAMESPACES, LoRAConfig, LoRAProjection, projection_shapes
+from bloombee.utils.lora import (
+    LORA_CACHE_ENV,
+    LORA_MODES,
+    LORA_NAMESPACES,
+    LoRAConfig,
+    LoRAProjection,
+    projection_shapes,
+)
 from bloombee.utils.lora_model_revision import model_revision
 from bloombee.utils.lora_profile import profile_fields, request_metadata, tensor_bytes, write_event
 from bloombee.utils.lossless_transport import deserialize_tensor_stream, serialize_torch_tensor
@@ -90,6 +96,9 @@ async def _call_lora_once(manager, span, inputs, metadata):
     serialized = time.perf_counter() if profile else 0.0
     response_proto_bytes = 0
     response_metadata = {}
+    expected_cache = {
+        key: metadata[key] for key in ("adapter_cache_limit_bytes", "cache_ttl_seconds") if key in metadata
+    }
     responses = await asyncio.wait_for(
         stub.rpc_lora_stream(iter_as_aiter(parts)), timeout=manager.config.connect_timeout
     )
@@ -102,6 +111,9 @@ async def _call_lora_once(manager, span, inputs, metadata):
                 raise RuntimeError("Worker did not acknowledge the requested LoRA protocol")
             if "model_revision" in metadata and response_metadata.get("model_revision") != metadata["model_revision"]:
                 raise RuntimeError("Worker did not verify the LoRA base model revision")
+            cache_settings = response_metadata.get("cache_settings") or {}
+            if any(cache_settings.get(key) != value for key, value in expected_cache.items()):
+                raise RuntimeError("Worker did not verify the LoRA adapter cache settings")
             if response_metadata.get("cache_miss"):
                 raise _LoRACacheMiss(
                     sum(part.ByteSize() for part in parts) if profile else 0, response.ByteSize() if profile else 0
@@ -131,6 +143,7 @@ async def _call_lora_once(manager, span, inputs, metadata):
             parameters_sent=metadata.get("parameters_sent", True),
             checkpoint_hit=response_metadata.get("checkpoint_hit", False),
             cache_retry_s=metadata.get("cache_retry_s", 0.0),
+            cache_settings=response_metadata.get("cache_settings"),
             peer=str(span.peer_id),
             start=span.start,
             end=span.end,
@@ -230,22 +243,9 @@ class LoRARemoteSequential(RemoteSequential):
             or str(inputs.dtype) != workload.input_dtype
         ):
             raise ValueError("Input shape/dtype differs from the profiled training workload")
-        with manager._thread_start_lock:
-            if not manager.is_alive():
-                manager._thread.start()
-        if not manager.ready.is_set():
-            manager.update(wait=True)
-        route = []
-        with manager.lock_changes:
-            for stage in plan.stages:
-                peer = self.worker_peers[stage.worker]
-                infos = [
-                    manager.state.sequence_info.block_infos[i].servers.get(peer) for i in range(stage.start, stage.end)
-                ]
-                if any(info is None or info.state != ServerState.ONLINE for info in infos):
-                    raise RuntimeError(f"Planned worker {stage.worker} is unavailable; explicit replanning is required")
-                route.append(RemoteSpanInfo(peer, stage.start, stage.end, infos[0]))
-        return route
+        return manager.make_fixed_sequence(
+            (stage.worker, self.worker_peers[stage.worker], stage.start, stage.end) for stage in plan.stages
+        )
 
     def forward(self, inputs, prompts=None, **kwargs):
         if self.active_session is not None:
@@ -288,19 +288,20 @@ class LoRARemoteSequential(RemoteSequential):
                 metadata["planned_span"] = [span.start, span.end]
                 metadata["compute_dtype"] = self.training_plan.workload.input_dtype
                 metadata["model_revision"] = self.base_model_revision
-                if stage.execution_mode != "block":
-                    metadata.update(version=3, execution_mode=stage.execution_mode)
+                stage_version = LORA_MODES[stage.execution_mode][0]
+                if stage_version >= 3:
+                    metadata.update(version=stage_version, execution_mode=stage.execution_mode)
                     if stage.checkpoint_limit_bytes is not None:
                         metadata["checkpoint_limit_bytes"] = stage.checkpoint_limit_bytes
-                    if stage.activation_cache_limit_bytes is not None:
-                        metadata["activation_cache_limit_bytes"] = stage.activation_cache_limit_bytes
-                if stage.execution_mode.startswith("span_cached_"):
+                if stage_version == 4:
+                    metadata.update(
+                        {key: value for key in LORA_CACHE_ENV if (value := getattr(stage, key)) is not None}
+                    )
                     versions = tuple((id(p), p._version) for p in self.adapters.parameters())
                     if versions != self._cache_parameter_versions:
                         self._cache_adapter_version += 1
                         self._cache_parameter_versions = versions
                     metadata.update(
-                        version=4,
                         cache_job=self._cache_job,
                         cache_request=uuid.uuid4().hex,
                         adapter_version=self._cache_adapter_version,
@@ -448,6 +449,8 @@ class DistributedLoRA(nn.Module):
             cpu_rng=torch.get_rng_state(),
             cuda_rng=torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else [],
         )
+        if self.remote_layers.training_plan is not None:
+            state["base_model_revision"] = self.remote_layers.base_model_revision
         path = Path(directory)
         path.mkdir(parents=True, exist_ok=False)
         self.save_pretrained(path)
@@ -462,6 +465,14 @@ class DistributedLoRA(nn.Module):
         """
         path = Path(directory)
         state = torch.load(path / "training_state.pt", map_location="cpu", weights_only=True)
+        revision = state.get("base_model_revision")
+        if revision is None and self.remote_layers.training_plan is not None:
+            legacy_plan = state.get("metadata", {}).get("training_config", {}).get("plan", {})
+            revision = legacy_plan.get("workload", {}).get("model_revision")
+            if revision is None:
+                raise ValueError("Planned checkpoint has no base model revision. Resume from adapter weights instead.")
+        if revision is not None and revision != self.remote_layers.base_model_revision:
+            raise ValueError("Training checkpoint base model revision does not match")
         if state["lora_config"] != self.lora_config.to_dict():
             raise ValueError("Training checkpoint LoRA configuration does not match")
         if (

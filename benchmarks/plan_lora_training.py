@@ -10,7 +10,8 @@ steps), not median_forward_backward_rpc_s. Checkpoint modes need workload.hidden
 Candidate checkpoint_limit_bytes and activation_cache_limit_bytes default to
 the worker defaults. Explicitly set the activation limit to 0 to plan a
 cached adapter mode with activation storage disabled.
-Set workload.model_revision from the profile report to pin the measured base.
+Set workload.model_revision and workload.model_type from the profile report.
+Cached candidates require the measured adapter_cache_limit_bytes and cache_ttl_seconds.
 
 Launch workers using the printed arguments and environment, then pass --plan and a
 --worker_peers JSON mapping to examples/train_lora.py. Worker startup is explicit;
@@ -21,7 +22,7 @@ import argparse
 import json
 from pathlib import Path
 
-from bloombee.utils.lora import LoRAConfig
+from bloombee.utils.lora import LORA_CACHE_ENV, LoRAConfig
 from bloombee.utils.training_plan import StageChoice, TrainingWorkload, solve_training_plan
 
 
@@ -45,13 +46,16 @@ def main():
                 parameters=plan.parameters,
                 utility=plan.utility,
                 resources=plan.resources,
-                worker_args={s.worker: s.worker_args() + revision_args for s in plan.stages},
+                worker_args={
+                    s.worker: s.worker_args() + ["--torch_dtype", plan.workload.dtype_name] + revision_args
+                    for s in plan.stages
+                },
                 worker_env={
                     s.worker: {
                         name: str(limit)
                         for name, limit in (
                             ("BLOOMBEE_LORA_SPAN_CHECKPOINT_BYTES", s.checkpoint_limit_bytes),
-                            ("BLOOMBEE_LORA_ACTIVATION_CACHE_BYTES", s.activation_cache_limit_bytes),
+                            *((env, getattr(s, key)) for key, (env, _) in LORA_CACHE_ENV.items()),
                         )
                         if limit is not None
                     }

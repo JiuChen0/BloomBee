@@ -24,6 +24,7 @@ from pathlib import Path
 import torch
 
 from bloombee import AutoDistributedModelForCausalLM, DistributedLoRA, LoRAConfig
+from bloombee.utils.lora import LORA_CACHE_ENV, LORA_CACHED_MODES
 from bloombee.utils.lora_profile import memory_snapshot, profile_step, synchronize
 from bloombee.utils.training_plan import TrainingPlan
 
@@ -36,6 +37,7 @@ def summarize_stage_profiles(events, config, *, accumulation=1):
     """
     pairs = defaultdict(dict)
     samples = defaultdict(lambda: defaultdict(dict))
+    cache_by_stage = {}
     steps = set()
     for event in events:
         if event["kind"] == "rpc" and event.get("warmup") is False:
@@ -49,6 +51,12 @@ def summarize_stage_profiles(events, config, *, accumulation=1):
         key = (*[f[k] for k in ("peer", "start", "end")], f.get("execution_mode", "block"))
         if key != (*[b[k] for k in ("peer", "start", "end")], b.get("execution_mode", "block")):
             raise ValueError("Forward/backward profile route differs")
+        cache_settings = f.get("cache_settings")
+        if (
+            cache_settings != b.get("cache_settings")
+            or cache_by_stage.setdefault(key, cache_settings) != cache_settings
+        ):
+            raise ValueError("Worker cache settings changed during profiling")
         step, microbatch = f["step"], f["microbatch"]
         if (step, microbatch) != (b["step"], b["microbatch"]) or not 0 <= microbatch < accumulation:
             raise ValueError("Invalid forward/backward profile step or microbatch")
@@ -63,6 +71,7 @@ def summarize_stage_profiles(events, config, *, accumulation=1):
         # Adaptive routes can measure a span in only part of a step. Such
         # samples are useful diagnostics, but cannot cost a fixed-stage plan.
         step_cost = statistics.median(complete) if len(complete) == len(steps) else None
+        cache_settings = cache_by_stage[(peer, start, end, mode)] or {}
         profiles.append(
             dict(
                 peer=peer,
@@ -75,6 +84,7 @@ def summarize_stage_profiles(events, config, *, accumulation=1):
                 median_step_rpc_s=step_cost,
                 rpc_seconds=step_cost / accumulation if step_cost is not None else None,
                 rank_by_layer=[{t: config.rank_for(i, t) for t in config.target_modules} for i in range(start, end)],
+                **{key: cache_settings[key] for key in LORA_CACHE_ENV if key in cache_settings},
             )
         )
     return profiles
@@ -171,12 +181,13 @@ def main():
     torch.manual_seed(args.seed)
     torch.set_num_threads(2)
     revision = plan.workload.model_revision if plan else None
+    torch_dtype = plan.workload.torch_dtype if plan else torch.float16
     base = AutoDistributedModelForCausalLM.from_pretrained(
         args.model,
         initial_peers=args.initial_peers,
         dht_prefix=args.dht_prefix,
         revision=revision[3:] if revision and revision.startswith("hf:") else None,
-        torch_dtype=torch.float16,
+        torch_dtype=torch_dtype,
         request_timeout=300,
         connect_timeout=30,
         max_retries=1,
@@ -211,6 +222,8 @@ def main():
             training_plan=plan.to_dict() if plan else None,
             model=args.model,
             model_revision=model.remote_layers.base_model_revision,
+            model_type=base.config.model_type,
+            input_dtype=str(torch_dtype),
             model_config=base.config.to_dict(),
             adapter_config=model.lora_config.to_dict(),
             host=socket.gethostname(),
@@ -238,7 +251,7 @@ def main():
         report["stage_profiles"] = summarize_stage_profiles(events, config, accumulation=args.accumulation)
         if plan and any(s.execution_mode != "block" for s in plan.stages):
             report["execution_mode"] = "stateless_lora_span_v3"
-        if plan and any(s.execution_mode.startswith("span_cached_") for s in plan.stages):
+        if plan and any(s.execution_mode in LORA_CACHED_MODES for s in plan.stages):
             report["execution_mode"] = "cached_lora_span_v4"
         args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
         print(
